@@ -1,17 +1,20 @@
 from __future__ import annotations
-import asyncio, csv, io, json, random, sqlite3, time
+import asyncio, csv, hmac, io, json, os, random, sqlite3, time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 TZ = timezone(timedelta(hours=7))
-DB_PATH = Path(__file__).resolve().parent.parent / "videoanalytics.db"
+DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
 STARTED = time.time()
+API_KEY = os.getenv("ZMK_API_KEY", "").strip()
+RATE_LIMIT_PER_MINUTE = int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"))
+_rate_buckets: dict[str, list[float]] = {}
 EVENT_TYPES = ["no_helmet", "no_vest", "phone_usage", "smoking", "restricted_zone", "immobility"]
 SEVERITIES = ["critical", "high", "medium", "low"]
 
@@ -65,8 +68,34 @@ def init_db():
 async def lifespan(app: FastAPI):
     init_db(); yield
 
-app=FastAPI(title="ZMK Vision API",version="1.0.0",description="On-premise API контура видеоаналитики",lifespan=lifespan)
-app.add_middleware(CORSMiddleware,allow_origins=["http://localhost:5173"],allow_credentials=True,allow_methods=["*"],allow_headers=["*"])
+app=FastAPI(title="ZMK Vision API",version="1.2.0",description="On-premise API контура видеоаналитики",lifespan=lifespan)
+app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:5173").split(",") if x.strip()],allow_credentials=True,allow_methods=["GET","POST","PUT","PATCH","DELETE"],allow_headers=["Content-Type","X-API-Key"])
+
+@app.middleware("http")
+async def security_middleware(request: Request, call_next):
+    """Optional API-key protection, size/rate limits and baseline response headers."""
+    path=request.url.path
+    public=path in {"/api/health","/docs","/openapi.json","/redoc"} or not path.startswith("/api/")
+    if API_KEY and not public and not hmac.compare_digest(request.headers.get("X-API-Key",""),API_KEY):
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail":"Invalid or missing API key"},status_code=401,headers={"WWW-Authenticate":"ApiKey"})
+    length=request.headers.get("content-length")
+    try: too_large=bool(length and int(length)>2_000_000)
+    except ValueError: too_large=True
+    if too_large:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail":"Request body too large"},status_code=413)
+    if path.startswith(("/api/admin/","/api/inference/")):
+        now=time.time(); key=f"{request.client.host if request.client else 'unknown'}:{path.split('/')[2]}"
+        bucket=[x for x in _rate_buckets.get(key,[]) if now-x<60]
+        if len(bucket)>=RATE_LIMIT_PER_MINUTE:
+            from fastapi.responses import JSONResponse
+            return JSONResponse({"detail":"Rate limit exceeded"},status_code=429,headers={"Retry-After":"60"})
+        bucket.append(now); _rate_buckets[key]=bucket
+    response=await call_next(request)
+    response.headers.update({"X-Content-Type-Options":"nosniff","X-Frame-Options":"SAMEORIGIN","Referrer-Policy":"no-referrer","Permissions-Policy":"camera=(), microphone=(), geolocation=()"})
+    if path.startswith("/api/"): response.headers["Cache-Control"]="no-store"
+    return response
 
 class CameraIn(BaseModel):
     name:str=Field(min_length=2,max_length=80); zone:str=Field(min_length=2,max_length=80); rtsp_url:str=""; enabled:bool=True
@@ -96,7 +125,7 @@ def rows(query,args=()):
     con=db(); result=[dict(r) for r in con.execute(query,args).fetchall()]; con.close(); return result
 
 @app.get("/api/health")
-def health(): return {"status":"ok","version":"1.0.0","uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
+def health(): return {"status":"ok","version":"1.2.0","uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
 
 @app.get("/api/dashboard")
 def dashboard():

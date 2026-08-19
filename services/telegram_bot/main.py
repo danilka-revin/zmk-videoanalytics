@@ -15,6 +15,7 @@ log = logging.getLogger("zmk.telegram")
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 API_URL = os.getenv("ZMK_API_URL", "http://api:8000").rstrip("/")
 WEBAPP_URL = os.getenv("TELEGRAM_WEBAPP_URL", "http://localhost:5173/telegram")
+API_KEY = os.getenv("ZMK_API_KEY", "")
 ADMINS = {int(x) for x in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",") if x.strip().isdigit()}
 OPERATORS = {int(x) for x in os.getenv("TELEGRAM_OPERATOR_IDS", "").split(",") if x.strip().isdigit()}
 VIEWERS = {int(x) for x in os.getenv("TELEGRAM_VIEWER_IDS", "").split(",") if x.strip().isdigit()}
@@ -40,7 +41,7 @@ def menu(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def api(method: str, path: str, **kwargs: Any) -> Any:
-    async with httpx.AsyncClient(base_url=API_URL, timeout=15) as client:
+    async with httpx.AsyncClient(base_url=API_URL, timeout=15, headers={"X-API-Key":API_KEY} if API_KEY else {}) as client:
         response = await client.request(method, path, **kwargs)
         response.raise_for_status()
         content_type = response.headers.get("content-type", "")
