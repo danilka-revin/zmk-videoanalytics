@@ -1,4 +1,5 @@
 import time
+import uuid
 from fastapi.testclient import TestClient
 from app.main import app
 
@@ -29,7 +30,8 @@ def test_hot_swap_is_atomic_and_audited():
 def test_training_rejects_offline_camera_and_completes_online_job():
     with TestClient(app) as c:
         assert c.post('/api/training/jobs', json={'camera_id':'cam_07'}).status_code == 409
-        started = c.post('/api/training/jobs', json={'camera_id':'cam_01','image_count':20,'epochs':1,'target_name':'test-camera-model'})
+        target_name = f"test-camera-{uuid.uuid4().hex[:10]}"
+        started = c.post('/api/training/jobs', json={'camera_id':'cam_01','image_count':20,'epochs':1,'target_name':target_name})
         assert started.status_code == 202
         job_id = started.json()['id']
         deadline = time.time() + 8
@@ -42,4 +44,4 @@ def test_training_rejects_offline_camera_and_completes_online_job():
         assert job['status'] == 'completed'
         assert job['progress'] == 100
         models = c.get('/api/models').json()
-        assert any(x['name'] == 'test-camera-model' and x['status'] == 'ready' for x in models)
+        assert any(x['name'] == target_name and x['status'] == 'ready' for x in models)

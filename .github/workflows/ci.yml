@@ -11,6 +11,7 @@ jobs:
       - run: pip install -r services/telegram_bot/requirements.txt
       - run: PYTHONPATH=backend pytest backend/tests -q
       - run: PYTHONPATH=services/telegram_bot pytest services/telegram_bot/test_helpers.py -q
+      - run: pytest tests -q
       - uses: actions/setup-node@v4
         with: {node-version: '20'}
       - run: npm ci

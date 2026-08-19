@@ -1,37 +1,91 @@
 #Requires -Version 5.1
+param([switch]$CheckOnly, [switch]$NonInteractive)
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
 $Host.UI.RawUI.WindowTitle = "ZMK Vision Installer"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
-Write-Host "`n=== ZMK Vision one-click installer for Windows ===" -ForegroundColor Green
+
+function Assert-ProjectFiles {
+  $required = @("docker-compose.yml", ".env.example", "backend/Dockerfile", "frontend/Dockerfile", "services/telegram_bot/Dockerfile")
+  foreach ($file in $required) { if (-not (Test-Path $file)) { throw "Missing project file: $file. Download and extract the complete release archive, not only the installer." } }
+}
+function Set-DotEnvValue([string]$Name, [string]$Value) {
+  $path = Join-Path $Root ".env"
+  $lines = if (Test-Path $path) { @(Get-Content $path) } else { @() }
+  $found = $false
+  $updated = foreach ($line in $lines) {
+    if ($line -match ("^" + [regex]::Escape($Name) + "=")) { $found = $true; "$Name=$Value" } else { $line }
+  }
+  if (-not $found) { $updated += "$Name=$Value" }
+  [IO.File]::WriteAllLines($path, [string[]]$updated, ([Text.UTF8Encoding]::new($false)))
+}
+function Wait-Http([string]$Url, [int]$Seconds = 120) {
+  $deadline = (Get-Date).AddSeconds($Seconds)
+  while ((Get-Date) -lt $deadline) {
+    try { $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 $Url; if ($r.StatusCode -eq 200) { return $true } } catch {}
+    Start-Sleep 2
+  }
+  return $false
+}
+
+Write-Host "`n=== ZMK Vision installer for Windows 10/11 ===" -ForegroundColor Green
+Assert-ProjectFiles
+if ($CheckOnly) {
+  Write-Host "Project files: OK"
+  if (Get-Command docker -ErrorAction SilentlyContinue) {
+    docker compose version
+    if ($LASTEXITCODE -ne 0) { throw "Docker Compose plugin is unavailable" }
+    docker compose config --quiet
+    if ($LASTEXITCODE -ne 0) { throw "docker-compose.yml validation failed" }
+    Write-Host "Docker Compose configuration: OK" -ForegroundColor Green
+  } else { Write-Warning "Docker is not installed; project file validation only." }
+  exit 0
+}
 
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
   Write-Host "Docker Desktop not found. Installing via winget..." -ForegroundColor Yellow
   if (-not (Get-Command winget -ErrorAction SilentlyContinue)) { throw "Install Docker Desktop from https://docker.com/products/docker-desktop and rerun." }
   winget install -e --id Docker.DockerDesktop --accept-package-agreements --accept-source-agreements
-  $dockerPath = "$Env:ProgramFiles\Docker\Docker\resources\bin"
-  $Env:Path += ";$dockerPath"
+  if ($LASTEXITCODE -ne 0) { throw "Docker Desktop installation failed with code $LASTEXITCODE" }
+  $Env:Path += ";$Env:ProgramFiles\Docker\Docker\resources\bin"
 }
+if (-not (Get-Command docker -ErrorAction SilentlyContinue)) { throw "Docker CLI is unavailable after installation. Restart Windows and run the installer again." }
 if (-not (docker info 2>$null)) {
   Write-Host "Starting Docker Desktop..."
   $desktop = "$Env:ProgramFiles\Docker\Docker\Docker Desktop.exe"
   if (Test-Path $desktop) { Start-Process $desktop }
   $ready = $false
   for ($i=0; $i -lt 60; $i++) { Start-Sleep 3; if (docker info 2>$null) { $ready=$true; break }; Write-Host -NoNewline "." }
-  if (-not $ready) { throw "Docker engine did not start. Start Docker Desktop and rerun installer." }
+  if (-not $ready) { throw "Docker engine did not start within 180 seconds. Start Docker Desktop and rerun." }
 }
+docker compose version | Out-Host
+if ($LASTEXITCODE -ne 0) { throw "Docker Compose plugin is unavailable. Update Docker Desktop." }
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
-$token = Read-Host "Telegram bot token (Enter to skip bot)"
+
+$token = if ($NonInteractive) { $env:TELEGRAM_BOT_TOKEN } else { Read-Host "Telegram bot token (Enter to skip bot)" }
+$ComposeProfile = @()
 if ($token) {
-  $admin = Read-Host "Your Telegram numeric ID (admin)"
-  $url = Read-Host "Public HTTPS Mini App URL (or Enter for localhost)"
-  Add-Content .env "`nTELEGRAM_BOT_TOKEN=$token`nTELEGRAM_ADMIN_IDS=$admin"
-  if ($url) { Add-Content .env "`nTELEGRAM_WEBAPP_URL=$url" }
-  docker compose --profile telegram up -d --build
-} else { docker compose up -d --build }
-if ($LASTEXITCODE -ne 0) { throw "docker compose failed" }
-Write-Host "`nZMK Vision installed successfully." -ForegroundColor Green
+  if ($token -notmatch '^\d+:[A-Za-z0-9_-]{20,}$') { throw "Telegram token format is invalid" }
+  $admin = if ($NonInteractive) { $env:TELEGRAM_ADMIN_IDS } else { Read-Host "Your Telegram numeric ID (admin)" }
+  if ($admin -notmatch '^\d+(,\d+)*$') { throw "Telegram admin ID must contain only numeric IDs separated by commas" }
+  $url = if ($NonInteractive) { $env:TELEGRAM_WEBAPP_URL } else { Read-Host "Public HTTPS Mini App URL (Enter to use local web only)" }
+  if ($url -and $url -notmatch '^https://') { throw "Telegram Mini App URL must use HTTPS" }
+  Set-DotEnvValue "TELEGRAM_BOT_TOKEN" $token
+  Set-DotEnvValue "TELEGRAM_ADMIN_IDS" $admin
+  if ($url) { Set-DotEnvValue "TELEGRAM_WEBAPP_URL" $url }
+  $ComposeProfile = @("--profile", "telegram")
+}
+
+docker compose @ComposeProfile config --quiet
+if ($LASTEXITCODE -ne 0) { throw "docker-compose.yml or .env validation failed" }
+docker compose @ComposeProfile up -d --build --remove-orphans
+if ($LASTEXITCODE -ne 0) { docker compose @ComposeProfile logs --tail=100; throw "docker compose failed" }
+if (-not (Wait-Http "http://localhost:8000/api/health" 120)) { docker compose @ComposeProfile logs --tail=100 api; throw "API health check failed" }
+if (-not (Wait-Http "http://localhost:5173" 120)) { docker compose @ComposeProfile logs --tail=100 web; throw "Web health check failed" }
+
+Write-Host "`nZMK Vision installed and verified successfully." -ForegroundColor Green
 Write-Host "Dashboard: http://localhost:5173"
 Write-Host "API docs:  http://localhost:8000/docs"
 Start-Process "http://localhost:5173"
-Read-Host "Press Enter to close"
+if (-not $NonInteractive) { Read-Host "Press Enter to close" }

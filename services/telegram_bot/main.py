@@ -1,13 +1,13 @@
 """ZMK Vision Telegram control plane: polling bot + Mini App launcher."""
 from __future__ import annotations
-import asyncio, csv, io, logging, os
+import asyncio, html, logging, os
 from datetime import datetime
 from typing import Any
 import httpx
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BufferedInputFile, CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
+from aiogram.types import BufferedInputFile, CallbackQuery, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
 from aiogram.client.default import DefaultBotProperties
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
@@ -41,11 +41,18 @@ def menu(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def api(method: str, path: str, **kwargs: Any) -> Any:
+    attempts=3 if method.upper()=="GET" else 1
     async with httpx.AsyncClient(base_url=API_URL, timeout=15, headers={"X-API-Key":API_KEY} if API_KEY else {}) as client:
-        response = await client.request(method, path, **kwargs)
-        response.raise_for_status()
-        content_type = response.headers.get("content-type", "")
-        return response.json() if "json" in content_type else response.content
+        for attempt in range(attempts):
+            try:
+                response = await client.request(method, path, **kwargs)
+                response.raise_for_status()
+                content_type = response.headers.get("content-type", "")
+                return response.json() if "json" in content_type else response.content
+            except (httpx.ConnectError,httpx.TimeoutException,httpx.RemoteProtocolError):
+                if attempt+1>=attempts: raise
+                await asyncio.sleep(.5*(attempt+1))
+    raise RuntimeError("API request failed")
 
 def dashboard_text(d: dict[str, Any]) -> str:
     return ("<b>📊 ZMK Vision — состояние</b>\n\n"
@@ -59,7 +66,7 @@ def dashboard_text(d: dict[str, Any]) -> str:
 
 def event_text(e: dict[str, Any]) -> str:
     labels={"no_helmet":"Без каски","no_vest":"Без жилета","phone_usage":"Телефон","smoking":"Курение","restricted_zone":"Опасная зона","immobility":"Неподвижность"}
-    return f"• <b>{labels.get(e['type'],e['type'])}</b> · {e.get('camera_name',e['camera_id'])} · {round(e['confidence']*100)}% · {e['severity']}"
+    return f"• <b>{html.escape(labels.get(e['type'],e['type']))}</b> · {html.escape(str(e.get('camera_name',e['camera_id'])))} · {round(e['confidence']*100)}% · {html.escape(str(e['severity']))}"
 
 async def guard(message: Message, minimum: str = "viewer") -> bool:
     uid = message.from_user.id if message.from_user else 0
@@ -86,7 +93,7 @@ async def status(message: Message):
 async def cameras(message: Message):
     if not await guard(message): return
     data=await api("GET","/api/cameras")
-    text="<b>📷 Камеры</b>\n\n"+"\n".join(f"{'🟢' if c['status']=='online' else '🔴'} <b>{c['name']}</b> · {c['zone']} · {c['fps']} FPS" for c in data)
+    text="<b>📷 Камеры</b>\n\n"+"\n".join(f"{'🟢' if c['status']=='online' else '🔴'} <b>{html.escape(str(c['name']))}</b> · {html.escape(str(c['zone']))} · {c['fps']} FPS" for c in data)
     await message.answer(text)
 
 @router.message(Command("events"))
@@ -99,7 +106,7 @@ async def events(message: Message):
 async def logs_cmd(message: Message):
     if not await guard(message, "operator"): return
     report=await api("GET","/api/reports/errors?hours=24")
-    lines=[f"• <code>{x['level']}</code> {x['service']} / {x.get('camera_id') or '—'}\n  {x['message']}" for x in report['items'][:10]]
+    lines=[f"• <code>{html.escape(str(x['level']))}</code> {html.escape(str(x['service']))} / {html.escape(str(x.get('camera_id') or '—'))}\n  {html.escape(str(x['message']))}" for x in report['items'][:10]]
     await message.answer("<b>🧾 Ошибки за 24 часа</b>\n"+" · ".join(f"{k}: <b>{v}</b>" for k,v in report['summary'].items())+"\n\n"+("\n".join(lines) or "Ошибок нет"))
 
 @router.message(Command("report"))
@@ -112,7 +119,7 @@ async def report_cmd(message: Message):
 async def models_cmd(message: Message):
     if not await guard(message): return
     data=await api("GET","/api/models")
-    text="<b>🧠 Реестр моделей</b>\n\n"+"\n".join(f"{'✅' if m['active'] else '▫️'} <b>{m['name']}</b> · P {m['precision']}% / R {m['recall']}%" for m in data)
+    text="<b>🧠 Реестр моделей</b>\n\n"+"\n".join(f"{'✅' if m['active'] else '▫️'} <b>{html.escape(str(m['name']))}</b> · P {m['precision']}% / R {m['recall']}%" for m in data)
     await message.answer(text)
 
 @router.message(Command("switch_model"))
@@ -145,25 +152,25 @@ async def train_cmd(message: Message, command: CommandObject):
     camera=(command.args or "").strip()
     if not camera: await message.answer("Использование: <code>/train cam_01</code>"); return
     job=await api("POST","/api/training/jobs",json={"camera_id":camera,"image_count":100,"epochs":20})
-    await message.answer(f"🧠 Дообучение запущено\nJob: <b>#{job['id']}</b>\nМодель: <code>{job['target_name']}</code>")
+    await message.answer(f"🧠 Дообучение запущено\nJob: <b>#{job['id']}</b>\nМодель: <code>{html.escape(str(job['target_name']))}</code>")
 
 @router.message(Command("users"))
 async def users_cmd(message: Message):
     if not await guard(message,"admin"): return
     users=await api("GET","/api/admin/users")
-    await message.answer("<b>👥 Пользователи</b>\n\n"+"\n".join(f"{'🟢' if u['active'] else '⚪'} {u['name']} · <code>{u['role']}</code>" for u in users))
+    await message.answer("<b>👥 Пользователи</b>\n\n"+"\n".join(f"{'🟢' if u['active'] else '⚪'} {html.escape(str(u['name']))} · <code>{html.escape(str(u['role']))}</code>" for u in users))
 
 @router.message(Command("alert_test"))
 async def alert_test_cmd(message: Message):
     if not await guard(message,"admin"): return
     error=await api("POST","/api/admin/logs/simulate-error")
-    await message.answer(f"🚨 <b>Тестовое оповещение</b>\n<code>{error['level']}</code> {error['service']}\n{error['message']}")
+    await message.answer(f"🚨 <b>Тестовое оповещение</b>\n<code>{html.escape(str(error['level']))}</code> {html.escape(str(error['service']))}\n{html.escape(str(error['message']))}")
 
 @router.message(Command("health"))
 async def health_cmd(message: Message):
     if not await guard(message): return
     h=await api("GET","/api/system-health")
-    await message.answer("<b>🩺 System health</b>\n\n"+f"CPU {h['cpu']}% · RAM {h['ram']}% · GPU {h['gpu']}% · VRAM {h['vram']}% · Disk {h['disk']}%\n"+"\n".join(f"🟢 {x['name']}: {x['status']}" for x in h['services']))
+    await message.answer("<b>🩺 System health</b>\n\n"+f"CPU {h['cpu']}% · RAM {h['ram']}% · GPU {h['gpu']}% · VRAM {h['vram']}% · Disk {h['disk']}%\n"+"\n".join(f"🟢 {html.escape(str(x['name']))}: {html.escape(str(x['status']))}" for x in h['services']))
 
 @router.callback_query(F.data.in_({"status","cameras","events","errors","models","health","report"}))
 async def callbacks(query: CallbackQuery):
@@ -172,13 +179,13 @@ async def callbacks(query: CallbackQuery):
     await query.answer(); message=query.message
     if query.data=="status": await message.answer(dashboard_text(await api("GET","/api/dashboard")),reply_markup=menu(query.from_user.id))
     elif query.data=="cameras":
-        data=await api("GET","/api/cameras"); await message.answer("<b>📷 Камеры</b>\n\n"+"\n".join(f"{'🟢' if c['status']=='online' else '🔴'} <b>{c['name']}</b> · {c['fps']} FPS" for c in data))
+        data=await api("GET","/api/cameras"); await message.answer("<b>📷 Камеры</b>\n\n"+"\n".join(f"{'🟢' if c['status']=='online' else '🔴'} <b>{html.escape(str(c['name']))}</b> · {c['fps']} FPS" for c in data))
     elif query.data=="events":
         data=await api("GET","/api/events?limit=10"); await message.answer("<b>🚨 События</b>\n\n"+"\n".join(event_text(x) for x in data))
     elif query.data=="errors":
         r=await api("GET","/api/reports/errors?hours=24"); await message.answer("<b>🧾 Ошибки</b>\n"+" · ".join(f"{k}: <b>{v}</b>" for k,v in r['summary'].items()))
     elif query.data=="models":
-        data=await api("GET","/api/models"); await message.answer("<b>🧠 Модели</b>\n\n"+"\n".join(f"{'✅' if m['active'] else '▫️'} {m['name']}" for m in data))
+        data=await api("GET","/api/models"); await message.answer("<b>🧠 Модели</b>\n\n"+"\n".join(f"{'✅' if m['active'] else '▫️'} {html.escape(str(m['name']))}" for m in data))
     elif query.data=="health":
         h=await api("GET","/api/system-health"); await message.answer(f"<b>🩺 Health</b>\nCPU {h['cpu']}% · RAM {h['ram']}% · GPU {h['gpu']}%")
     elif query.data=="report":
@@ -201,8 +208,19 @@ async def alert_worker(bot: Bot):
         except Exception: log.exception("Alert worker iteration failed")
         await asyncio.sleep(5)
 
+@router.errors()
+async def telegram_error(event: ErrorEvent):
+    log.exception("Telegram update failed",exc_info=event.exception)
+    message=getattr(event.update,"message",None)
+    if message:
+        try: await message.answer("⚠️ Команда временно недоступна. Проверьте состояние API или повторите позже.")
+        except Exception: pass
+    return True
+
 async def main():
     if not TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+    if not (WEBAPP_URL.startswith("https://") or WEBAPP_URL.startswith("http://localhost")): raise RuntimeError("TELEGRAM_WEBAPP_URL must use HTTPS")
+    if not (ADMINS or OPERATORS or VIEWERS): log.warning("Telegram whitelist is empty; all users will be denied")
     bot=Bot(TOKEN,default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp=Dispatcher(); dp.include_router(router)
     log.info("Starting bot; API=%s; admins=%d operators=%d viewers=%d",API_URL,len(ADMINS),len(OPERATORS),len(VIEWERS))

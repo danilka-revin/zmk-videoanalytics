@@ -8,15 +8,20 @@ services:
       ZMK_API_KEY: ${ZMK_API_KEY:-}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      RTSP_CAM_01: ${RTSP_CAM_01:-rtsp://camera-01/stream}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ADMIN_IDS: ${TELEGRAM_ADMIN_IDS:-}
+      TELEGRAM_OPERATOR_IDS: ${TELEGRAM_OPERATOR_IDS:-}
+      TELEGRAM_VIEWER_IDS: ${TELEGRAM_VIEWER_IDS:-}
     restart: unless-stopped
     healthcheck: {test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"], interval: 15s, timeout: 3s, retries: 3}
   web:
-    image: node:20-alpine
-    working_dir: /app
-    command: sh -c "npm install && npm run dev -- --host 0.0.0.0"
-    volumes: ["./frontend:/app"]
-    ports: ["5173:5173"]
-    depends_on: [api]
+    build: ./frontend
+    ports: ["5173:80"]
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
   telegram-bot:
     build: ./services/telegram_bot
     profiles: ["telegram"]
