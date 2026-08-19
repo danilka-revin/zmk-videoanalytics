@@ -18,12 +18,14 @@ def test_error_report_and_csv():
 
 def test_hot_swap_is_atomic_and_audited():
     with TestClient(app) as c:
-        result = c.post('/api/models/siz-guard-v2.0/activate')
+        models = c.get('/api/models').json()
+        target = next(x['name'] for x in models if not x['active'] and x['status'] == 'ready')
+        result = c.post(f'/api/models/{target}/activate')
         assert result.status_code == 200
         assert result.json()['hot_swap'] is True
         assert result.json()['downtime_ms'] == 0
         models = c.get('/api/models').json()
-        assert next(x for x in models if x['name'] == 'siz-guard-v2.0')['active'] is True
+        assert next(x for x in models if x['name'] == target)['active'] is True
         assert c.post('/api/models/missing/activate').status_code == 404
 
 

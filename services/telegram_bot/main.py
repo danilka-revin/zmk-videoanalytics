@@ -82,7 +82,7 @@ async def start(message: Message):
 @router.message(Command("help"))
 async def help_cmd(message: Message):
     if not await guard(message): return
-    await message.answer("/status — состояние\n/cameras — камеры\n/events — события\n/logs — ошибки\n/report — CSV\n/models — модели\n/switch_model &lt;name&gt; — hot-swap (admin)\n/thresholds — пороги AI\n/set_threshold &lt;metric&gt; &lt;value&gt; — изменить порог\n/train &lt;camera_id&gt; — дообучение\n/users — пользователи\n/alert_test — тест тревоги\n/health — сервисы", reply_markup=menu(message.from_user.id))
+    await message.answer("/status — состояние\n/cameras — камеры\n/events — события\n/logs — ошибки\n/report — CSV\n/models — модели\n/switch_model &lt;name&gt; — hot-swap (admin)\n/thresholds — пороги AI\n/set_threshold &lt;metric&gt; &lt;value&gt; — изменить порог\n/train &lt;camera_id&gt; — дообучение\n/cancel_training &lt;job_id&gt; — отменить обучение\n/users — пользователи\n/alert_test — тест тревоги\n/health — сервисы", reply_markup=menu(message.from_user.id))
 
 @router.message(Command("status"))
 async def status(message: Message):
@@ -133,13 +133,13 @@ async def switch_model(message: Message, command: CommandObject):
 async def thresholds_cmd(message: Message):
     if not await guard(message,"operator"): return
     cfg=await api("GET","/api/admin/config"); ai=cfg["inference"]
-    await message.answer("<b>🎚 Пороги AI</b>\n"+"\n".join(f"<code>{k}</code>: <b>{ai[k]}</b>" for k in ["helmet_conf","vest_conf","phone_conf","nms_iou"]))
+    await message.answer("<b>🎚 Пороги AI</b>\n"+"\n".join(f"<code>{k}</code>: <b>{ai[k]}</b>" for k in ["helmet_conf","vest_conf","phone_conf","smoking_conf","restricted_zone_conf","immobility_conf","nms_iou"]))
 
 @router.message(Command("set_threshold"))
 async def set_threshold_cmd(message: Message, command: CommandObject):
     if not await guard(message,"admin"): return
     parts=(command.args or "").split()
-    if len(parts)!=2 or parts[0] not in {"helmet_conf","vest_conf","phone_conf"}:
+    if len(parts)!=2 or parts[0] not in {"helmet_conf","vest_conf","phone_conf","smoking_conf","restricted_zone_conf","immobility_conf"}:
         await message.answer("Использование: <code>/set_threshold helmet_conf 0.85</code>"); return
     try: value=float(parts[1])
     except ValueError: await message.answer("Значение должно быть числом 0.1–1.0"); return
@@ -153,6 +153,14 @@ async def train_cmd(message: Message, command: CommandObject):
     if not camera: await message.answer("Использование: <code>/train cam_01</code>"); return
     job=await api("POST","/api/training/jobs",json={"camera_id":camera,"image_count":100,"epochs":20})
     await message.answer(f"🧠 Дообучение запущено\nJob: <b>#{job['id']}</b>\nМодель: <code>{html.escape(str(job['target_name']))}</code>")
+
+@router.message(Command("cancel_training"))
+async def cancel_training_cmd(message: Message, command: CommandObject):
+    if not await guard(message,"admin"): return
+    value=(command.args or "").strip()
+    if not value.isdigit(): await message.answer("Использование: <code>/cancel_training 123</code>"); return
+    result=await api("POST",f"/api/training/jobs/{value}/cancel")
+    await message.answer(f"🛑 Задача <b>#{result['id']}</b> отменена")
 
 @router.message(Command("users"))
 async def users_cmd(message: Message):

@@ -1,18 +1,24 @@
-# ZMK Vision v1.2.3 — Beginner Guide
+# ZMK Vision v1.2.4 — Model Pipeline Hardening
 
-## Новое
-- Добавлена подробная русскоязычная инструкция для начинающих: `docs/BEGINNER_GUIDE_RU.md`.
-- Пошагово описаны установка на Windows и Linux, первый запуск, Docker, Telegram, Mini App, API key, RTSP, диагностика, резервное копирование, обновление и удаление.
-- В README добавлена заметная ссылка на руководство.
+## Модель и inference gateway
+- Добавлена идемпотентность детекций по `detection_id`; повторная доставка возвращает существующий `event_id`.
+- Добавлена строгая проверка bbox и временного окна timestamp.
+- Для всех шести типов событий используются отдельные настраиваемые confidence thresholds.
+- Обработка batch и чтение активной модели выполняются в одной транзакции с hot-swap.
+- RTSP/model payload проходит расширенную валидацию.
 
-## Исправлено
-- Пустой `TELEGRAM_WEBAPP_URL` теперь корректно переключает Compose на локальный fallback вместо фиктивного домена.
-- Windows и Linux установщики всегда обновляют значение Mini App URL без накопления устаревших параметров.
-- Проверки установщиков, Windows PowerShell CI и release gates сохранены.
+## Реестр и hot-swap
+- Повторная активация текущей модели стала идемпотентной и не создаёт ложный audit log.
+- Добавлен quality gate по минимальным Precision/Recall.
+- Добавлен health endpoint активной модели и автоматическое восстановление некорректной ссылки active_model.
+- Время control-plane переключения измеряется отдельно.
 
-## Установка
-- Windows 10/11: распакуйте полный ZIP и запустите `installers/install-windows.bat`.
-- Ubuntu/Debian: распакуйте полный TAR.GZ и выполните `bash installers/install-linux.sh`.
-- Проверка без установки: `bash installers/install-linux.sh --check` или `install-windows.bat -CheckOnly`.
+## Обучение
+- Одновременно допускается одна GPU-задача, что предотвращает конкуренцию за VRAM.
+- Добавлена отмена через API, Web и Telegram.
+- Background tasks отслеживаются и корректно завершаются при остановке API.
+- Ошибки, отмена и перезапуск получают явные terminal statuses.
+- Коллизии имён обучаемых моделей блокируются.
 
-Начинающим рекомендуется сначала открыть `docs/BEGINNER_GUIDE_RU.md`.
+## Проверки
+Расширенный набор regression-тестов проверяет модельный gateway, idempotency, thresholds, geometry, timestamps, hot-swap, health, quality gate, single-job guard и cancellation.
