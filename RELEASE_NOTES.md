@@ -1,24 +1,18 @@
-# ZMK Vision v1.2.2 — Reliability & Installer Fixes
+# ZMK Vision v1.2.3 — Beginner Guide
 
-Исправляющий релиз, направленный на предсказуемую установку, безопасность данных и устойчивость интеграций.
+## Новое
+- Добавлена подробная русскоязычная инструкция для начинающих: `docs/BEGINNER_GUIDE_RU.md`.
+- Пошагово описаны установка на Windows и Linux, первый запуск, Docker, Telegram, Mini App, API key, RTSP, диагностика, резервное копирование, обновление и удаление.
+- В README добавлена заметная ссылка на руководство.
 
-## Исправления
-- Windows PowerShell installer теперь обязательно проходит реальный parse/dry-check на `windows-latest` до публикации релиза.
-- Установщики Windows и Linux получили dry-check, проверку полного архива, валидацию Telegram-параметров, Compose config и ожидание health checks.
-- Установщик выводит логи сервиса при неуспешном запуске и не сообщает об успехе до готовности API и Web.
-- Production Web переведён с Vite dev server на multi-stage Nginx image.
-- Добавлены SPA fallback, API reverse proxy, CSP и отдельная политика iframe для Telegram Mini App.
-- Telegram Mini App теперь передаёт подписанный `initData`; backend проверяет HMAC, срок и whitelist/RBAC.
-- RTSP credentials скрыты из API-ответов, входные URL и timestamps валидируются.
-- CSV export защищён от spreadsheet formula injection.
-- SQLite включает WAL, foreign keys, busy timeout и persistent volume.
-- Прерванные задачи обучения получают статус failed; коллизии имён моделей отклоняются.
-- Telegram HTML экранируется, GET-запросы к API повторяются при временных сетевых ошибках.
-- Удалена внешняя зависимость интерфейса от Google Fonts.
-- Исправлены загрузки CSV при включённом API key.
-- Повреждённые настройки localStorage больше не блокируют запуск интерфейса.
+## Исправлено
+- Пустой `TELEGRAM_WEBAPP_URL` теперь корректно переключает Compose на локальный fallback вместо фиктивного домена.
+- Windows и Linux установщики всегда обновляют значение Mini App URL без накопления устаревших параметров.
+- Проверки установщиков, Windows PowerShell CI и release gates сохранены.
 
 ## Установка
 - Windows 10/11: распакуйте полный ZIP и запустите `installers/install-windows.bat`.
 - Ubuntu/Debian: распакуйте полный TAR.GZ и выполните `bash installers/install-linux.sh`.
 - Проверка без установки: `bash installers/install-linux.sh --check` или `install-windows.bat -CheckOnly`.
+
+Начинающим рекомендуется сначала открыть `docs/BEGINNER_GUIDE_RU.md`.

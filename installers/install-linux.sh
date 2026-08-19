@@ -56,7 +56,7 @@ if [[ -n "$TOKEN" ]]; then
   [[ -z "$WEBAPP" || "$WEBAPP" == https://* ]] || fail "Telegram Mini App URL must use HTTPS"
   set_env TELEGRAM_BOT_TOKEN "$TOKEN"
   set_env TELEGRAM_ADMIN_IDS "$ADMIN"
-  [[ -z "$WEBAPP" ]] || set_env TELEGRAM_WEBAPP_URL "$WEBAPP"
+  set_env TELEGRAM_WEBAPP_URL "$WEBAPP"
   PROFILE=(--profile telegram)
 fi
 

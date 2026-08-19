@@ -77,7 +77,7 @@ def init_db():
 async def lifespan(app: FastAPI):
     init_db(); yield
 
-app=FastAPI(title="ZMK Vision API",version="1.2.2",description="On-premise API контура видеоаналитики",lifespan=lifespan)
+app=FastAPI(title="ZMK Vision API",version="1.2.3",description="On-premise API контура видеоаналитики",lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:5173").split(",") if x.strip()],allow_credentials=True,allow_methods=["GET","POST","PUT","PATCH","DELETE"],allow_headers=["Content-Type","X-API-Key","X-Telegram-Init-Data"])
 
 def telegram_webapp_role(init_data:str)->str|None:
@@ -169,7 +169,7 @@ def rows(query,args=()):
     con=db(); result=[dict(r) for r in con.execute(query,args).fetchall()]; con.close(); return result
 
 @app.get("/api/health")
-def health(): return {"status":"ok","version":"1.2.2","uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
+def health(): return {"status":"ok","version":"1.2.3","uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
 
 @app.get("/api/dashboard")
 def dashboard():

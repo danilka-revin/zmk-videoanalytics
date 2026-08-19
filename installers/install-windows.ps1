@@ -73,7 +73,7 @@ if ($token) {
   if ($url -and $url -notmatch '^https://') { throw "Telegram Mini App URL must use HTTPS" }
   Set-DotEnvValue "TELEGRAM_BOT_TOKEN" $token
   Set-DotEnvValue "TELEGRAM_ADMIN_IDS" $admin
-  if ($url) { Set-DotEnvValue "TELEGRAM_WEBAPP_URL" $url }
+  Set-DotEnvValue "TELEGRAM_WEBAPP_URL" $url
   $ComposeProfile = @("--profile", "telegram")
 }
 
