@@ -96,7 +96,7 @@ install-windows.bat
 3. при необходимости установит Docker Desktop через `winget`;
 4. запустит Docker;
 5. создаст файл настроек `.env`;
-6. предложит подключить Telegram;
+6. предложит выбрать Telegram, MAX или запуск без бота;
 7. соберёт контейнеры;
 8. дождётся запуска API и Web-панели;
 9. откроет интерфейс в браузере.
@@ -208,7 +208,7 @@ http://localhost:8000/api/health
 ```json
 {
   "status": "ok",
-  "version": "1.3.0"
+  "version": "1.4.0"
 }
 ```
 
@@ -247,7 +247,7 @@ http://localhost:8000/docs
 
 ---
 
-# Часть D. Настройка Telegram
+# Часть D. Настройка мессенджера: Telegram или MAX
 
 ## 14. Создание бота
 
@@ -352,11 +352,47 @@ TELEGRAM_WEBAPP_URL=https://vision.example.ru/telegram
 
 Backend проверяет подпись Telegram `initData`, время авторизации и роль пользователя. Не добавляйте посторонние Telegram ID в whitelist.
 
+## 19. Альтернатива: бот в мессенджере MAX
+
+Вместо Telegram можно запустить отдельного бота для MAX.
+
+1. Откройте в MAX системного бота `@MasterBot`.
+2. Создайте бота и получите token.
+3. Узнайте свой числовой MAX user ID.
+4. Заполните `.env`:
+
+```env
+MAX_BOT_TOKEN=your_max_bot_token
+MAX_ADMIN_IDS=123456789
+MAX_OPERATOR_IDS=
+MAX_VIEWER_IDS=
+```
+
+5. Запустите:
+
+```bash
+docker compose --profile max up -d --build
+```
+
+Бот MAX поддерживает состояние системы, камеры, события, логи, CSV-отчёты, модели, hot-swap, thresholds, обучение, отмену обучения и тестовые тревоги.
+
+Установщик предлагает выбор:
+
+```text
+1 — Telegram
+2 — MAX
+0 — без бота
+```
+
+Одновременно запускается только выбранный bot-сервис. Для автоматической установки без вопросов используйте `MESSENGER_PROVIDER=telegram`, `MESSENGER_PROVIDER=max` или `MESSENGER_PROVIDER=none`.
+
+Официальная документация MAX Bot API: https://dev.max.ru/docs-api/
+
 ---
 
 # Часть E. Защита системы
 
-## 19. API-ключ
+## 20. API-ключ
 
 Для локального знакомства ключ можно оставить пустым. Для сервера создайте длинный случайный ключ:
 
@@ -374,7 +410,7 @@ ZMK_API_KEY=replace-with-a-long-random-value-of-at-least-32-characters
 
 Если ключ неверный, панель покажет ошибку получения данных.
 
-## 20. Пароли инфраструктуры
+## 21. Пароли инфраструктуры
 
 Перед production-запуском замените:
 
@@ -386,7 +422,7 @@ MINIO_ROOT_PASSWORD=change-before-production
 
 Не используйте одинаковые пароли и не добавляйте `.env` в Git.
 
-## 21. CORS
+## 22. CORS
 
 Если панель открывается через домен, укажите его:
 
@@ -400,7 +436,7 @@ CORS_ORIGINS=https://vision.example.ru
 
 # Часть F. Камеры
 
-## 22. RTSP URL
+## 23. RTSP URL
 
 Пример:
 
@@ -423,7 +459,7 @@ RTSP-пароли не возвращаются через API списка ка
 
 # Часть G. Диагностика
 
-## 23. Состояние контейнеров
+## 24. Состояние контейнеров
 
 ```bash
 docker compose ps
@@ -431,7 +467,7 @@ docker compose ps
 
 У работающих сервисов должен быть статус `Up` или `healthy`.
 
-## 24. Все последние логи
+## 25. Все последние логи
 
 ```bash
 docker compose logs --tail=200
@@ -443,6 +479,8 @@ docker compose logs --tail=200
 docker compose logs --tail=200 api
 docker compose logs --tail=200 web
 docker compose logs --tail=200 telegram-bot
+# или
+docker compose logs --tail=200 max-bot
 ```
 
 Наблюдение в реальном времени:
@@ -453,7 +491,7 @@ docker compose logs -f api
 
 Выход из просмотра логов: `Ctrl+C`.
 
-## 25. Перезапуск
+## 26. Перезапуск
 
 ```bash
 docker compose restart
@@ -465,7 +503,7 @@ docker compose restart
 docker compose up -d --build --remove-orphans
 ```
 
-## 26. Порт уже занят
+## 27. Порт уже занят
 
 Если появляется ошибка `port is already allocated`, найдите программу, которая использует порт `5173` или `8000`.
 
@@ -484,7 +522,7 @@ sudo ss -ltnp | grep -E ':5173|:8000'
 
 Остановите конфликтующую программу или измените внешний порт в `docker-compose.yml`.
 
-## 27. Панель открывается, но данных нет
+## 28. Панель открывается, но данных нет
 
 Проверьте:
 
@@ -496,23 +534,27 @@ sudo ss -ltnp | grep -E ':5173|:8000'
 
 Для сброса настроек интерфейса откройте персонализацию и нажмите **Сбросить**.
 
-## 28. Telegram-бот молчит
+## 29. Telegram/MAX-бот молчит
 
 Проверьте:
 
 ```bash
 docker compose logs --tail=200 telegram-bot
+# или
+docker compose logs --tail=200 max-bot
 ```
 
 Частые причины:
 
 - неправильный token;
+- выбран не тот Compose profile (`telegram` или `max`);
 - Telegram ID отсутствует в whitelist;
 - бот уже запущен на другом компьютере;
 - API-контейнер недоступен;
-- Mini App URL использует HTTP вместо HTTPS.
+- Telegram Mini App URL использует HTTP вместо HTTPS;
+- у MAX-бота осталась webhook-подписка или неверный ID пользователя.
 
-## 29. Очистка зависших контейнеров
+## 30. Очистка зависших контейнеров
 
 ```bash
 docker compose down --remove-orphans
@@ -525,7 +567,7 @@ docker compose up -d --build
 
 # Часть H. Резервное копирование и обновление
 
-## 30. Резервная копия
+## 31. Резервная копия
 
 Перед обновлением остановите сервисы:
 
@@ -540,7 +582,7 @@ docker compose down
 - дополнительные конфигурации reverse proxy;
 - сертификаты HTTPS.
 
-## 31. Обновление через Git
+## 32. Обновление через Git
 
 ```bash
 git pull
@@ -553,7 +595,7 @@ docker compose up -d --build --remove-orphans
 curl http://localhost:8000/api/health
 ```
 
-## 32. Обновление из ZIP/TAR.GZ
+## 33. Обновление из ZIP/TAR.GZ
 
 1. сделайте резервную копию `.env` и `data`;
 2. скачайте новый релиз;
@@ -565,13 +607,13 @@ curl http://localhost:8000/api/health
 
 # Часть I. Остановка и удаление
 
-## 33. Остановить, сохранив данные
+## 34. Остановить, сохранив данные
 
 ```bash
 docker compose --profile telegram --profile production down --remove-orphans
 ```
 
-## 34. Windows
+## 35. Windows
 
 ```text
 installers\uninstall-windows.bat
@@ -583,7 +625,7 @@ installers\uninstall-windows.bat
 .\installers\uninstall-windows.ps1 -Purge
 ```
 
-## 35. Linux
+## 36. Linux
 
 Остановить и сохранить данные:
 
@@ -627,6 +669,12 @@ docker compose up -d --build
 
 ```bash
 docker compose --profile telegram up -d --build
+```
+
+Запуск с MAX:
+
+```bash
+docker compose --profile max up -d --build
 ```
 
 Проверка:

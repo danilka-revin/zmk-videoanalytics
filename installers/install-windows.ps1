@@ -7,7 +7,7 @@ $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
 function Assert-ProjectFiles {
-  $required = @("docker-compose.yml", ".env.example", "backend/Dockerfile", "frontend/Dockerfile", "services/telegram_bot/Dockerfile")
+  $required = @("docker-compose.yml", ".env.example", "backend/Dockerfile", "frontend/Dockerfile", "services/telegram_bot/Dockerfile", "services/max_bot/Dockerfile")
   foreach ($file in $required) { if (-not (Test-Path $file)) { throw "Missing project file: $file. Download and extract the complete release archive, not only the installer." } }
 }
 function Set-DotEnvValue([string]$Name, [string]$Value) {
@@ -63,19 +63,37 @@ docker compose version | Out-Host
 if ($LASTEXITCODE -ne 0) { throw "Docker Compose plugin is unavailable. Update Docker Desktop." }
 if (-not (Test-Path .env)) { Copy-Item .env.example .env }
 
-$token = if ($NonInteractive) { $env:TELEGRAM_BOT_TOKEN } else { Read-Host "Telegram bot token (Enter to skip bot)" }
-$ComposeProfile = @()
-if ($token) {
-  if ($token -notmatch '^\d+:[A-Za-z0-9_-]{20,}$') { throw "Telegram token format is invalid" }
-  $admin = if ($NonInteractive) { $env:TELEGRAM_ADMIN_IDS } else { Read-Host "Your Telegram numeric ID (admin)" }
-  if ($admin -notmatch '^\d+(,\d+)*$') { throw "Telegram admin ID must contain only numeric IDs separated by commas" }
-  $url = if ($NonInteractive) { $env:TELEGRAM_WEBAPP_URL } else { Read-Host "Public HTTPS Mini App URL (Enter to use local web only)" }
-  if ($url -and $url -notmatch '^https://') { throw "Telegram Mini App URL must use HTTPS" }
-  Set-DotEnvValue "TELEGRAM_BOT_TOKEN" $token
-  Set-DotEnvValue "TELEGRAM_ADMIN_IDS" $admin
-  Set-DotEnvValue "TELEGRAM_WEBAPP_URL" $url
-  $ComposeProfile = @("--profile", "telegram")
+$messenger = if ($NonInteractive) { if ($env:MESSENGER_PROVIDER) { $env:MESSENGER_PROVIDER } else { "none" } } else {
+  Write-Host "Choose messenger: 1 - Telegram, 2 - MAX, 0 - no bot"
+  $choice = Read-Host "Your choice [0/1/2]"
+  switch ($choice) { "1" { "telegram" } "2" { "max" } default { "none" } }
 }
+$ComposeProfile = @()
+switch ($messenger.ToLowerInvariant()) {
+  "telegram" {
+    $token = if ($NonInteractive) { $env:TELEGRAM_BOT_TOKEN } else { Read-Host "Telegram bot token" }
+    if ($token -notmatch '^\d+:[A-Za-z0-9_-]{20,}$') { throw "Telegram token format is invalid" }
+    $admin = if ($NonInteractive) { $env:TELEGRAM_ADMIN_IDS } else { Read-Host "Your Telegram numeric ID (admin)" }
+    if ($admin -notmatch '^\d+(,\d+)*$') { throw "Telegram admin ID must contain only numeric IDs separated by commas" }
+    $url = if ($NonInteractive) { $env:TELEGRAM_WEBAPP_URL } else { Read-Host "Public HTTPS Mini App URL (Enter for bot-only)" }
+    if ($url -and $url -notmatch '^https://') { throw "Telegram Mini App URL must use HTTPS" }
+    Set-DotEnvValue "TELEGRAM_BOT_TOKEN" $token; Set-DotEnvValue "TELEGRAM_ADMIN_IDS" $admin; Set-DotEnvValue "TELEGRAM_WEBAPP_URL" $url
+    Set-DotEnvValue "MAX_BOT_TOKEN" ""; Set-DotEnvValue "MESSENGER_PROVIDER" "telegram"
+    $ComposeProfile = @("--profile", "telegram")
+  }
+  "max" {
+    $token = if ($NonInteractive) { $env:MAX_BOT_TOKEN } else { Read-Host "MAX bot token from @MasterBot" }
+    if ($token -notmatch '^[A-Za-z0-9._:-]{20,500}$') { throw "MAX token format is invalid" }
+    $admin = if ($NonInteractive) { $env:MAX_ADMIN_IDS } else { Read-Host "Your MAX numeric ID (admin)" }
+    if ($admin -notmatch '^\d+(,\d+)*$') { throw "MAX admin ID must contain only numeric IDs separated by commas" }
+    Set-DotEnvValue "MAX_BOT_TOKEN" $token; Set-DotEnvValue "MAX_ADMIN_IDS" $admin
+    Set-DotEnvValue "TELEGRAM_BOT_TOKEN" ""; Set-DotEnvValue "MESSENGER_PROVIDER" "max"
+    $ComposeProfile = @("--profile", "max")
+  }
+  "none" { Set-DotEnvValue "TELEGRAM_BOT_TOKEN" ""; Set-DotEnvValue "MAX_BOT_TOKEN" ""; Set-DotEnvValue "MESSENGER_PROVIDER" "none" }
+  default { throw "MESSENGER_PROVIDER must be telegram, max or none" }
+}
+docker compose --profile telegram --profile max stop telegram-bot max-bot 2>$null | Out-Null
 
 docker compose @ComposeProfile config --quiet
 if ($LASTEXITCODE -ne 0) { throw "docker-compose.yml or .env validation failed" }

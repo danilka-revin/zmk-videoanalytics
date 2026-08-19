@@ -8,6 +8,7 @@ services:
       ZMK_API_KEY: ${ZMK_API_KEY:-}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      MESSENGER_PROVIDER: ${MESSENGER_PROVIDER:-none}
       RTSP_CAM_01: ${RTSP_CAM_01:-rtsp://camera-01/stream}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ADMIN_IDS: ${TELEGRAM_ADMIN_IDS:-}
@@ -31,6 +32,20 @@ services:
       TELEGRAM_OPERATOR_IDS: ${TELEGRAM_OPERATOR_IDS:-}
       TELEGRAM_VIEWER_IDS: ${TELEGRAM_VIEWER_IDS:-}
       TELEGRAM_WEBAPP_URL: ${TELEGRAM_WEBAPP_URL:-http://localhost:5173/telegram}
+      ZMK_API_URL: http://api:8000
+      ZMK_API_KEY: ${ZMK_API_KEY:-}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+  max-bot:
+    build: ./services/max_bot
+    profiles: ["max"]
+    environment:
+      MAX_BOT_TOKEN: ${MAX_BOT_TOKEN:-}
+      MAX_ADMIN_IDS: ${MAX_ADMIN_IDS:-}
+      MAX_OPERATOR_IDS: ${MAX_OPERATOR_IDS:-}
+      MAX_VIEWER_IDS: ${MAX_VIEWER_IDS:-}
       ZMK_API_URL: http://api:8000
       ZMK_API_KEY: ${ZMK_API_KEY:-}
     depends_on:

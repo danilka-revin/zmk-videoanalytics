@@ -7,6 +7,7 @@ def test_health_and_dashboard():
         assert c.get('/api/health').status_code == 200
         d=c.get('/api/dashboard').json()
         assert d['cameras']['total'] == 10
+        assert d['messenger_provider'] in {'none','telegram','max'}
 
 def test_simulate_and_ack():
     with TestClient(app) as c:

@@ -4,7 +4,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }
-required=(docker-compose.yml .env.example backend/Dockerfile frontend/Dockerfile services/telegram_bot/Dockerfile)
+required=(docker-compose.yml .env.example backend/Dockerfile frontend/Dockerfile services/telegram_bot/Dockerfile services/max_bot/Dockerfile)
 for file in "${required[@]}"; do [[ -f "$file" ]] || fail "Missing $file. Download and extract the complete release archive, not only the installer."; done
 
 if [[ "${1:-}" == "--check" ]]; then
@@ -48,18 +48,36 @@ wait_http(){
   return 1
 }
 
-if [[ -n "${NONINTERACTIVE:-}" ]]; then TOKEN="${TELEGRAM_BOT_TOKEN:-}"; else read -r -p "Telegram bot token (Enter to skip bot): " TOKEN; fi
-PROFILE=()
-if [[ -n "$TOKEN" ]]; then
-  [[ "$TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]] || fail "Telegram token format is invalid"
-  if [[ -n "${NONINTERACTIVE:-}" ]]; then ADMIN="${TELEGRAM_ADMIN_IDS:-}"; WEBAPP="${TELEGRAM_WEBAPP_URL:-}"; else read -r -p "Your Telegram numeric ID (admin): " ADMIN; read -r -p "Public HTTPS Mini App URL (Enter to use local web only): " WEBAPP; fi
-  [[ "$ADMIN" =~ ^[0-9]+(,[0-9]+)*$ ]] || fail "Telegram admin ID must contain numeric IDs separated by commas"
-  [[ -z "$WEBAPP" || "$WEBAPP" == https://* ]] || fail "Telegram Mini App URL must use HTTPS"
-  set_env TELEGRAM_BOT_TOKEN "$TOKEN"
-  set_env TELEGRAM_ADMIN_IDS "$ADMIN"
-  set_env TELEGRAM_WEBAPP_URL "$WEBAPP"
-  PROFILE=(--profile telegram)
+if [[ -n "${NONINTERACTIVE:-}" ]]; then
+  MESSENGER="${MESSENGER_PROVIDER:-none}"
+else
+  echo "Выберите мессенджер: 1 — Telegram, 2 — MAX, 0 — без бота"
+  read -r -p "Ваш выбор [0/1/2]: " CHOICE
+  case "$CHOICE" in 1) MESSENGER=telegram;; 2) MESSENGER=max;; 0|"") MESSENGER=none;; *) fail "Неизвестный вариант мессенджера";; esac
 fi
+PROFILE=()
+case "$MESSENGER" in
+  telegram)
+    if [[ -n "${NONINTERACTIVE:-}" ]]; then TOKEN="${TELEGRAM_BOT_TOKEN:-}"; ADMIN="${TELEGRAM_ADMIN_IDS:-}"; WEBAPP="${TELEGRAM_WEBAPP_URL:-}"; else read -r -p "Telegram bot token: " TOKEN; read -r -p "Ваш Telegram numeric ID (admin): " ADMIN; read -r -p "Public HTTPS Mini App URL (Enter для bot-only): " WEBAPP; fi
+    [[ "$TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]] || fail "Telegram token format is invalid"
+    [[ "$ADMIN" =~ ^[0-9]+(,[0-9]+)*$ ]] || fail "Telegram admin ID must contain numeric IDs separated by commas"
+    [[ -z "$WEBAPP" || "$WEBAPP" == https://* ]] || fail "Telegram Mini App URL must use HTTPS"
+    set_env TELEGRAM_BOT_TOKEN "$TOKEN"; set_env TELEGRAM_ADMIN_IDS "$ADMIN"; set_env TELEGRAM_WEBAPP_URL "$WEBAPP"
+    set_env MAX_BOT_TOKEN ""; set_env MESSENGER_PROVIDER "telegram"
+    PROFILE=(--profile telegram)
+    ;;
+  max)
+    if [[ -n "${NONINTERACTIVE:-}" ]]; then TOKEN="${MAX_BOT_TOKEN:-}"; ADMIN="${MAX_ADMIN_IDS:-}"; else read -r -p "MAX bot token от @MasterBot: " TOKEN; read -r -p "Ваш MAX numeric ID (admin): " ADMIN; fi
+    [[ "$TOKEN" =~ ^[A-Za-z0-9._:-]{20,500}$ ]] || fail "MAX token format is invalid"
+    [[ "$ADMIN" =~ ^[0-9]+(,[0-9]+)*$ ]] || fail "MAX admin ID must contain numeric IDs separated by commas"
+    set_env MAX_BOT_TOKEN "$TOKEN"; set_env MAX_ADMIN_IDS "$ADMIN"
+    set_env TELEGRAM_BOT_TOKEN ""; set_env MESSENGER_PROVIDER "max"
+    PROFILE=(--profile max)
+    ;;
+  none) set_env TELEGRAM_BOT_TOKEN ""; set_env MAX_BOT_TOKEN ""; set_env MESSENGER_PROVIDER "none";;
+  *) fail "MESSENGER_PROVIDER must be telegram, max or none";;
+esac
+"${DC[@]}" --profile telegram --profile max stop telegram-bot max-bot >/dev/null 2>&1 || true
 
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml or .env validation failed"
 if ! "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose startup failed"; fi

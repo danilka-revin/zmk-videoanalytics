@@ -193,7 +193,7 @@ async def alert_test_cmd(message: Message):
 async def health_cmd(message: Message):
     if not await guard(message): return
     h=await api("GET","/api/system-health")
-    await message.answer("<b>🩺 System health</b>\n\n"+f"CPU {h['cpu']}% · RAM {h['ram']}% · GPU {h['gpu']}% · VRAM {h['vram']}% · Disk {h['disk']}%\n"+"\n".join(f"🟢 {html.escape(str(x['name']))}: {html.escape(str(x['status']))}" for x in h['services']))
+    await message.answer("<b>🩺 System health</b>\n\n"+f"CPU {h['cpu']}% · RAM {h['ram']}% · GPU {h['gpu']}% · VRAM {h['vram']}% · Disk {h['disk']}%\nМессенджер: {h.get('messenger_provider','none')}\n"+"\n".join(f"🟢 {html.escape(str(x['name']))}: {html.escape(str(x['status']))}" for x in h['services']))
 
 @router.callback_query(F.data.in_({"status","cameras","events","errors","models","health","report"}))
 async def callbacks(query: CallbackQuery):

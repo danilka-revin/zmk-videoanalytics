@@ -30,6 +30,8 @@ try: RATE_LIMIT_PER_MINUTE = max(10,int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"
 except ValueError: RATE_LIMIT_PER_MINUTE = 120
 _rate_buckets: dict[str, list[float]] = {}
 _training_tasks: dict[int,asyncio.Task] = {}
+MESSENGER_PROVIDER = os.getenv("MESSENGER_PROVIDER", "none").lower()
+if MESSENGER_PROVIDER not in {"none", "telegram", "max"}: MESSENGER_PROVIDER = "none"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_ROLES = {**{int(x):"viewer" for x in os.getenv("TELEGRAM_VIEWER_IDS","").split(",") if x.strip().isdigit()},**{int(x):"operator" for x in os.getenv("TELEGRAM_OPERATOR_IDS","").split(",") if x.strip().isdigit()},**{int(x):"admin" for x in os.getenv("TELEGRAM_ADMIN_IDS","").split(",") if x.strip().isdigit()}}
 SYSTEM_RANDOM = secrets.SystemRandom()
@@ -123,7 +125,7 @@ async def lifespan(app: FastAPI):
         for task in list(_training_tasks.values()): task.cancel()
         if _training_tasks: await asyncio.gather(*list(_training_tasks.values()),return_exceptions=True)
 
-app=FastAPI(title="ZMK Vision API",version="1.3.0",description="On-premise API контура видеоаналитики",lifespan=lifespan)
+app=FastAPI(title="ZMK Vision API",version="1.4.0",description="On-premise API контура видеоаналитики",lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:5173").split(",") if x.strip()],allow_credentials=False,allow_methods=["GET","POST","PUT","PATCH","DELETE"],allow_headers=["Content-Type","X-API-Key","X-Telegram-Init-Data"])
 
 def custom_openapi():
@@ -234,7 +236,7 @@ def rows(query,args=()):
     con=db(); result=[dict(r) for r in con.execute(query,args).fetchall()]; con.close(); return result
 
 @app.get("/api/health")
-def health(): return {"status":"ok","version":"1.3.0","uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
+def health(): return {"status":"ok","version":"1.4.0","uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
 
 @app.get("/api/dashboard")
 def dashboard():
@@ -248,7 +250,7 @@ def dashboard():
         end=datetime.now(TZ)-timedelta(hours=h); start=end-timedelta(hours=1)
         n=con.execute("SELECT COUNT(*) FROM events WHERE timestamp BETWEEN ? AND ?",(start.isoformat(),end.isoformat())).fetchone()[0]
         trend.append({"label":end.strftime("%H:00"),"value":n})
-    con.close(); return {"cameras":{"total":total,"online":online},"events24h":events24,"critical_unacked":critical,"avg_fps":round(avg[0],1),"avg_latency_ms":round(avg[1]),"gpu_load":68,"active_model":model[0] if model else None,"precision":model[1] if model else None,"recall":model[2] if model else None,"trend":trend}
+    con.close(); return {"cameras":{"total":total,"online":online},"events24h":events24,"critical_unacked":critical,"avg_fps":round(avg[0],1),"avg_latency_ms":round(avg[1]),"gpu_load":68,"messenger_provider":MESSENGER_PROVIDER,"active_model":model[0] if model else None,"precision":model[1] if model else None,"recall":model[2] if model else None,"trend":trend}
 
 @app.get("/api/cameras")
 def cameras():
@@ -475,7 +477,7 @@ def simulate_error():
     con=db(); cur=con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(now_iso(),level,service,message,cam)); con.commit(); lid=cur.lastrowid; con.close(); return {"id":lid,"level":level,"service":service,"message":message,"camera_id":cam,"timestamp":now_iso()}
 
 @app.get("/api/system-health")
-def system_health(): return {"cpu":41,"ram":57,"gpu":68,"vram":72,"disk":38,"services":[{"name":n,"status":"healthy"} for n in ["ingestion","inference","events","archive","api"]]}
+def system_health(): return {"cpu":41,"ram":57,"gpu":68,"vram":72,"disk":38,"messenger_provider":MESSENGER_PROVIDER,"services":[{"name":n,"status":"healthy"} for n in ["ingestion","inference","events","archive","api"]]}
 def csv_safe(value:Any):
     """Prevent spreadsheet formula injection in exported operator-controlled fields."""
     if isinstance(value,str) and value.startswith(("=","+","-","@","\t","\r")): return "'"+value

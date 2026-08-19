@@ -2,11 +2,11 @@
 
 **ZMK Vision — локальная платформа интеллектуальной видеоаналитики для контроля промышленной безопасности, мониторинга камер и оперативного управления инцидентами.**
 
-Система объединяет RTSP-видеопотоки, AI-детекции, журнал событий, отчёты, администрирование, Telegram-бота и мобильное Telegram Mini App в едином on-premise контуре. Проект предназначен для производственных площадок, складов, проходных и опасных зон, где видеоданные и настройки должны оставаться внутри инфраструктуры организации.
+Система объединяет RTSP-видеопотоки, AI-детекции, журнал событий, отчёты, администрирование, бота на выбор для Telegram или MAX и мобильное Telegram Mini App в едином on-premise контуре. Проект предназначен для производственных площадок, складов, проходных и опасных зон, где видеоданные и настройки должны оставаться внутри инфраструктуры организации.
 
-> Впервые работаете с Docker и серверными приложениями? Откройте **[подробную инструкцию для начинающих](docs/BEGINNER_GUIDE_RU.md)** — в ней пошагово разобраны Windows, Linux, Telegram, камеры, безопасность, обновление и типовые ошибки.
+> Впервые работаете с Docker и серверными приложениями? Откройте **[подробную инструкцию для начинающих](docs/BEGINNER_GUIDE_RU.md)** — в ней пошагово разобраны Windows, Linux, Telegram, MAX, камеры, безопасность, обновление и типовые ошибки.
 
-![Version](https://img.shields.io/badge/version-1.3.0-25332d)
+![Version](https://img.shields.io/badge/version-1.4.0-25332d)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688)
 ![React](https://img.shields.io/badge/React-TypeScript-61dafb)
@@ -53,14 +53,15 @@
 - регистрация новой версии после завершения обучения;
 - ручная активация обученной модели после проверки метрик.
 
-### Telegram
+### Бот на выбор: Telegram или MAX
 
-- Telegram-бот на `aiogram 3`;
+- Telegram-бот на `aiogram 3` или MAX-бот на `maxapi`;
+- установщик запускает только выбранный мессенджер;
 - whitelist и разграничение доступа по ролям;
 - автоматические уведомления о новых критических событиях;
-- состояние системы, камеры, события, логи и отчёты;
+- состояние системы, камеры, события, логи и CSV-отчёты;
 - управление порогами, моделями и задачами обучения;
-- мобильное Telegram Mini App по маршруту `/telegram`.
+- Telegram дополнительно поддерживает Mini App по маршруту `/telegram`.
 
 ## Интерфейсы
 
@@ -91,7 +92,7 @@ docker compose up --build
 installers\install-windows.bat
 ```
 
-Установщик проверит Docker Desktop, создаст `.env`, предложит настроить Telegram и запустит систему.
+Установщик проверит Docker Desktop, создаст `.env`, предложит выбрать Telegram, MAX или запуск без бота и запустит систему.
 
 ### Ubuntu / Debian
 
@@ -123,7 +124,21 @@ docker compose --profile telegram up -d --build
 
 Telegram Mini App требует публичный HTTPS-адрес. Токены, RTSP-пароли и другие секреты не должны попадать в Git.
 
-### Команды бота
+## Запуск с MAX-ботом
+
+1. Создайте бота через `@MasterBot` в MAX.
+2. Заполните `MAX_BOT_TOKEN` и `MAX_ADMIN_IDS` в `.env`.
+3. Запустите только MAX-профиль:
+
+```bash
+docker compose --profile max up -d --build
+```
+
+Для переключения остановите прежний bot-сервис и запустите нужный профиль. Установщики Windows/Linux делают это автоматически и не запускают два бота одновременно.
+
+Подробнее: [`services/max_bot/README.md`](services/max_bot/README.md).
+
+### Команды ботов Telegram и MAX
 
 | Команда | Назначение | Минимальная роль |
 |---|---|---|
@@ -156,7 +171,7 @@ Inference Gateway → Event Processing
     ↓
 PostgreSQL / TimescaleDB ── MinIO Archive
     ↓
-Web Admin ── Telegram Bot ── Mini App ── СКУД Webhook
+Web Admin ── Telegram/MAX Bot ── Mini App ── СКУД Webhook
 ```
 
 Текущая версия запускается без GPU и реальных камер благодаря демонстрационному генератору. Канонический API-контракт уже проверяет модель, камеру, confidence и записывает принятые детекции в журнал. Для промышленного контура к нему подключается отдельный RTSP/inference worker.
@@ -168,6 +183,7 @@ Web Admin ── Telegram Bot ── Mini App ── СКУД Webhook
 - [Передача данных от модели](docs/MODEL_DATA_FLOW.md)
 - [Автодообучение](docs/AUTO_TRAINING.md)
 - [Telegram](services/telegram_bot/README.md)
+- [MAX](services/max_bot/README.md)
 
 ## Основные API
 
@@ -212,11 +228,12 @@ pip install -r backend/requirements-dev.txt
 PYTHONPATH=backend pytest backend/tests -q
 ```
 
-Telegram-бот:
+Боты Telegram и MAX:
 
 ```bash
-pip install -r services/telegram_bot/requirements.txt
+pip install -r services/telegram_bot/requirements.txt -r services/max_bot/requirements.txt
 PYTHONPATH=services/telegram_bot pytest services/telegram_bot/test_helpers.py -q
+PYTHONPATH=services/max_bot pytest services/max_bot/test_helpers.py -q
 ```
 
 Frontend:
@@ -236,6 +253,7 @@ npm run build
 backend/                 FastAPI, SQLite, события, модели и отчёты
 frontend/                React/TypeScript Web UI и Telegram Mini App
 services/telegram_bot/   Telegram-бот и push-оповещения
+services/max_bot/        MAX-бот и push-оповещения
 installers/              Установщики Windows и Linux
 docs/                    Архитектура и контракты
 docker-compose.yml       Локальная и production-конфигурация
@@ -244,7 +262,7 @@ docker-compose.yml       Локальная и production-конфигураци
 
 ## Статус
 
-Версия `1.3.0` является рабочим демонстрационным и интеграционным контуром. Web-панель, REST API, администрирование, отчёты, Telegram-интерфейсы, hot-swap и жизненный цикл обучения работают локально. Реальное распознавание требует подключения камер, GPU, весов моделей и размеченного набора данных.
+Версия `1.4.0` является рабочим демонстрационным и интеграционным контуром. Web-панель, REST API, администрирование, отчёты, Telegram/MAX-интерфейсы, hot-swap и жизненный цикл обучения работают локально. Реальное распознавание требует подключения камер, GPU, весов моделей и размеченного набора данных.
 
 ## Защита API и эксплуатационная безопасность
 
@@ -256,10 +274,10 @@ CORS_ORIGINS=https://vision.example.ru
 RATE_LIMIT_PER_MINUTE=120
 ```
 
-Web-панель принимает ключ в меню **Персонализация → Защищённый API** и хранит его только в `localStorage`. Telegram-сервис получает тот же ключ из окружения. API применяет constant-time проверку ключа, лимит размера запроса, rate limiting для admin/inference, запрет кэширования и защитные HTTP-заголовки.
+Web-панель принимает ключ в меню **Персонализация → Защищённый API** и хранит его только в `localStorage`. Telegram/MAX-сервисы получают тот же ключ из окружения. API применяет constant-time проверку ключа, лимит размера запроса, rate limiting для admin/inference, запрет кэширования и защитные HTTP-заголовки.
 
 SQLite размещается в Docker volume и работает в WAL-режиме с foreign keys и busy timeout. Пароли инфраструктурных PostgreSQL и MinIO задаются только через `.env` и должны быть заменены перед production-запуском. Telegram Mini App проходит HMAC-проверку `initData` и получает права только из whitelist ролей.
 
 ## Безопасность
 
-Не публикуйте `.env`, токены Telegram, RTSP URL с паролями, приватные SSH-ключи и production credentials. Для обнаруженных уязвимостей используйте приватный канал владельца репозитория, а не публичный Issue.
+Не публикуйте `.env`, токены Telegram/MAX, RTSP URL с паролями, приватные SSH-ключи и production credentials. Для обнаруженных уязвимостей используйте приватный канал владельца репозитория, а не публичный Issue.
