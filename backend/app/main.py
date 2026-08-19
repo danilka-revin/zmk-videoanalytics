@@ -3,7 +3,7 @@ import asyncio, csv, io, json, random, sqlite3, time
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -30,6 +30,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS model_registry(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, format TEXT NOT NULL, status TEXT NOT NULL, precision REAL, recall REAL, trained_at TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'baseline');
     CREATE TABLE IF NOT EXISTS training_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, camera_id TEXT NOT NULL, base_model TEXT NOT NULL, target_name TEXT NOT NULL, image_count INTEGER NOT NULL, epochs INTEGER NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL, error TEXT, FOREIGN KEY(camera_id) REFERENCES cameras(id));
+    CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, login TEXT UNIQUE NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
     """)
     if con.execute("SELECT COUNT(*) FROM cameras").fetchone()[0] == 0:
         cams=[(f"cam_{i:02}", f"Камера {i:02}", ["Цех №1","Склад","Проходная","Зона погрузки"][i%4], f"rtsp://camera-{i:02}/stream", "online" if i not in (7,) else "offline", round(random.uniform(6.8,9.8),1), random.randint(110,420),1,now_iso()) for i in range(1,11)]
@@ -42,6 +43,18 @@ def init_db():
             con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(now_iso(),level,"ai_inference",msg,"cam_07" if "07" in msg else None))
         defaults={"helmet_conf":"0.85","vest_conf":"0.80","phone_conf":"0.78","active_model":"siz-guard-v2.1"}
         con.executemany("INSERT INTO settings VALUES(?,?)", defaults.items())
+    config_defaults={
+        "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
+        "retention_days":"90", "archive_quality":"90", "archive_clip_seconds":"10",
+        "inference_fps":"8", "inference_device":"cuda:0", "batch_size":"4", "nms_iou":"0.45",
+        "telegram_enabled":"false", "telegram_chat_ids":"", "critical_alerts":"true",
+        "webhook_enabled":"false", "webhook_url":"", "webhook_timeout":"5",
+        "minio_endpoint":"minio:9000", "minio_bucket":"videoanalytics", "minio_secure":"false",
+        "rtsp_reconnect_seconds":"5", "event_cooldown_seconds":"30", "auto_training_enabled":"false"
+    }
+    for key,value in config_defaults.items(): con.execute("INSERT OR IGNORE INTO settings VALUES(?,?)",(key,value))
+    if con.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
+        con.executemany("INSERT INTO users(name,login,role,active,created_at) VALUES(?,?,?,?,?)",[("Алексей Петров","admin","admin",1,now_iso()),("Оператор смены","operator","operator",1,now_iso()),("Наблюдатель","viewer","viewer",1,now_iso())])
     if con.execute("SELECT COUNT(*) FROM model_registry").fetchone()[0] == 0:
         con.executemany("INSERT INTO model_registry(name,format,status,precision,recall,trained_at,source) VALUES(?,?,?,?,?,?,?)", [
             ("siz-guard-v2.1","TensorRT FP16","ready",92.4,87.1,now_iso(),"baseline"),
@@ -59,6 +72,20 @@ class CameraIn(BaseModel):
     name:str=Field(min_length=2,max_length=80); zone:str=Field(min_length=2,max_length=80); rtsp_url:str=""; enabled:bool=True
 class SettingIn(BaseModel): value:float=Field(ge=.1,le=1)
 class AckIn(BaseModel): note:str=Field(default="",max_length=500)
+class DetectionIn(BaseModel):
+    camera_id:str
+    model_name:str
+    timestamp:str|None=None
+    event_type:Literal["no_helmet","no_vest","phone_usage","smoking","restricted_zone","immobility"]
+    confidence:float=Field(ge=0,le=1)
+    person_id:str|None=None
+    bbox:list[float]=Field(default_factory=list,min_length=0,max_length=4)
+class DetectionBatch(BaseModel): detections:list[DetectionIn]=Field(min_length=1,max_length=500)
+class ConfigPatch(BaseModel): values:dict[str,Any]
+class UserIn(BaseModel):
+    name:str=Field(min_length=2,max_length=80)
+    login:str=Field(min_length=2,max_length=40)
+    role:Literal["admin","operator","viewer"]
 class TrainingIn(BaseModel):
     camera_id:str
     image_count:int=Field(default=100,ge=20,le=5000)
@@ -115,6 +142,77 @@ def simulate_event():
     con=db(); cur=con.execute("INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id) VALUES(?,?,?,?,?,?)",(now_iso(),cam,typ,sev,conf,f"P-{random.randint(1100,9999)}")); con.commit(); eid=cur.lastrowid; con.close()
     return {"id":eid,"timestamp":now_iso(),"camera_id":cam,"type":typ,"severity":sev,"confidence":conf}
 
+@app.post("/api/inference/detections")
+def ingest_detections(payload:DetectionBatch):
+    """Validated contract from inference workers to the event subsystem."""
+    con=db(); active=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()[0]
+    thresholds={"no_helmet":"helmet_conf","no_vest":"vest_conf","phone_usage":"phone_conf"}
+    accepted=[]; rejected=[]
+    for i,d in enumerate(payload.detections):
+        cam=con.execute("SELECT status,enabled FROM cameras WHERE id=?",(d.camera_id,)).fetchone()
+        reason=None
+        if d.model_name != active: reason=f"stale_model: active={active}"
+        elif not cam: reason="unknown_camera"
+        elif cam[0] != "online" or not cam[1]: reason="camera_unavailable"
+        else:
+            key=thresholds.get(d.event_type); threshold=float(con.execute("SELECT value FROM settings WHERE key=?",(key,)).fetchone()[0]) if key else .70
+            if d.confidence < threshold: reason=f"below_threshold:{threshold}"
+        if reason: rejected.append({"index":i,"reason":reason}); continue
+        severity="critical" if d.event_type in {"restricted_zone","immobility"} else "high" if d.event_type in {"no_helmet","smoking"} else "medium"
+        cur=con.execute("INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id) VALUES(?,?,?,?,?,?)",(d.timestamp or now_iso(),d.camera_id,d.event_type,severity,d.confidence,d.person_id))
+        accepted.append({"index":i,"event_id":cur.lastrowid})
+    con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","inference_gateway",f"batch model={active} accepted={len(accepted)} rejected={len(rejected)}"))
+    con.commit(); con.close(); return {"active_model":active,"accepted":accepted,"rejected":rejected,"received":len(payload.detections)}
+
+@app.get("/api/admin/config")
+def get_config():
+    data={r["key"]:r["value"] for r in rows("SELECT * FROM settings")}
+    groups={
+      "general":["site_name","timezone","language","retention_days"],
+      "inference":["inference_fps","inference_device","batch_size","nms_iou","helmet_conf","vest_conf","phone_conf","event_cooldown_seconds"],
+      "archive":["archive_quality","archive_clip_seconds","minio_endpoint","minio_bucket","minio_secure"],
+      "notifications":["telegram_enabled","telegram_chat_ids","critical_alerts"],
+      "integration":["webhook_enabled","webhook_url","webhook_timeout","rtsp_reconnect_seconds"],
+      "training":["auto_training_enabled"]}
+    return {g:{k:data.get(k,"") for k in keys} for g,keys in groups.items()}
+
+CONFIG_ALLOWED={"site_name","timezone","language","retention_days","inference_fps","inference_device","batch_size","nms_iou","helmet_conf","vest_conf","phone_conf","event_cooldown_seconds","archive_quality","archive_clip_seconds","minio_endpoint","minio_bucket","minio_secure","telegram_enabled","telegram_chat_ids","critical_alerts","webhook_enabled","webhook_url","webhook_timeout","rtsp_reconnect_seconds","auto_training_enabled"}
+@app.put("/api/admin/config")
+def update_config(payload:ConfigPatch):
+    unknown=set(payload.values)-CONFIG_ALLOWED
+    if unknown: raise HTTPException(422,f"Неизвестные параметры: {', '.join(sorted(unknown))}")
+    numeric={"retention_days":(1,3650),"inference_fps":(1,30),"batch_size":(1,64),"nms_iou":(.1,.95),"helmet_conf":(.1,1),"vest_conf":(.1,1),"phone_conf":(.1,1),"event_cooldown_seconds":(0,3600),"archive_quality":(10,100),"archive_clip_seconds":(2,120),"webhook_timeout":(1,60),"rtsp_reconnect_seconds":(1,300)}
+    for key,(lo,hi) in numeric.items():
+        if key in payload.values:
+            try: value=float(payload.values[key])
+            except (TypeError,ValueError): raise HTTPException(422,f"{key}: требуется число")
+            if not lo<=value<=hi: raise HTTPException(422,f"{key}: допустимо {lo}..{hi}")
+    current={r["key"]:r["value"] for r in rows("SELECT * FROM settings")}; merged={**current,**{k:str(v).lower() if isinstance(v,bool) else str(v) for k,v in payload.values.items()}}
+    if merged.get("webhook_enabled")=="true" and not merged.get("webhook_url","").startswith(("http://","https://")): raise HTTPException(422,"Для включения webhook укажите корректный HTTP(S) URL")
+    if merged.get("telegram_enabled")=="true" and not merged.get("telegram_chat_ids","").strip(): raise HTTPException(422,"Для Telegram укажите хотя бы один chat ID")
+    if not merged.get("minio_endpoint","").strip() or not merged.get("minio_bucket","").strip(): raise HTTPException(422,"MinIO endpoint и bucket обязательны")
+    con=db();
+    for key,value in payload.values.items(): con.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,str(value).lower() if isinstance(value,bool) else str(value)))
+    con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","admin",f"Configuration updated: {', '.join(payload.values.keys())}")); con.commit(); con.close()
+    return {"updated":list(payload.values),"restart_required":any(k in payload.values for k in {"inference_device","minio_endpoint"})}
+
+@app.get("/api/admin/users")
+def get_users(): return rows("SELECT id,name,login,role,active,created_at FROM users ORDER BY id")
+@app.post("/api/admin/users",status_code=201)
+def create_user(payload:UserIn):
+    con=db()
+    try: cur=con.execute("INSERT INTO users(name,login,role,active,created_at) VALUES(?,?,?,?,?)",(payload.name,payload.login,payload.role,1,now_iso())); con.commit()
+    except sqlite3.IntegrityError: con.close(); raise HTTPException(409,"Логин уже используется")
+    uid=cur.lastrowid; con.close(); return {"id":uid,**payload.model_dump(),"active":True}
+@app.patch("/api/admin/users/{user_id}/toggle")
+def toggle_user(user_id:int):
+    con=db(); row=con.execute("SELECT active,role FROM users WHERE id=?",(user_id,)).fetchone()
+    if not row: con.close(); raise HTTPException(404,"Пользователь не найден")
+    if row[1]=="admin" and row[0]:
+        admins=con.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
+        if admins<=1: con.close(); raise HTTPException(409,"Нельзя отключить последнего администратора")
+    active=0 if row[0] else 1; con.execute("UPDATE users SET active=? WHERE id=?",(active,user_id)); con.commit(); con.close(); return {"id":user_id,"active":bool(active)}
+
 @app.get("/api/logs")
 def logs(level:str|None=None,limit:int=Query(100,le=500)):
     return rows("SELECT * FROM logs"+(" WHERE level=?" if level else "")+" ORDER BY id DESC LIMIT ?",([level,limit] if level else [limit]))
@@ -170,7 +268,7 @@ def training_job(job_id:int):
 
 @app.get("/api/admin/summary")
 def admin_summary():
-    con=db(); result={"users":3,"audit24h":con.execute("SELECT COUNT(*) FROM logs WHERE timestamp>=?",((datetime.now(TZ)-timedelta(days=1)).isoformat(),)).fetchone()[0],"errors24h":con.execute("SELECT COUNT(*) FROM logs WHERE level IN ('ERROR','CRITICAL') AND timestamp>=?",((datetime.now(TZ)-timedelta(days=1)).isoformat(),)).fetchone()[0],"training_running":con.execute("SELECT COUNT(*) FROM training_jobs WHERE status IN ('queued','running')").fetchone()[0]}; con.close(); return result
+    con=db(); result={"users":con.execute("SELECT COUNT(*) FROM users WHERE active=1").fetchone()[0],"audit24h":con.execute("SELECT COUNT(*) FROM logs WHERE timestamp>=?",((datetime.now(TZ)-timedelta(days=1)).isoformat(),)).fetchone()[0],"errors24h":con.execute("SELECT COUNT(*) FROM logs WHERE level IN ('ERROR','CRITICAL') AND timestamp>=?",((datetime.now(TZ)-timedelta(days=1)).isoformat(),)).fetchone()[0],"training_running":con.execute("SELECT COUNT(*) FROM training_jobs WHERE status IN ('queued','running')").fetchone()[0]}; con.close(); return result
 @app.get("/api/reports/errors")
 def error_report(hours:int=Query(24,ge=1,le=720)):
     since=(datetime.now(TZ)-timedelta(hours=hours)).isoformat()

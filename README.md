@@ -9,7 +9,8 @@
 - Панель состояния 10 камер, KPI, GPU, Precision/Recall, задержка и график событий.
 - Реальный REST API на FastAPI с OpenAPI (`/docs`), SQLite и начальными данными.
 - Журнал событий с фильтрами API, подтверждением оператором и генератором тестового события.
-- Полноценная админ-панель: системная сводка, аудит и отчёт по WARNING/ERROR/CRITICAL с периодами 1 час–30 дней и экспортом CSV.
+- Полноценная админ-панель: общие параметры, AI/GPU и пороги, архив MinIO, Telegram, webhook СКУД, RTSP, пользователи/RBAC, аудит и отчёт по WARNING/ERROR/CRITICAL.
+- Проверяемый шлюз данных модели `POST /api/inference/detections`: версия активной модели, камера, confidence, severity, запись события и причины отклонения.
 - Атомарная горячая замена модели без остановки API; проверка реестра и audit log переключения.
 - Автодообучение по кадрам выбранной online-камеры: захват, quality gate, псевдоразметка, train/val, fine-tuning, валидация и регистрация новой версии.
 - Управление камерами и порогами детекции.
@@ -43,6 +44,9 @@ cd frontend && npm install && npm run dev
 | Метод | URL | Назначение |
 |---|---|---|
 | GET | `/api/dashboard` | KPI и тренд |
+| POST | `/api/inference/detections` | Детекции модели → события системы |
+| GET/PUT | `/api/admin/config` | Полная конфигурация |
+| GET/POST | `/api/admin/users` | Пользователи и RBAC |
 | GET/POST | `/api/cameras` | Камеры |
 | GET | `/api/events` | События и фильтры |
 | POST | `/api/events/{id}/ack` | Подтверждение |
