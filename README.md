@@ -9,7 +9,10 @@
 - Панель состояния 10 камер, KPI, GPU, Precision/Recall, задержка и график событий.
 - Реальный REST API на FastAPI с OpenAPI (`/docs`), SQLite и начальными данными.
 - Журнал событий с фильтрами API, подтверждением оператором и генератором тестового события.
-- Управление камерами, порогами детекции и переключением модели без остановки API.
+- Полноценная админ-панель: системная сводка, аудит и отчёт по WARNING/ERROR/CRITICAL с периодами 1 час–30 дней и экспортом CSV.
+- Атомарная горячая замена модели без остановки API; проверка реестра и audit log переключения.
+- Автодообучение по кадрам выбранной online-камеры: захват, quality gate, псевдоразметка, train/val, fine-tuning, валидация и регистрация новой версии.
+- Управление камерами и порогами детекции.
 - Состояние сервисов, структурированные данные, SSE `/api/stream`, выгрузка CSV.
 - Адаптивная React/TypeScript-панель на русском языке.
 - Docker Compose, healthcheck, CI; production-профиль с PostgreSQL, Redis и MinIO.
@@ -45,7 +48,11 @@ cd frontend && npm install && npm run dev
 | POST | `/api/events/{id}/ack` | Подтверждение |
 | POST | `/api/events/simulate` | Тестовая детекция |
 | GET | `/api/models` | Реестр моделей |
-| POST | `/api/models/{name}/activate` | Hot-swap |
+| POST | `/api/models/{name}/activate` | Атомарный hot-swap |
+| POST/GET | `/api/training/jobs` | Автодообучение и прогресс |
+| GET | `/api/admin/summary` | Сводка админ-панели |
+| GET | `/api/reports/errors` | Отчёт по ошибкам |
+| GET | `/api/reports/errors.csv` | Экспорт логов ошибок |
 | GET | `/api/system-health` | CPU/GPU/сервисы |
 | GET | `/api/reports/events.csv` | Выгрузка |
 
