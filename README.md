@@ -1,95 +1,239 @@
 # ZMK Vision
 
-Рабочий MVP on-premise платформы видеоаналитики промышленной безопасности по требованиям из ТЗ: диспетчерская панель, 10 RTSP-камер, события СИЗ и опасного поведения, мониторинг, hot-swap моделей, журнал и CSV-отчёт.
+**ZMK Vision — локальная платформа интеллектуальной видеоаналитики для контроля промышленной безопасности, мониторинга камер и оперативного управления инцидентами.**
 
-![status](https://img.shields.io/badge/status-MVP-d5ff45) ![api](https://img.shields.io/badge/API-FastAPI-009688) ![ui](https://img.shields.io/badge/UI-React_+_TypeScript-61dafb)
+Система объединяет RTSP-видеопотоки, AI-детекции, журнал событий, отчёты, администрирование, Telegram-бота и мобильное Telegram Mini App в едином on-premise контуре. Проект предназначен для производственных площадок, складов, проходных и опасных зон, где видеоданные и настройки должны оставаться внутри инфраструктуры организации.
 
-## Что уже работает
+![Version](https://img.shields.io/badge/version-1.1.0-25332d)
+![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.116-009688)
+![React](https://img.shields.io/badge/React-TypeScript-61dafb)
+![Docker](https://img.shields.io/badge/deploy-Docker_Compose-2496ed)
 
-- Панель состояния 10 камер, KPI, GPU, Precision/Recall, задержка и график событий.
-- Реальный REST API на FastAPI с OpenAPI (`/docs`), SQLite и начальными данными.
-- Журнал событий с фильтрами API, подтверждением оператором и генератором тестового события.
-- Полноценная админ-панель: общие параметры, AI/GPU и пороги, архив MinIO, Telegram, webhook СКУД, RTSP, пользователи/RBAC, аудит и отчёт по WARNING/ERROR/CRITICAL.
-- Проверяемый шлюз данных модели `POST /api/inference/detections`: версия активной модели, камера, confidence, severity, запись события и причины отклонения.
-- Атомарная горячая замена модели без остановки API; проверка реестра и audit log переключения.
-- Автодообучение по кадрам выбранной online-камеры: захват, quality gate, псевдоразметка, train/val, fine-tuning, валидация и регистрация новой версии.
-- Управление камерами и порогами детекции.
-- Состояние сервисов, структурированные данные, SSE `/api/stream`, выгрузка CSV.
-- Адаптивная React/TypeScript-панель на русском языке.
-- Docker Compose, healthcheck, CI; production-профиль с PostgreSQL, Redis и MinIO.
+## Возможности
 
-> AI/RTSP слой в MVP работает через детерминированный симулятор. API-контракт готов для подключения GStreamer/FFmpeg и inference worker на YOLO/TensorRT. Веса моделей и реальные RTSP URL намеренно не входят в репозиторий.
+### Видеоаналитика и события
+
+- управление десятью и более RTSP-камерами;
+- единый шлюз приёма результатов AI-моделей;
+- детекция отсутствия каски и сигнального жилета;
+- выявление телефона, курения, неподвижности и входа в опасную зону;
+- проверка версии модели, камеры и порога confidence для каждой детекции;
+- классификация критичности и защита от результатов устаревшей модели;
+- подтверждение инцидентов оператором и журнал действий.
+
+### Панель управления
+
+- состояние камер и сервисов в реальном времени;
+- KPI, FPS, задержка, GPU, Precision и Recall;
+- график событий и список критических инцидентов;
+- управление камерами, AI-порогами, архивом и интеграциями;
+- пользователи и роли `admin`, `operator`, `viewer`;
+- отчёты по событиям и системным ошибкам;
+- экспорт CSV.
+
+### Управление моделями
+
+- реестр версий моделей;
+- атомарная горячая замена без остановки API;
+- audit log переключений;
+- запуск автодообучения по кадрам выбранной камеры;
+- этапы захвата, quality gate, псевдоразметки, train/validation и экспорта ONNX;
+- регистрация новой версии после завершения обучения;
+- ручная активация обученной модели после проверки метрик.
+
+### Telegram
+
+- Telegram-бот на `aiogram 3`;
+- whitelist и разграничение доступа по ролям;
+- автоматические уведомления о новых критических событиях;
+- состояние системы, камеры, события, логи и отчёты;
+- управление порогами, моделями и задачами обучения;
+- мобильное Telegram Mini App по маршруту `/telegram`.
+
+## Интерфейсы
+
+| Интерфейс | Адрес после локального запуска |
+|---|---|
+| Web-панель | http://localhost:5173 |
+| Telegram Mini App | http://localhost:5173/telegram |
+| REST API | http://localhost:8000 |
+| OpenAPI / Swagger | http://localhost:8000/docs |
+| Health check | http://localhost:8000/api/health |
 
 ## Быстрый запуск
 
-### Docker
+### Docker Compose
+
 ```bash
+git clone https://github.com/danilka-revin/zmk-videoanalytics.git
+cd zmk-videoanalytics
+cp .env.example .env
 docker compose up --build
 ```
-Панель: http://localhost:5173 · API: http://localhost:8000/docs
 
-### Локально
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -r backend/requirements.txt
-PYTHONPATH=backend uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
-```
-В другом терминале:
-```bash
-cd frontend && npm install && npm run dev
+### Windows 10/11
+
+Скачайте ZIP из [GitHub Releases](https://github.com/danilka-revin/zmk-videoanalytics/releases), распакуйте его и запустите:
+
+```text
+installers\install-windows.bat
 ```
 
-## Основные API
+Установщик проверит Docker Desktop, создаст `.env`, предложит настроить Telegram и запустит систему.
 
-| Метод | URL | Назначение |
-|---|---|---|
-| GET | `/api/dashboard` | KPI и тренд |
-| POST | `/api/inference/detections` | Детекции модели → события системы |
-| GET/PUT | `/api/admin/config` | Полная конфигурация |
-| GET/POST | `/api/admin/users` | Пользователи и RBAC |
-| GET/POST | `/api/cameras` | Камеры |
-| GET | `/api/events` | События и фильтры |
-| POST | `/api/events/{id}/ack` | Подтверждение |
-| POST | `/api/events/simulate` | Тестовая детекция |
-| GET | `/api/models` | Реестр моделей |
-| POST | `/api/models/{name}/activate` | Атомарный hot-swap |
-| POST/GET | `/api/training/jobs` | Автодообучение и прогресс |
-| GET | `/api/admin/summary` | Сводка админ-панели |
-| GET | `/api/reports/errors` | Отчёт по ошибкам |
-| GET | `/api/reports/errors.csv` | Экспорт логов ошибок |
-| GET | `/api/system-health` | CPU/GPU/сервисы |
-| GET | `/api/reports/events.csv` | Выгрузка |
+### Ubuntu / Debian
 
-## Production-профиль
 ```bash
-docker compose --profile production up -d
-```
-Перед использованием замените секреты, включите HTTPS/reverse proxy и вынесите RTSP credentials в secrets. Для реального внедрения следующие этапы: inference worker, Redis Streams, S3-архивация JPEG/MP4, Telegram-бот, RBAC/JWT и интеграция со СКУД.
-
-## Тесты
-```bash
-pip install -r backend/requirements.txt
-PYTHONPATH=backend pytest backend/tests -q
-cd frontend && npm run build
+bash installers/install-linux.sh
 ```
 
-Архитектура и ограничения описаны в [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+Скрипт проверит Docker и Compose, установит недостающие компоненты и запустит проект.
 
-## Telegram Bot + Mini App
+## Запуск с Telegram-ботом
 
-Бот предоставляет `/status`, `/cameras`, `/events`, `/logs`, `/report`, `/models`, `/switch_model`, `/health`, inline-меню, whitelist/RBAC и кнопку Mini App. Мобильная панель доступна по `/telegram`.
+1. Создайте бота через `@BotFather`.
+2. Скопируйте `.env.example` в `.env`.
+3. Заполните параметры:
+
+```env
+TELEGRAM_BOT_TOKEN=your_bot_token
+TELEGRAM_ADMIN_IDS=123456789
+TELEGRAM_OPERATOR_IDS=
+TELEGRAM_VIEWER_IDS=
+TELEGRAM_WEBAPP_URL=https://vision.example.ru/telegram
+```
+
+4. Запустите сервисы:
 
 ```bash
-cp .env.example .env
-# заполните TELEGRAM_BOT_TOKEN и TELEGRAM_ADMIN_IDS
 docker compose --profile telegram up -d --build
 ```
 
-Для Mini App нужен публичный HTTPS URL в `TELEGRAM_WEBAPP_URL`. Подробности: [`services/telegram_bot/README.md`](services/telegram_bot/README.md).
+Telegram Mini App требует публичный HTTPS-адрес. Токены, RTSP-пароли и другие секреты не должны попадать в Git.
 
-## Установка в один клик
+### Команды бота
 
-- Windows 10/11: `installers/install-windows.bat`
-- Ubuntu/Debian: `bash installers/install-linux.sh`
+| Команда | Назначение | Минимальная роль |
+|---|---|---|
+| `/status` | Состояние платформы | viewer |
+| `/cameras` | Список камер | viewer |
+| `/events` | Последние события | viewer |
+| `/health` | CPU, RAM, GPU и сервисы | viewer |
+| `/logs` | Ошибки и предупреждения | operator |
+| `/report` | CSV-отчёт | operator |
+| `/models` | Реестр моделей | viewer |
+| `/thresholds` | Пороги AI | operator |
+| `/switch_model <name>` | Горячая замена | admin |
+| `/set_threshold <metric> <value>` | Изменение порога | admin |
+| `/train <camera_id>` | Запуск дообучения | admin |
+| `/users` | Пользователи | admin |
+| `/alert_test` | Тест оповещения | admin |
 
-Скрипты проверяют/устанавливают Docker, создают `.env`, предлагают настроить Telegram и запускают Compose. Готовые ZIP/TAR.GZ публикуются в GitHub Releases.
+## Архитектура
+
+```text
+RTSP-камеры
+    ↓
+Video Ingestion / GStreamer
+    ↓
+Redis Streams
+    ↓
+YOLO / TensorRT Inference Worker
+    ↓
+Inference Gateway → Event Processing
+    ↓
+PostgreSQL / TimescaleDB ── MinIO Archive
+    ↓
+Web Admin ── Telegram Bot ── Mini App ── СКУД Webhook
+```
+
+Текущая версия запускается без GPU и реальных камер благодаря демонстрационному генератору. Канонический API-контракт уже проверяет модель, камеру, confidence и записывает принятые детекции в журнал. Для промышленного контура к нему подключается отдельный RTSP/inference worker.
+
+Подробнее:
+
+- [Архитектура](docs/ARCHITECTURE.md)
+- [Передача данных от модели](docs/MODEL_DATA_FLOW.md)
+- [Автодообучение](docs/AUTO_TRAINING.md)
+- [Telegram](services/telegram_bot/README.md)
+
+## Основные API
+
+| Метод | Endpoint | Назначение |
+|---|---|---|
+| `GET` | `/api/dashboard` | KPI и динамика |
+| `POST` | `/api/inference/detections` | Детекции модели → события |
+| `GET/POST` | `/api/cameras` | Управление камерами |
+| `GET` | `/api/events` | Журнал событий |
+| `POST` | `/api/events/{id}/ack` | Подтверждение события |
+| `GET` | `/api/models` | Реестр моделей |
+| `POST` | `/api/models/{name}/activate` | Атомарный hot-swap |
+| `GET/POST` | `/api/training/jobs` | Задачи автодообучения |
+| `GET/PUT` | `/api/admin/config` | Конфигурация платформы |
+| `GET/POST` | `/api/admin/users` | Пользователи и роли |
+| `GET` | `/api/reports/errors` | Отчёт по ошибкам |
+| `GET` | `/api/reports/events.csv` | CSV событий |
+| `GET` | `/api/system-health` | Состояние ресурсов |
+
+## Production-профиль
+
+```bash
+docker compose --profile production up -d
+```
+
+Production-профиль включает PostgreSQL, Redis и MinIO. Перед вводом в эксплуатацию необходимо:
+
+- заменить все пароли и токены;
+- включить HTTPS и reverse proxy;
+- хранить RTSP credentials в secrets;
+- настроить резервное копирование;
+- подключить реальные модели и GPU worker;
+- провести валидацию Precision/Recall на данных площадки;
+- настроить сетевые политики и срок хранения архива.
+
+## Разработка и тестирование
+
+Backend:
+
+```bash
+pip install -r backend/requirements.txt
+PYTHONPATH=backend pytest backend/tests -q
+```
+
+Telegram-бот:
+
+```bash
+pip install -r services/telegram_bot/requirements.txt
+PYTHONPATH=services/telegram_bot pytest services/telegram_bot/test_helpers.py -q
+```
+
+Frontend:
+
+```bash
+cd frontend
+npm ci
+npm run lint
+npm run build
+```
+
+Проверки автоматически выполняются в GitHub Actions для push и pull request. Теги вида `v*` запускают сборку GitHub Release с ZIP/TAR.GZ и установщиками для Windows и Linux.
+
+## Структура репозитория
+
+```text
+backend/                 FastAPI, SQLite, события, модели и отчёты
+frontend/                React/TypeScript Web UI и Telegram Mini App
+services/telegram_bot/   Telegram-бот и push-оповещения
+installers/              Установщики Windows и Linux
+docs/                    Архитектура и контракты
+docker-compose.yml       Локальная и production-конфигурация
+.github/workflows/       CI и автоматическая публикация релизов
+```
+
+## Статус
+
+Версия `1.1.0` является рабочим демонстрационным и интеграционным контуром. Web-панель, REST API, администрирование, отчёты, Telegram-интерфейсы, hot-swap и жизненный цикл обучения работают локально. Реальное распознавание требует подключения камер, GPU, весов моделей и размеченного набора данных.
+
+## Безопасность
+
+Не публикуйте `.env`, токены Telegram, RTSP URL с паролями, приватные SSH-ключи и production credentials. Для обнаруженных уязвимостей используйте приватный канал владельца репозитория, а не публичный Issue.

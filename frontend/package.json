@@ -1,1 +1,24 @@
-{"name":"zmk-vision-console","private":true,"version":"1.0.0","type":"module","scripts":{"dev":"vite --host 0.0.0.0","build":"tsc -b && vite build","lint":"tsc --noEmit"},"dependencies":{"@vitejs/plugin-react":"latest","vite":"latest","typescript":"latest","react":"latest","react-dom":"latest","lucide-react":"latest"},"devDependencies":{"@types/react":"latest","@types/react-dom":"latest"}}
+{
+  "name": "zmk-vision-console",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "tsc -b && vite build",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@vitejs/plugin-react": "latest",
+    "vite": "latest",
+    "typescript": "latest",
+    "react": "latest",
+    "react-dom": "latest",
+    "lucide-react": "latest"
+  },
+  "devDependencies": {
+    "@types/react": "latest",
+    "@types/react-dom": "latest"
+  },
+  "description": "ZMK Vision web administration console and Telegram Mini App for on-premise industrial safety video analytics"
+}
