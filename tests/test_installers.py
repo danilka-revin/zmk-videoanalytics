@@ -45,7 +45,7 @@ def test_compose_and_environment_are_consistent():
     assert compose['services']['max-bot']['build'] == './services/max_bot'
     assert 'RUN nginx -t' in (ROOT/'frontend/Dockerfile').read_text()
     nginx = (ROOT/'frontend/nginx.conf').read_text()
-    assert 'proxy_pass http://api:8000' in nginx
+    assert 'set $api_upstream http://api:8000' in nginx and 'proxy_pass $api_upstream' in nginx
     assert 'location ^~ /telegram' in nginx and 'https://web.telegram.org' in nginx
     lines = [x for x in (ROOT/'.env.example').read_text().splitlines() if x and not x.startswith('#')]
     keys = [x.split('=',1)[0] for x in lines]

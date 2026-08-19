@@ -8,7 +8,7 @@ jobs:
   windows-installer-check:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Parse and dry-check PowerShell installer
         shell: pwsh
         run: ./installers/install-windows.ps1 -CheckOnly
@@ -16,8 +16,8 @@ jobs:
     needs: windows-installer-check
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
         with: {python-version: '3.12'}
       - run: pip install -r backend/requirements-dev.txt -r services/telegram_bot/requirements.txt -r services/max_bot/requirements.txt
       - run: pip-audit -r backend/requirements.txt -r services/telegram_bot/requirements.txt -r services/max_bot/requirements.txt
@@ -27,7 +27,7 @@ jobs:
       - run: PYTHONPATH=services/telegram_bot pytest services/telegram_bot/test_helpers.py -q
       - run: PYTHONPATH=services/max_bot pytest services/max_bot/test_helpers.py -q
       - run: pytest tests -q
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with: {node-version: '24'}
       - run: npm ci && npm audit --omit=dev --audit-level=high && npm run lint && npm run build
         working-directory: frontend
