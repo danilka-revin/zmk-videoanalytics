@@ -1,7 +1,8 @@
-from datetime import datetime, timedelta, timezone
 import uuid
-from fastapi.testclient import TestClient
+from datetime import datetime, timedelta, timezone
+
 from app.main import app, db, now_iso
+from fastapi.testclient import TestClient
 
 
 def current_model(c):
@@ -29,6 +30,27 @@ def test_all_event_thresholds_and_detection_idempotency():
         assert first['accepted'][0]['event_id'] == second['accepted'][0]['event_id']
         assert second['accepted'][0]['duplicate'] is True
         c.put('/api/settings/smoking_conf', json={'value':.80})
+
+
+def test_event_cooldown_suppresses_frame_by_frame_alert_flood():
+    with TestClient(app) as c:
+        model=current_model(c); person=f'COOLDOWN-{uuid.uuid4().hex[:8]}'
+        base={'camera_id':'cam_01','model_name':model,'event_type':'no_helmet','confidence':.99,'person_id':person}
+        first=c.post('/api/inference/detections',json={'detections':[{**base,'detection_id':f'det-{uuid.uuid4().hex}'}]}).json()
+        second=c.post('/api/inference/detections',json={'detections':[{**base,'detection_id':f'det-{uuid.uuid4().hex}'}]}).json()
+        assert len(first['accepted'])==1
+        assert second['rejected'][0]['reason'].startswith('event_cooldown:')
+        assert second['rejected'][0]['event_id']==first['accepted'][0]['event_id']
+
+
+def test_detection_timestamps_are_normalized_to_site_timezone():
+    with TestClient(app) as c:
+        model=current_model(c); detection_id=f'tz-{uuid.uuid4().hex}'
+        utc_time=datetime.now(timezone.utc).isoformat()
+        result=c.post('/api/inference/detections',json={'detections':[{'camera_id':'cam_01','model_name':model,'event_type':'immobility','confidence':.99,'timestamp':utc_time,'detection_id':detection_id,'person_id':detection_id}]})
+        assert result.status_code==200 and result.json()['accepted']
+        con=db(); timestamp=con.execute("SELECT timestamp FROM events WHERE external_id=?",(detection_id,)).fetchone()[0]; con.close()
+        assert timestamp.endswith('+07:00')
 
 
 def test_detection_geometry_and_time_window():
@@ -59,6 +81,9 @@ def test_model_activation_is_idempotent_and_health_is_consistent():
         assert health.json()['healthy'] is True
         assert health.json()['model']['name'] == model
         assert health.json()['requirements'] == {'precision':90.0,'recall':85.0}
+        dashboard=c.get('/api/dashboard').json()
+        assert dashboard['active_model']==model
+        assert dashboard['precision']==health.json()['model']['precision']
 
 
 def test_model_below_quality_gate_cannot_be_activated():

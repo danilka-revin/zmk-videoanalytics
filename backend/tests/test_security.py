@@ -3,8 +3,9 @@ import hmac
 import json
 import time
 from urllib.parse import urlencode
+
+from app import main
 from fastapi.testclient import TestClient
-import app.main as main
 
 
 def test_security_headers_and_cache_policy():
@@ -14,6 +15,9 @@ def test_security_headers_and_cache_policy():
         assert r.headers['x-content-type-options'] == 'nosniff'
         assert r.headers['x-frame-options'] == 'SAMEORIGIN'
         assert r.headers['cache-control'] == 'no-store'
+        schema=c.get('/openapi.json').json()
+        assert schema['components']['securitySchemes']['ApiKeyAuth']['name']=='X-API-Key'
+        assert schema['paths']['/api/dashboard']['get']['security']==[{'ApiKeyAuth':[]}]
 
 
 def test_optional_api_key_protects_non_public_api():

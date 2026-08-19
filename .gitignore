@@ -9,3 +9,7 @@ dist/
 data/
 
 *.tsbuildinfo
+.ruff_cache/
+.coverage
+htmlcov/
+*.log

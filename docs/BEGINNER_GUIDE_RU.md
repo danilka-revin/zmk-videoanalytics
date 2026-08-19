@@ -208,7 +208,7 @@ http://localhost:8000/api/health
 ```json
 {
   "status": "ok",
-  "version": "1.2.3"
+  "version": "1.3.0"
 }
 ```
 

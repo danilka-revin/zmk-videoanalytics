@@ -1,5 +1,7 @@
+from datetime import datetime, timedelta, timezone
+
+from app.main import app, csv_safe, db
 from fastapi.testclient import TestClient
-from app.main import app, csv_safe
 
 
 def test_camera_credentials_never_leave_list_endpoint():
@@ -34,3 +36,18 @@ def test_duplicate_registered_training_target_is_rejected():
             'camera_id':'cam_01','image_count':20,'epochs':1,'target_name':'siz-guard-v2.1'
         })
         assert result.status_code == 409
+
+
+def test_retention_setting_removes_expired_events_and_logs_immediately():
+    with TestClient(app) as c:
+        old=(datetime.now(timezone.utc)-timedelta(days=3)).isoformat()
+        con=db()
+        con.execute("INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id) VALUES(?,?,?,?,?,?)",(old,'cam_01','no_helmet','high',.99,'OLD-EVENT'))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(old,'INFO','test','OLD-LOG'))
+        con.commit(); con.close()
+        changed=c.put('/api/admin/config',json={'values':{'retention_days':1}})
+        assert changed.status_code==200
+        con=db()
+        assert con.execute("SELECT COUNT(*) FROM events WHERE person_id='OLD-EVENT'").fetchone()[0]==0
+        assert con.execute("SELECT COUNT(*) FROM logs WHERE message='OLD-LOG'").fetchone()[0]==0
+        con.close()

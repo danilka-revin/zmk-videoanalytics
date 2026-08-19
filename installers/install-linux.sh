@@ -18,6 +18,7 @@ fi
 echo -e "\n=== ZMK Vision installer for Ubuntu/Debian ==="
 if [[ "$(uname -s)" != "Linux" ]]; then fail "This installer supports Linux only"; fi
 if ! command -v apt-get >/dev/null 2>&1; then fail "Automatic installation supports Ubuntu/Debian (apt). Install Docker manually on this distribution."; fi
+if ! command -v curl >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y ca-certificates curl; fi
 if ! command -v docker >/dev/null 2>&1; then
   echo "Installing Docker Engine and Compose plugin..."
   sudo apt-get update

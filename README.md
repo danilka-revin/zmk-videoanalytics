@@ -6,9 +6,9 @@
 
 > Впервые работаете с Docker и серверными приложениями? Откройте **[подробную инструкцию для начинающих](docs/BEGINNER_GUIDE_RU.md)** — в ней пошагово разобраны Windows, Linux, Telegram, камеры, безопасность, обновление и типовые ошибки.
 
-![Version](https://img.shields.io/badge/version-1.2.4-25332d)
+![Version](https://img.shields.io/badge/version-1.3.0-25332d)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.116-009688)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688)
 ![React](https://img.shields.io/badge/React-TypeScript-61dafb)
 ![Docker](https://img.shields.io/badge/deploy-Docker_Compose-2496ed)
 
@@ -208,7 +208,7 @@ Production-профиль поднимает инфраструктурные к
 Backend:
 
 ```bash
-pip install -r backend/requirements.txt
+pip install -r backend/requirements-dev.txt
 PYTHONPATH=backend pytest backend/tests -q
 ```
 
@@ -244,7 +244,7 @@ docker-compose.yml       Локальная и production-конфигураци
 
 ## Статус
 
-Версия `1.2.4` является рабочим демонстрационным и интеграционным контуром. Web-панель, REST API, администрирование, отчёты, Telegram-интерфейсы, hot-swap и жизненный цикл обучения работают локально. Реальное распознавание требует подключения камер, GPU, весов моделей и размеченного набора данных.
+Версия `1.3.0` является рабочим демонстрационным и интеграционным контуром. Web-панель, REST API, администрирование, отчёты, Telegram-интерфейсы, hot-swap и жизненный цикл обучения работают локально. Реальное распознавание требует подключения камер, GPU, весов моделей и размеченного набора данных.
 
 ## Защита API и эксплуатационная безопасность
 

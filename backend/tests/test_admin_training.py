@@ -1,7 +1,8 @@
 import time
 import uuid
-from fastapi.testclient import TestClient
+
 from app.main import app
+from fastapi.testclient import TestClient
 
 
 def test_error_report_and_csv():

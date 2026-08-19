@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.db
+*.db-shm
+*.db-wal
+tests/
+.pytest_cache/
+requirements-dev.txt

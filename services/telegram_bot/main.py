@@ -1,14 +1,27 @@
 """ZMK Vision Telegram control plane: polling bot + Mini App launcher."""
 from __future__ import annotations
-import asyncio, html, logging, os
-from datetime import datetime
+
+import asyncio
+import html
+import logging
+import os
+from datetime import datetime, timezone
 from typing import Any
+
 import httpx
 from aiogram import Bot, Dispatcher, F, Router
+from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import Command, CommandObject
-from aiogram.types import BufferedInputFile, CallbackQuery, ErrorEvent, InlineKeyboardButton, InlineKeyboardMarkup, Message, WebAppInfo
-from aiogram.client.default import DefaultBotProperties
+from aiogram.types import (
+    BufferedInputFile,
+    CallbackQuery,
+    ErrorEvent,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    WebAppInfo,
+)
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("zmk.telegram")
@@ -31,8 +44,10 @@ def allowed(user_id: int, minimum: str = "viewer") -> bool:
     return ROLE_LEVEL[role_for(user_id)] >= ROLE_LEVEL[minimum]
 
 def menu(user_id: int) -> InlineKeyboardMarkup:
-    rows = [
-        [InlineKeyboardButton(text="📊 Открыть ZMK Mini App", web_app=WebAppInfo(url=WEBAPP_URL))],
+    rows = []
+    if WEBAPP_URL.startswith("https://"):
+        rows.append([InlineKeyboardButton(text="📊 Открыть ZMK Mini App", web_app=WebAppInfo(url=WEBAPP_URL))])
+    rows += [
         [InlineKeyboardButton(text="🟢 Статус", callback_data="status"), InlineKeyboardButton(text="📷 Камеры", callback_data="cameras")],
         [InlineKeyboardButton(text="🚨 События", callback_data="events"), InlineKeyboardButton(text="🧾 Ошибки", callback_data="errors")],
         [InlineKeyboardButton(text="🧠 Модели", callback_data="models"), InlineKeyboardButton(text="🩺 Health", callback_data="health")],
@@ -71,7 +86,7 @@ def event_text(e: dict[str, Any]) -> str:
 async def guard(message: Message, minimum: str = "viewer") -> bool:
     uid = message.from_user.id if message.from_user else 0
     if allowed(uid, minimum): return True
-    await message.answer("⛔ Ваш Telegram ID не включён в белый список.\nID: <code>%s</code>" % uid)
+    await message.answer(f"⛔ Ваш Telegram ID не включён в белый список.\nID: <code>{uid}</code>")
     return False
 
 @router.message(Command("start"))
@@ -113,7 +128,7 @@ async def logs_cmd(message: Message):
 async def report_cmd(message: Message):
     if not await guard(message, "operator"): return
     content=await api("GET","/api/reports/events.csv")
-    await message.answer_document(BufferedInputFile(content,filename=f"zmk-events-{datetime.now():%Y%m%d}.csv"),caption="Отчёт по событиям")
+    await message.answer_document(BufferedInputFile(content,filename=f"zmk-events-{datetime.now(timezone.utc):%Y%m%d}.csv"),caption="Отчёт по событиям")
 
 @router.message(Command("models"))
 async def models_cmd(message: Message):
@@ -197,7 +212,7 @@ async def callbacks(query: CallbackQuery):
     elif query.data=="health":
         h=await api("GET","/api/system-health"); await message.answer(f"<b>🩺 Health</b>\nCPU {h['cpu']}% · RAM {h['ram']}% · GPU {h['gpu']}%")
     elif query.data=="report":
-        content=await api("GET","/api/reports/events.csv"); await message.answer_document(BufferedInputFile(content,filename=f"zmk-events-{datetime.now():%Y%m%d}.csv"))
+        content=await api("GET","/api/reports/events.csv"); await message.answer_document(BufferedInputFile(content,filename=f"zmk-events-{datetime.now(timezone.utc):%Y%m%d}.csv"))
 
 async def alert_worker(bot: Bot):
     """Push newly received critical events to operators without acknowledging them."""
@@ -218,16 +233,17 @@ async def alert_worker(bot: Bot):
 
 @router.errors()
 async def telegram_error(event: ErrorEvent):
-    log.exception("Telegram update failed",exc_info=event.exception)
+    log.error("Telegram update failed",exc_info=(type(event.exception),event.exception,event.exception.__traceback__))
     message=getattr(event.update,"message",None)
     if message:
         try: await message.answer("⚠️ Команда временно недоступна. Проверьте состояние API или повторите позже.")
-        except Exception: pass
+        except Exception:
+            log.debug("Could not send user-facing error",exc_info=True)
     return True
 
 async def main():
     if not TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
-    if not (WEBAPP_URL.startswith("https://") or WEBAPP_URL.startswith("http://localhost")): raise RuntimeError("TELEGRAM_WEBAPP_URL must use HTTPS")
+    if not (WEBAPP_URL.startswith(("https://","http://localhost"))): raise RuntimeError("TELEGRAM_WEBAPP_URL must use HTTPS")
     if not (ADMINS or OPERATORS or VIEWERS): log.warning("Telegram whitelist is empty; all users will be denied")
     bot=Bot(TOKEN,default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp=Dispatcher(); dp.include_router(router)

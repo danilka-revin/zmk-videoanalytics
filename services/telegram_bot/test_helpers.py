@@ -1,8 +1,11 @@
 import os
+
 os.environ.setdefault('TELEGRAM_ADMIN_IDS','100')
 os.environ.setdefault('TELEGRAM_OPERATOR_IDS','200')
 os.environ.setdefault('TELEGRAM_VIEWER_IDS','300')
-from main import role_for, allowed, dashboard_text, event_text
+import main as bot_main
+from main import allowed, dashboard_text, event_text, role_for
+
 
 def test_roles():
     assert role_for(100)=='admin' and role_for(200)=='operator' and role_for(300)=='viewer'
@@ -12,3 +15,16 @@ def test_formatters():
     text=dashboard_text({'cameras':{'online':9,'total':10},'events24h':2,'critical_unacked':1,'avg_fps':8,'avg_latency_ms':200,'gpu_load':60,'precision':92,'recall':87})
     assert '9/10' in text and '92%' in text
     assert 'Без каски' in event_text({'type':'no_helmet','camera_id':'cam_01','confidence':.9,'severity':'high'})
+
+
+def test_local_bot_menu_omits_invalid_http_mini_app_button():
+    previous=bot_main.WEBAPP_URL
+    try:
+        bot_main.WEBAPP_URL='http://localhost:5173/telegram'
+        labels=[button.text for row in bot_main.menu(100).inline_keyboard for button in row]
+        assert '📊 Открыть ZMK Mini App' not in labels
+        bot_main.WEBAPP_URL='https://vision.example.test/telegram'
+        labels=[button.text for row in bot_main.menu(100).inline_keyboard for button in row]
+        assert '📊 Открыть ZMK Mini App' in labels
+    finally:
+        bot_main.WEBAPP_URL=previous

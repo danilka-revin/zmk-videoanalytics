@@ -1,6 +1,7 @@
-from pathlib import Path
 import re
 import subprocess
+from pathlib import Path
+
 import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -9,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 def test_linux_installers_pass_shell_parser_and_dry_check():
     scripts = [ROOT/'installers/install-linux.sh', ROOT/'installers/uninstall-linux.sh']
     subprocess.run(['bash','-n',*[str(x) for x in scripts]], check=True)
-    result = subprocess.run(['bash',str(scripts[0]),'--check'], cwd=ROOT, text=True, capture_output=True)
+    result = subprocess.run(['bash',str(scripts[0]),'--check'], cwd=ROOT, text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
     assert 'Installer validation: OK' in result.stdout
 
@@ -36,6 +37,8 @@ def test_compose_and_environment_are_consistent():
     assert compose['services']['web']['build'] == './frontend'
     assert 'healthcheck' in compose['services']['api']
     assert compose['services']['api']['environment']['VIDEOANALYTICS_DB'] == '/app/data/videoanalytics.db'
+    assert compose['services']['api']['ports'] == ['127.0.0.1:8000:8000']
+    assert 'RUN nginx -t' in (ROOT/'frontend/Dockerfile').read_text()
     nginx = (ROOT/'frontend/nginx.conf').read_text()
     assert 'proxy_pass http://api:8000' in nginx
     assert 'location ^~ /telegram' in nginx and 'https://web.telegram.org' in nginx
