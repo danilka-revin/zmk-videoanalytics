@@ -1,8 +1,9 @@
-# ZMK Vision v1.2.1 — Reliability & Installer Fixes
+# ZMK Vision v1.2.2 — Reliability & Installer Fixes
 
 Исправляющий релиз, направленный на предсказуемую установку, безопасность данных и устойчивость интеграций.
 
 ## Исправления
+- Windows PowerShell installer теперь обязательно проходит реальный parse/dry-check на `windows-latest` до публикации релиза.
 - Установщики Windows и Linux получили dry-check, проверку полного архива, валидацию Telegram-параметров, Compose config и ожидание health checks.
 - Установщик выводит логи сервиса при неуспешном запуске и не сообщает об успехе до готовности API и Web.
 - Production Web переведён с Vite dev server на multi-stage Nginx image.

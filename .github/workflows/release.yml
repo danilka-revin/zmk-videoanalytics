@@ -5,7 +5,15 @@ on:
 permissions:
   contents: write
 jobs:
+  windows-installer-check:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Parse and dry-check PowerShell installer
+        shell: pwsh
+        run: ./installers/install-windows.ps1 -CheckOnly
   verify-and-release:
+    needs: windows-installer-check
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
