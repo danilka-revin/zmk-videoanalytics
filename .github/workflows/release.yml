@@ -1,0 +1,40 @@
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions:
+  contents: write
+jobs:
+  verify-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: '3.12'}
+      - run: pip install -r backend/requirements.txt -r services/telegram_bot/requirements.txt
+      - run: PYTHONPATH=backend pytest backend/tests -q
+      - run: PYTHONPATH=services/telegram_bot pytest services/telegram_bot/test_helpers.py -q
+      - uses: actions/setup-node@v4
+        with: {node-version: '20'}
+      - run: npm ci && npm run build
+        working-directory: frontend
+      - name: Build release archives
+        run: |
+          mkdir -p release-stage/zmk-videoanalytics
+          tar --exclude='./.git' --exclude='*/node_modules' --exclude='*/dist' --exclude='*.db' --exclude='./release-stage' --exclude='zmk-videoanalytics-*.zip' --exclude='zmk-videoanalytics-*.tar.gz' -cf - . | tar -xf - -C release-stage/zmk-videoanalytics
+          cd release-stage
+          zip -qr ../zmk-videoanalytics-${GITHUB_REF_NAME}.zip zmk-videoanalytics
+          tar -czf ../zmk-videoanalytics-${GITHUB_REF_NAME}.tar.gz zmk-videoanalytics
+          cd ..
+          sha256sum zmk-videoanalytics-* > SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body_path: RELEASE_NOTES.md
+          files: |
+            zmk-videoanalytics-*.zip
+            zmk-videoanalytics-*.tar.gz
+            SHA256SUMS.txt
+            installers/install-windows.ps1
+            installers/install-windows.bat
+            installers/install-linux.sh

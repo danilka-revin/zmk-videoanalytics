@@ -8,7 +8,9 @@ jobs:
       - uses: actions/setup-python@v5
         with: {python-version: '3.12'}
       - run: pip install -r backend/requirements.txt
+      - run: pip install -r services/telegram_bot/requirements.txt
       - run: PYTHONPATH=backend pytest backend/tests -q
+      - run: PYTHONPATH=services/telegram_bot pytest services/telegram_bot/test_helpers.py -q
       - uses: actions/setup-node@v4
         with: {node-version: '20'}
       - run: npm ci

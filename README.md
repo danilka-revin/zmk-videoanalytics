@@ -74,3 +74,22 @@ cd frontend && npm run build
 ```
 
 Архитектура и ограничения описаны в [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
+## Telegram Bot + Mini App
+
+Бот предоставляет `/status`, `/cameras`, `/events`, `/logs`, `/report`, `/models`, `/switch_model`, `/health`, inline-меню, whitelist/RBAC и кнопку Mini App. Мобильная панель доступна по `/telegram`.
+
+```bash
+cp .env.example .env
+# заполните TELEGRAM_BOT_TOKEN и TELEGRAM_ADMIN_IDS
+docker compose --profile telegram up -d --build
+```
+
+Для Mini App нужен публичный HTTPS URL в `TELEGRAM_WEBAPP_URL`. Подробности: [`services/telegram_bot/README.md`](services/telegram_bot/README.md).
+
+## Установка в один клик
+
+- Windows 10/11: `installers/install-windows.bat`
+- Ubuntu/Debian: `bash installers/install-linux.sh`
+
+Скрипты проверяют/устанавливают Docker, создают `.env`, предлагают настроить Telegram и запускают Compose. Готовые ZIP/TAR.GZ публикуются в GitHub Releases.

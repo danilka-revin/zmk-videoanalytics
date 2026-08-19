@@ -12,6 +12,20 @@ services:
     volumes: ["./frontend:/app"]
     ports: ["5173:5173"]
     depends_on: [api]
+  telegram-bot:
+    build: ./services/telegram_bot
+    profiles: ["telegram"]
+    environment:
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      TELEGRAM_ADMIN_IDS: ${TELEGRAM_ADMIN_IDS:-}
+      TELEGRAM_OPERATOR_IDS: ${TELEGRAM_OPERATOR_IDS:-}
+      TELEGRAM_VIEWER_IDS: ${TELEGRAM_VIEWER_IDS:-}
+      TELEGRAM_WEBAPP_URL: ${TELEGRAM_WEBAPP_URL:-http://localhost:5173/telegram}
+      ZMK_API_URL: http://api:8000
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
   redis:
     image: redis:7-alpine
     profiles: ["production"]
