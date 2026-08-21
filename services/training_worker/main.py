@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import multiprocessing as mp
 import os
+import queue
 import shutil
 from pathlib import Path
 
@@ -28,33 +30,52 @@ def capture(job:Job,path:Path):
   frame+=1
  cap.release()
  if saved<20: raise RuntimeError(f'Captured only {saved} frames; RTSP stream unavailable or too short')
-def train(job:Job):
+def train(job:Job, updates=None):
  work=ROOT/f'job-{job.id}'; shutil.rmtree(work,ignore_errors=True); images=work/'images'/'all'; labels=work/'labels'/'all'; images.mkdir(parents=True); labels.mkdir(parents=True)
- capture(job,images); base=job.base_artifact.removeprefix('file://') if job.base_artifact else BASE_MODEL; pseudo_model=YOLO(base)
+ capture(job,images); updates and updates.put(('progress',25,'Кадры захвачены')); base=job.base_artifact.removeprefix('file://') if job.base_artifact else BASE_MODEL; pseudo_model=YOLO(base)
  count=0
  for image in images.glob('*.jpg'):
   result=pseudo_model.predict(str(image),verbose=False,conf=job.confidence)[0]; h,w=result.orig_shape; lines=[]
   for box,cls in zip(result.boxes.xywh.cpu().tolist(),result.boxes.cls.cpu().tolist()):
    x,y,bw,bh=box; lines.append(f'{int(cls)} {x/w:.6f} {y/h:.6f} {bw/w:.6f} {bh/h:.6f}')
   if lines: (labels/f'{image.stem}.txt').write_text('\n'.join(lines)); count+=1
+ updates and updates.put(('progress',50,'Псевдоразметка завершена'))
  if count<10: raise RuntimeError('Pseudo-labeling produced fewer than 10 labeled frames')
  for split in ('train','val'): (work/'images'/split).mkdir(); (work/'labels'/split).mkdir()
  labeled=sorted(labels.glob('*.txt'))
  for index,label in enumerate(labeled):
   split='val' if index < max(1,int(len(labeled)*job.val_split)) else 'train'; image=images/f'{label.stem}.jpg'; shutil.move(str(image),work/'images'/split/image.name); shutil.move(str(label),work/'labels'/split/label.name)
  data=work/'data.yaml'; data.write_text(yaml.safe_dump({'path':str(work),'train':'images/train','val':'images/val','names':pseudo_model.names},allow_unicode=True))
- trainer=YOLO(BASE_MODEL); result=trainer.train(data=str(data),epochs=job.epochs,imgsz=job.imgsz,batch=job.batch,patience=job.patience,device=0,project=str(work/'runs'),name='train',exist_ok=True,verbose=False)
+ trainer=YOLO(BASE_MODEL); updates and updates.put(('progress',60,'Обучение YOLO11n'))
+ result=trainer.train(data=str(data),epochs=job.epochs,imgsz=job.imgsz,batch=job.batch,patience=job.patience,device=0,project=str(work/'runs'),name='train',exist_ok=True,verbose=False)
+ updates and updates.put(('progress',90,'Экспорт ONNX'))
  best=work/'runs'/'train'/'weights'/'best.pt'; MODELS.mkdir(parents=True,exist_ok=True); target=MODELS/f'{job.target_name}.pt'; shutil.copy2(best,target); exported=YOLO(str(target)).export(format='onnx',dynamic=True,simplify=True); onnx=MODELS/f'{job.target_name}.onnx'; shutil.move(str(exported),onnx)
  metrics=getattr(result,'results_dict',{}); return onnx,float(metrics.get('metrics/precision(B)',0))*100,float(metrics.get('metrics/recall(B)',0))*100
-async def execute(job:Job):
- running.add(job.id)
+def train_entry(payload, updates):
  try:
-  await callback(job.id,status='running',progress=5,stage='Захват RTSP кадров'); artifact,precision,recall=await asyncio.to_thread(train,job)
-  await callback(job.id,status='completed',progress=100,stage='Модель обучена',artifact_uri=f'file://{artifact}',precision=precision,recall=recall)
- except asyncio.CancelledError: await callback(job.id,status='cancelled',progress=0,stage='Отменено'); raise
+  artifact,precision,recall=train(Job(**payload),updates); updates.put(('success',str(artifact),precision,recall))
+ except Exception as exc:  # noqa: BLE001 - transfer child process failure
+  updates.put(('error',str(exc)[:500]))
+async def execute(job:Job):
+ running.add(job.id); ctx=mp.get_context('spawn'); updates=ctx.Queue(); process=ctx.Process(target=train_entry,args=(job.model_dump(),updates),daemon=True); process.start()
+ try:
+  await callback(job.id,status='running',progress=5,stage='Захват RTSP кадров')
+  while process.is_alive() or not updates.empty():
+   try: message=updates.get_nowait()
+   except queue.Empty: await asyncio.sleep(1); continue
+   if message[0]=='progress': await callback(job.id,status='running',progress=message[1],stage=message[2])
+   elif message[0]=='error': raise RuntimeError(message[1])
+   elif message[0]=='success': await callback(job.id,status='completed',progress=100,stage='Модель обучена',artifact_uri=f'file://{message[1]}',precision=message[2],recall=message[3]); return
+  if process.exitcode: raise RuntimeError(f'Training process exited with code {process.exitcode}')
+ except asyncio.CancelledError:
+  if process.is_alive(): process.terminate(); process.join(timeout=10)
+  await callback(job.id,status='cancelled',progress=0,stage='Отменено'); raise
  except Exception as exc:  # noqa: BLE001 - report all ML/RTSP/CUDA failures
+  if process.is_alive(): process.terminate(); process.join(timeout=10)
   await callback(job.id,status='failed',progress=0,stage='Ошибка',error=str(exc)[:500])
- finally: running.discard(job.id); tasks.pop(job.id,None)
+ finally:
+  if process.is_alive(): process.terminate()
+  process.join(timeout=5); running.discard(job.id); tasks.pop(job.id,None); updates.close()
 @app.get('/health')
 def health(): return {'status':'ok','gpu':torch.cuda.is_available(),'running_jobs':list(running)}
 @app.post('/jobs',status_code=202)

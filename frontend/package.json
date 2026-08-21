@@ -1,7 +1,7 @@
 {
   "name": "zmk-vision-console",
   "private": true,
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "ZMK Vision web administration console and Telegram Mini App for on-premise industrial safety video analytics",
   "type": "module",
   "scripts": {

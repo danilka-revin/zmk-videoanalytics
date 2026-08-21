@@ -123,7 +123,7 @@ async def lifespan(app: FastAPI):
         for task in list(_training_tasks.values()): task.cancel()
         if _training_tasks: await asyncio.gather(*list(_training_tasks.values()),return_exceptions=True)
 
-app=FastAPI(title="ZMK Vision API",version="2.2.0",description="On-premise API контура видеоаналитики",lifespan=lifespan)
+app=FastAPI(title="ZMK Vision API",version="2.2.1",description="On-premise API контура видеоаналитики",lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:5173").split(",") if x.strip()],allow_credentials=False,allow_methods=["GET","POST","PUT","PATCH","DELETE"],allow_headers=["Content-Type","X-API-Key","X-Telegram-Init-Data"])
 
 def custom_openapi():
@@ -290,7 +290,7 @@ def capabilities():
     return {"demo_mode":SEED_TEST_DATA,"training_worker":worker["reachable"] and worker["gpu"],"training":worker,"external_inference_gateway":True,"camera_crud":True,"diagnostics":True,"search":True}
 
 @app.get("/api/health")
-def health(): return {"status":"ok","version":"2.2.0","uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
+def health(): return {"status":"ok","version":"2.2.1","uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
 
 @app.get("/api/dashboard")
 def dashboard():
