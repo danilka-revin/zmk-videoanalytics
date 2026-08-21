@@ -1,11 +1,7 @@
-# ZMK Vision v2.2.3 — Camera Live Snapshots & Delete Fix
+# ZMK Vision v2.2.4 — Final Worker Race Fixes
 
-- Inference worker каждые 5 секунд сохраняет реальный JPEG последнего RTSP-кадра.
-- Кадр уменьшается до 960 px и JPEG quality 75 для ограничения трафика.
-- Добавлены защищённые upload/get snapshot API; RTSP credentials не раскрываются.
-- Web-панель загружает изображения через fetch с API key и обновляет их без перезагрузки.
-- Object URLs освобождаются, утечки памяти в браузере исключены.
-- При отсутствии кадра показывается нейтральная иконка, а не поддельное изображение.
-- Кнопка удаления теперь имеет видимый текст, подтверждение и удаляет связанные snapshot-файлы.
-- Удаление камеры с событиями по-прежнему требует явного подтверждения `delete_events=true`.
-- Добавлены regression-тесты upload/get/delete snapshot.
+- Исправлено смешивание tracker state между разными камерами: inference использует независимый spatial person ID по camera/class/position.
+- Устранена гонка multiprocessing Queue: training worker ждёт terminal message после завершения child process и не оставляет задачу в running.
+- Исправлена реальная cancellation и cleanup process/queue.
+- Camera preview больше не обновляет React state после unmount и освобождает Object URL при позднем ответе.
+- Повторно проверены snapshot upload/get/delete, camera delete, CPU fallback, inference и training lifecycle.

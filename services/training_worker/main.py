@@ -60,13 +60,19 @@ async def execute(job:Job):
  running.add(job.id); ctx=mp.get_context('spawn'); updates=ctx.Queue(); process=ctx.Process(target=train_entry,args=(job.model_dump(),updates),daemon=True); process.start()
  try:
   await callback(job.id,status='running',progress=5,stage='Захват RTSP кадров')
-  while process.is_alive() or not updates.empty():
-   try: message=updates.get_nowait()
-   except queue.Empty: await asyncio.sleep(1); continue
+  empty_after_exit=0
+  while True:
+   try: message=await asyncio.to_thread(updates.get,True,1)
+   except queue.Empty:
+    if process.is_alive(): continue
+    empty_after_exit+=1
+    if empty_after_exit>=2: break
+    continue
+   empty_after_exit=0
    if message[0]=='progress': await callback(job.id,status='running',progress=message[1],stage=message[2])
    elif message[0]=='error': raise RuntimeError(message[1])
    elif message[0]=='success': await callback(job.id,status='completed',progress=100,stage='Модель обучена',artifact_uri=f'file://{message[1]}',precision=message[2],recall=message[3]); return
-  if process.exitcode: raise RuntimeError(f'Training process exited with code {process.exitcode}')
+  raise RuntimeError(f'Training process exited without result (code {process.exitcode})')
  except asyncio.CancelledError:
   if process.is_alive(): process.terminate(); process.join(timeout=10)
   await callback(job.id,status='cancelled',progress=0,stage='Отменено'); raise

@@ -53,12 +53,11 @@ class Runtime:
    encoded_ok,encoded=cv2.imencode('.jpg',image,[cv2.IMWRITE_JPEG_QUALITY,75])
    if encoded_ok: await self.post(f'/api/cameras/{cid}/snapshot',{'jpeg_base64':base64.b64encode(encoded).decode(),'captured_at':datetime.now(timezone.utc).isoformat()}); self.last_snapshot[cid]=now
   if not ok or self.model is None: return
-  result=(await asyncio.to_thread(self.model.track,image,persist=True,conf=CONF,device=DEVICE,verbose=False))[0]; detections=[]; stamp=datetime.now(timezone.utc).isoformat()
-  track_ids=result.boxes.id.int().cpu().tolist() if result.boxes.id is not None else [None]*len(result.boxes)
-  for index,(xyxy,cls,score,track_id) in enumerate(zip(result.boxes.xyxy.cpu().tolist(),result.boxes.cls.cpu().tolist(),result.boxes.conf.cpu().tolist(),track_ids)):
+  result=(await asyncio.to_thread(self.model.predict,image,conf=CONF,device=DEVICE,verbose=False))[0]; detections=[]; stamp=datetime.now(timezone.utc).isoformat()
+  for index,(xyxy,cls,score) in enumerate(zip(result.boxes.xyxy.cpu().tolist(),result.boxes.cls.cpu().tolist(),result.boxes.conf.cpu().tolist())):
    label=str(self.model.names[int(cls)])
    if label not in EVENT_CLASSES: continue
-   x1,y1,x2,y2=xyxy; detections.append({'camera_id':cid,'model_name':self.model_name,'timestamp':stamp,'event_type':label,'confidence':score,'person_id':f'{cid}-track-{track_id}' if track_id is not None else None,'detection_id':f'{cid}:{int(time.time()*1000)}:{index}','bbox':[x1,y1,x2,y2]})
+   x1,y1,x2,y2=xyxy; spatial_id=f'{cid}-{label}-{int(((x1+x2)/2)//100)}-{int(((y1+y2)/2)//100)}'; detections.append({'camera_id':cid,'model_name':self.model_name,'timestamp':stamp,'event_type':label,'confidence':score,'person_id':spatial_id,'detection_id':f'{cid}:{int(time.time()*1000)}:{index}','bbox':[x1,y1,x2,y2]})
   if detections: await self.post('/api/inference/detections',{'detections':detections})
  async def run(self):
   if not WORKER_TOKEN: raise RuntimeError('ZMK_WORKER_TOKEN is required')
