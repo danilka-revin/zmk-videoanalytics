@@ -1,45 +1,29 @@
-# ZMK Vision v2.1.0 — Real NVIDIA Auto-Training
+# ZMK Vision v2.2.0 — Full RTSP Inference & Advanced Training
 
-## Реальное автодообучение
-- NVIDIA GPU worker на Ultralytics 8.4.126.
-- RTSP capture с FPS limit.
-- Псевдоразметка активной моделью или YOLO11n.
-- Раздельные train/validation наборы.
-- YOLO11n fine-tuning и динамический ONNX export.
-- Persistent model/data volumes, progress callback и cancellation.
-- Задача завершается ошибкой при недостатке кадров или разметки — успешные метрики не подставляются.
+## Реальный inference worker
+- Подключение к сохранённым RTSP URL через OpenCV.
+- Горячая загрузка активного ONNX/TensorRT/PyTorch артефакта.
+- Проверка SHA-256 перед загрузкой.
+- NVIDIA/CPU inference с настраиваемым confidence.
+- Отправка фактической camera telemetry каждые 10 секунд.
+- Передача детекций с timestamp, bbox и idempotency ID в gateway.
+- Поддержка классов нарушений: no_helmet, no_vest, phone_usage, smoking, restricted_zone, immobility.
+- Выделенный защищённый internal API с отдельным worker token.
 
-## Убраны витринные данные
-- Чистая установка стартует без камер, событий, пользователей и моделей.
-- Удалены фиктивные GPU/CPU/RAM/Disk, FPS, latency и модельные метрики.
-- Ресурсы сервера измеряются через psutil и NVIDIA NVML; при отсутствии GPU показывается `—`.
-- Генераторы тестовых событий и ошибок недоступны в production.
-- Симуляция обучения удалена и добавлен реальный NVIDIA GPU training worker: RTSP capture, pseudo-labeling, YOLO11n fine-tuning, ONNX export, progress callbacks и cancellation.
-- Dashboard отображает только фактически зарегистрированную модель и полученную телеметрию.
+## Расширенное автодообучение
+Настройки из Web/API передаются GPU worker и сохраняются в задаче:
+- image_count;
+- epochs;
+- batch;
+- image size;
+- patience;
+- pseudo-label confidence;
+- validation split;
+- capture FPS.
 
-## Полное управление камерами
-- Создание, просмотр, редактирование и удаление камер.
-- Название, зона, описание, RTSP URL, enabled и индивидуальный FPS limit.
-- RTSP secret не возвращается в браузер после сохранения.
-- Удаление камеры с событиями требует явного `delete_events=true`.
-- Endpoint телеметрии ingestion worker: status, фактический FPS и latency.
-- TCP-диагностика одной камеры и параллельная диагностика всех камер.
+Worker создаёт раздельные train/val наборы, выполняет YOLO11n fine-tuning, экспорт ONNX, callback прогресса, регистрацию модели и реальную cancellation.
 
-## Реальные функции интерфейса
-- Рабочий глобальный поиск по камерам, событиям и моделям.
-- Рабочая кнопка диагностики и отдельный раздел диагностики.
-- Рабочие кнопки добавления, редактирования, проверки и удаления камер.
-- Регистрация внешнего ONNX/TensorRT/PyTorch артефакта с метриками, URI и checksum.
-- Пустые состояния вместо вымышленных показателей.
-- Исправлены светлые элементы в тёмной теме: модальные окна, формы, таблицы, статусы, селекты, уведомления и карточки.
-
-## Интеграция
-- Inference gateway остаётся канонической точкой приёма детекций.
-- Camera telemetry API предназначен для реального RTSP/GStreamer worker.
-- Capability API сообщает, какие внешние workers подключены.
-- Telegram или MAX по-прежнему выбираются при установке.
-
-## Проверки
-- Отдельные production-тесты подтверждают пустой старт без fake data.
-- Camera CRUD, telemetry, diagnostics, search, guarded delete и model registration покрыты тестами.
-- CI собирает API, Web, Telegram и MAX Docker images и выполняет security/dependency audits.
+## Интеграции
+- Webhook СКУД теперь фактически отправляется для принятых событий.
+- Ошибки доставки записываются в системный журнал.
+- Installers предлагают отдельно включить NVIDIA training и RTSP inference workers.

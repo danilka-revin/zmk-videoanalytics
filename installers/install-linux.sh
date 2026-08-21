@@ -4,7 +4,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }
-required=(docker-compose.yml .env.example backend/Dockerfile frontend/Dockerfile services/telegram_bot/Dockerfile services/max_bot/Dockerfile services/training_worker/Dockerfile)
+required=(docker-compose.yml .env.example backend/Dockerfile frontend/Dockerfile services/telegram_bot/Dockerfile services/max_bot/Dockerfile services/training_worker/Dockerfile services/inference_worker/Dockerfile)
 for file in "${required[@]}"; do [[ -f "$file" ]] || fail "Missing $file. Download and extract the complete release archive, not only the installer."; done
 
 if [[ "${1:-}" == "--check" ]]; then
@@ -85,6 +85,12 @@ if [[ "$TRAINING" =~ ^([yY]|true|1)$ ]]; then
   PROFILE+=(--profile training)
 else
   set_env TRAINING_WORKER_URL ""
+fi
+if [[ -n "${NONINTERACTIVE:-}" ]]; then INFERENCE="${ENABLE_INFERENCE:-false}"; else read -r -p "Включить реальный RTSP YOLO inference worker? [y/N]: " INFERENCE; fi
+if [[ "$INFERENCE" =~ ^([yY]|true|1)$ ]]; then
+  TOKEN_VALUE="${ZMK_WORKER_TOKEN:-$(tr -d '-' </proc/sys/kernel/random/uuid)}"
+  set_env ZMK_WORKER_TOKEN "$TOKEN_VALUE"
+  PROFILE+=(--profile inference)
 fi
 
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml or .env validation failed"

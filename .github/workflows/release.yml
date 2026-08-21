@@ -32,7 +32,7 @@ jobs:
       - run: npm ci && npm audit --omit=dev --audit-level=high && npm run lint && npm run build
         working-directory: frontend
       - name: Validate Compose and build all application images
-        run: docker compose --profile telegram --profile max --profile training config --quiet && docker compose --profile telegram --profile max --profile training build
+        run: docker compose --profile telegram --profile max --profile training --profile inference config --quiet && docker compose --profile telegram --profile max --profile training --profile inference build
       - name: Build release archives
         run: |
           mkdir -p release-stage/zmk-videoanalytics

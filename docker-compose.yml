@@ -10,6 +10,7 @@ services:
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
       MESSENGER_PROVIDER: ${MESSENGER_PROVIDER:-none}
       TRAINING_WORKER_URL: ${TRAINING_WORKER_URL:-}
+      ZMK_WORKER_TOKEN: ${ZMK_WORKER_TOKEN:-}
       RTSP_CAM_01: ${RTSP_CAM_01:-rtsp://camera-01/stream}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ADMIN_IDS: ${TELEGRAM_ADMIN_IDS:-}
@@ -49,6 +50,28 @@ services:
       MAX_VIEWER_IDS: ${MAX_VIEWER_IDS:-}
       ZMK_API_URL: http://api:8000
       ZMK_API_KEY: ${ZMK_API_KEY:-}
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
+  inference-worker:
+    build: ./services/inference_worker
+    profiles: ["inference"]
+    environment:
+      ZMK_API_URL: http://api:8000
+      ZMK_API_KEY: ${ZMK_API_KEY:-}
+      ZMK_WORKER_TOKEN: ${ZMK_WORKER_TOKEN:-}
+      INFERENCE_DEVICE: ${INFERENCE_DEVICE:-0}
+      INFERENCE_CONF: ${INFERENCE_CONF:-0.5}
+    volumes:
+      - model-data:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
     depends_on:
       api:
         condition: service_healthy

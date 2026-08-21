@@ -31,6 +31,7 @@ TZ = timezone(timedelta(hours=7))
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
 STARTED = time.time()
 API_KEY = os.getenv("ZMK_API_KEY", "").strip()
+WORKER_TOKEN = os.getenv("ZMK_WORKER_TOKEN", "").strip()
 try: RATE_LIMIT_PER_MINUTE = max(10,int(os.getenv("RATE_LIMIT_PER_MINUTE", "120")))
 except ValueError: RATE_LIMIT_PER_MINUTE = 120
 _rate_buckets: dict[str, list[float]] = {}
@@ -71,7 +72,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, level TEXT NOT NULL, service TEXT NOT NULL, message TEXT NOT NULL, camera_id TEXT);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS model_registry(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, format TEXT NOT NULL, status TEXT NOT NULL, precision REAL, recall REAL, trained_at TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'external', artifact_uri TEXT NOT NULL DEFAULT '', checksum TEXT NOT NULL DEFAULT '');
-    CREATE TABLE IF NOT EXISTS training_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, camera_id TEXT NOT NULL, base_model TEXT NOT NULL, target_name TEXT NOT NULL, image_count INTEGER NOT NULL, epochs INTEGER NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL, error TEXT, FOREIGN KEY(camera_id) REFERENCES cameras(id));
+    CREATE TABLE IF NOT EXISTS training_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, camera_id TEXT NOT NULL, base_model TEXT NOT NULL, target_name TEXT NOT NULL, image_count INTEGER NOT NULL, epochs INTEGER NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL, error TEXT, batch INTEGER NOT NULL DEFAULT 8, imgsz INTEGER NOT NULL DEFAULT 640, patience INTEGER NOT NULL DEFAULT 20, confidence REAL NOT NULL DEFAULT .35, val_split REAL NOT NULL DEFAULT .2, capture_fps REAL NOT NULL DEFAULT 2, FOREIGN KEY(camera_id) REFERENCES cameras(id));
     CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, login TEXT UNIQUE NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
     """)
     camera_columns={r[1] for r in con.execute("PRAGMA table_info(cameras)").fetchall()}
@@ -81,6 +82,9 @@ def init_db():
     model_columns={r[1] for r in con.execute("PRAGMA table_info(model_registry)").fetchall()}
     for column,ddl in {"artifact_uri":"TEXT NOT NULL DEFAULT ''","checksum":"TEXT NOT NULL DEFAULT ''"}.items():
         if column not in model_columns: con.execute(f"ALTER TABLE model_registry ADD COLUMN {column} {ddl}")
+    training_columns={r[1] for r in con.execute("PRAGMA table_info(training_jobs)").fetchall()}
+    for column,ddl in {"batch":"INTEGER NOT NULL DEFAULT 8","imgsz":"INTEGER NOT NULL DEFAULT 640","patience":"INTEGER NOT NULL DEFAULT 20","confidence":"REAL NOT NULL DEFAULT .35","val_split":"REAL NOT NULL DEFAULT .2","capture_fps":"REAL NOT NULL DEFAULT 2"}.items():
+        if column not in training_columns: con.execute(f"ALTER TABLE training_jobs ADD COLUMN {column} {ddl}")
     event_columns={r[1] for r in con.execute("PRAGMA table_info(events)").fetchall()}
     if "external_id" not in event_columns: con.execute("ALTER TABLE events ADD COLUMN external_id TEXT")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_events_external_id ON events(external_id) WHERE external_id IS NOT NULL")
@@ -119,7 +123,7 @@ async def lifespan(app: FastAPI):
         for task in list(_training_tasks.values()): task.cancel()
         if _training_tasks: await asyncio.gather(*list(_training_tasks.values()),return_exceptions=True)
 
-app=FastAPI(title="ZMK Vision API",version="2.1.0",description="On-premise API контура видеоаналитики",lifespan=lifespan)
+app=FastAPI(title="ZMK Vision API",version="2.2.0",description="On-premise API контура видеоаналитики",lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:5173").split(",") if x.strip()],allow_credentials=False,allow_methods=["GET","POST","PUT","PATCH","DELETE"],allow_headers=["Content-Type","X-API-Key","X-Telegram-Init-Data"])
 
 def custom_openapi():
@@ -152,9 +156,13 @@ async def security_middleware(request: Request, call_next):
     """Optional API-key protection, size/rate limits and baseline response headers."""
     path=request.url.path
     public=path in {"/api/health","/docs","/openapi.json","/redoc"} or not path.startswith("/api/")
+    if path.startswith("/api/internal/"):
+        from fastapi.responses import JSONResponse
+        if not WORKER_TOKEN: return JSONResponse({"detail":"Worker API is not configured"},status_code=503)
+        if not hmac.compare_digest(request.headers.get("X-Worker-Token",""),WORKER_TOKEN): return JSONResponse({"detail":"Invalid worker token"},status_code=401)
     api_key_ok=bool(API_KEY and hmac.compare_digest(request.headers.get("X-API-Key",""),API_KEY))
     telegram_role=telegram_webapp_role(request.headers.get("X-Telegram-Init-Data",""))
-    if API_KEY and not public and not (api_key_ok or telegram_role):
+    if API_KEY and not public and not (api_key_ok or telegram_role or path.startswith("/api/internal/")):
         from fastapi.responses import JSONResponse
         return JSONResponse({"detail":"Invalid or missing API credentials"},status_code=401,headers={"WWW-Authenticate":"ApiKey"})
     if telegram_role and not api_key_ok:
@@ -262,6 +270,12 @@ class TrainingIn(BaseModel):
     image_count:int=Field(default=100,ge=20,le=5000)
     epochs:int=Field(default=20,ge=1,le=300)
     target_name:str|None=Field(default=None,min_length=2,max_length=120,pattern=r"^[a-zA-Z0-9._-]+$")
+    batch:int=Field(default=8,ge=1,le=128)
+    imgsz:int=Field(default=640,ge=320,le=1920)
+    patience:int=Field(default=20,ge=0,le=100)
+    confidence:float=Field(default=.35,ge=.05,le=.95)
+    val_split:float=Field(default=.2,ge=.1,le=.4)
+    capture_fps:float=Field(default=2,ge=.1,le=10)
 
 def rows(query,args=()):
     con=db(); result=[dict(r) for r in con.execute(query,args).fetchall()]; con.close(); return result
@@ -276,7 +290,7 @@ def capabilities():
     return {"demo_mode":SEED_TEST_DATA,"training_worker":worker["reachable"] and worker["gpu"],"training":worker,"external_inference_gateway":True,"camera_crud":True,"diagnostics":True,"search":True}
 
 @app.get("/api/health")
-def health(): return {"status":"ok","version":"2.1.0","uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
+def health(): return {"status":"ok","version":"2.2.0","uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
 
 @app.get("/api/dashboard")
 def dashboard():
@@ -291,6 +305,14 @@ def dashboard():
         n=con.execute("SELECT COUNT(*) FROM events WHERE timestamp BETWEEN ? AND ?",(start.isoformat(),end.isoformat())).fetchone()[0]
         trend.append({"label":end.strftime("%H:00"),"value":n})
     con.close(); gpu=gpu_metrics(); return {"cameras":{"total":total,"online":online},"events24h":events24,"critical_unacked":critical,"avg_fps":round(avg[0],1),"avg_latency_ms":round(avg[1]),"gpu_load":gpu["gpu"],"gpu_temp":gpu["gpu_temp"],"messenger_provider":MESSENGER_PROVIDER,"active_model":model[0] if model else None,"precision":model[1] if model else None,"recall":model[2] if model else None,"trend":trend}
+
+@app.get("/api/internal/cameras")
+def internal_cameras(): return rows("SELECT id,name,rtsp_url,fps_limit,enabled FROM cameras WHERE enabled=1 AND rtsp_url!='' ORDER BY id")
+
+@app.get("/api/internal/active-model")
+def internal_active_model():
+    data=rows("SELECT m.name,m.format,m.artifact_uri,m.checksum FROM model_registry m JOIN settings s ON s.key='active_model' AND s.value=m.name WHERE m.status='ready'")
+    return data[0] if data else None
 
 @app.get("/api/cameras")
 def cameras():
@@ -409,7 +431,12 @@ def ingest_detections(payload:DetectionBatch):
         cur=con.execute("INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id,external_id) VALUES(?,?,?,?,?,?,?)",(normalized_timestamp,d.camera_id,d.event_type,severity,d.confidence,d.person_id,d.detection_id))
         accepted.append({"index":i,"event_id":cur.lastrowid})
     con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","inference_gateway",f"batch model={active} accepted={len(accepted)} rejected={len(rejected)}"))
-    con.commit(); con.close(); return {"active_model":active,"accepted":accepted,"rejected":rejected,"received":len(payload.detections)}
+    webhook={r[0]:r[1] for r in con.execute("SELECT key,value FROM settings WHERE key IN ('webhook_enabled','webhook_url','webhook_timeout')").fetchall()}; con.commit(); con.close()
+    if accepted and webhook.get('webhook_enabled')=='true' and webhook.get('webhook_url'):
+        try: httpx.post(webhook['webhook_url'],json={"source":"zmk-vision","model":active,"events":accepted,"timestamp":now_iso()},timeout=float(webhook.get('webhook_timeout','5'))).raise_for_status()
+        except httpx.HTTPError as exc:
+            logcon=db(); logcon.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"ERROR","integration",f"Webhook delivery failed: {str(exc)[:300]}")); logcon.commit(); logcon.close()
+    return {"active_model":active,"accepted":accepted,"rejected":rejected,"received":len(payload.detections)}
 
 @app.get("/api/admin/config")
 def get_config():
@@ -520,11 +547,11 @@ async def start_training(payload:TrainingIn):
         con.close(); raise HTTPException(409,"Имя модели уже используется")
     if con.execute("SELECT 1 FROM training_jobs WHERE status IN ('queued','running')").fetchone():
         con.close(); raise HTTPException(409,"Уже выполняется другая задача обучения")
-    cur=con.execute("INSERT INTO training_jobs(created_at,updated_at,camera_id,base_model,target_name,image_count,epochs,status,progress,stage) VALUES(?,?,?,?,?,?,?,?,?,?)",(now_iso(),now_iso(),payload.camera_id,active,target,payload.image_count,payload.epochs,"queued",0,"В очереди")); con.commit(); jid=cur.lastrowid; con.close()
+    cur=con.execute("INSERT INTO training_jobs(created_at,updated_at,camera_id,base_model,target_name,image_count,epochs,status,progress,stage,batch,imgsz,patience,confidence,val_split,capture_fps) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(now_iso(),now_iso(),payload.camera_id,active,target,payload.image_count,payload.epochs,"queued",0,"В очереди",payload.batch,payload.imgsz,payload.patience,payload.confidence,payload.val_split,payload.capture_fps)); con.commit(); jid=cur.lastrowid; con.close()
     if SEED_TEST_DATA:
         task=asyncio.create_task(run_training(jid),name=f"training-{jid}"); _training_tasks[jid]=task; task.add_done_callback(lambda _: _training_tasks.pop(jid,None))
     else:
-        model=rows("SELECT artifact_uri FROM model_registry WHERE name=?",(active,)); request={"id":jid,"camera_id":payload.camera_id,"rtsp_url":cam[1],"target_name":target,"base_artifact":model[0]["artifact_uri"] if model else None,"image_count":payload.image_count,"epochs":payload.epochs,"fps_limit":min(float(cam[2]),2)}
+        model=rows("SELECT artifact_uri FROM model_registry WHERE name=?",(active,)); request={"id":jid,"camera_id":payload.camera_id,"rtsp_url":cam[1],"target_name":target,"base_artifact":model[0]["artifact_uri"] if model else None,"image_count":payload.image_count,"epochs":payload.epochs,"fps_limit":min(float(cam[2]),payload.capture_fps),"batch":payload.batch,"imgsz":payload.imgsz,"patience":payload.patience,"confidence":payload.confidence,"val_split":payload.val_split}
         try:
             async with httpx.AsyncClient(timeout=15) as client: response=await client.post(f"{TRAINING_WORKER_URL}/jobs",json=request); response.raise_for_status()
         except httpx.HTTPError as exc:

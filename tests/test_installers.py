@@ -45,6 +45,8 @@ def test_compose_and_environment_are_consistent():
     assert compose['services']['max-bot']['build'] == './services/max_bot'
     assert compose['services']['training-worker']['profiles'] == ['training']
     assert compose['services']['training-worker']['build'] == './services/training_worker'
+    assert compose['services']['inference-worker']['profiles'] == ['inference']
+    assert compose['services']['inference-worker']['build'] == './services/inference_worker'
     assert 'RUN nginx -t' in (ROOT/'frontend/Dockerfile').read_text()
     nginx = (ROOT/'frontend/nginx.conf').read_text()
     assert 'set $api_upstream http://api:8000' in nginx and 'proxy_pass $api_upstream' in nginx

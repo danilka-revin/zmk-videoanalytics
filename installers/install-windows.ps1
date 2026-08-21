@@ -7,7 +7,7 @@ $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
 function Assert-ProjectFiles {
-  $required = @("docker-compose.yml", ".env.example", "backend/Dockerfile", "frontend/Dockerfile", "services/telegram_bot/Dockerfile", "services/max_bot/Dockerfile", "services/training_worker/Dockerfile")
+  $required = @("docker-compose.yml", ".env.example", "backend/Dockerfile", "frontend/Dockerfile", "services/telegram_bot/Dockerfile", "services/max_bot/Dockerfile", "services/training_worker/Dockerfile", "services/inference_worker/Dockerfile")
   foreach ($file in $required) { if (-not (Test-Path $file)) { throw "Missing project file: $file. Download and extract the complete release archive, not only the installer." } }
 }
 function Set-DotEnvValue([string]$Name, [string]$Value) {
@@ -99,6 +99,12 @@ if ($training -match '^(y|Y|true|1)$') {
   Set-DotEnvValue "TRAINING_WORKER_URL" "http://training-worker:8010"
   $ComposeProfile += @("--profile", "training")
 } else { Set-DotEnvValue "TRAINING_WORKER_URL" "" }
+$inference = if ($NonInteractive) { $env:ENABLE_INFERENCE } else { Read-Host "Enable real RTSP YOLO inference worker? [y/N]" }
+if ($inference -match '^(y|Y|true|1)$') {
+  $workerToken = if ($env:ZMK_WORKER_TOKEN) { $env:ZMK_WORKER_TOKEN } else { [guid]::NewGuid().ToString('N') }
+  Set-DotEnvValue "ZMK_WORKER_TOKEN" $workerToken
+  $ComposeProfile += @("--profile", "inference")
+}
 
 docker compose @ComposeProfile config --quiet
 if ($LASTEXITCODE -ne 0) { throw "docker-compose.yml or .env validation failed" }

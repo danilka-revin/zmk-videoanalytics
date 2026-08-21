@@ -56,6 +56,14 @@ def test_telegram_mini_app_signature_and_role_permissions():
         main.API_KEY, main.TELEGRAM_BOT_TOKEN, main.TELEGRAM_ROLES = old_key, old_token, old_roles
 
 
+def test_internal_worker_api_requires_dedicated_token(monkeypatch):
+    monkeypatch.setattr(main, 'WORKER_TOKEN', 'worker-secret')
+    with TestClient(main.app) as c:
+        assert c.get('/api/internal/cameras').status_code == 401
+        assert c.get('/api/internal/cameras', headers={'X-Worker-Token':'wrong'}).status_code == 401
+        assert c.get('/api/internal/cameras', headers={'X-Worker-Token':'worker-secret'}).status_code == 200
+
+
 def test_request_size_limit():
     with TestClient(main.app) as c:
         r = c.post('/api/inference/detections', headers={'content-length':'2000001'}, content=b'{}')

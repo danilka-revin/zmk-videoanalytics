@@ -33,7 +33,7 @@ def test_training_rejects_offline_camera_and_completes_online_job():
     with TestClient(app) as c:
         assert c.post('/api/training/jobs', json={'camera_id':'cam_07'}).status_code == 409
         target_name = f"test-camera-{uuid.uuid4().hex[:10]}"
-        started = c.post('/api/training/jobs', json={'camera_id':'cam_01','image_count':20,'epochs':1,'target_name':target_name})
+        started = c.post('/api/training/jobs', json={'camera_id':'cam_01','image_count':20,'epochs':1,'target_name':target_name,'batch':4,'imgsz':512,'patience':5,'confidence':.4,'val_split':.25,'capture_fps':1})
         assert started.status_code == 202
         job_id = started.json()['id']
         deadline = time.time() + 8
@@ -45,5 +45,6 @@ def test_training_rejects_offline_camera_and_completes_online_job():
             time.sleep(.25)
         assert job['status'] == 'completed'
         assert job['progress'] == 100
+        assert (job['batch'],job['imgsz'],job['patience'],job['confidence'],job['val_split'],job['capture_fps']) == (4,512,5,.4,.25,1)
         models = c.get('/api/models').json()
         assert any(x['name'] == target_name and x['status'] == 'ready' for x in models)
