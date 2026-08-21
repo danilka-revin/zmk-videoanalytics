@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import csv
 import hashlib
 import hmac
@@ -24,10 +26,11 @@ import pynvml
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
 TZ = timezone(timedelta(hours=7))
+SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
 STARTED = time.time()
 API_KEY = os.getenv("ZMK_API_KEY", "").strip()
@@ -123,7 +126,7 @@ async def lifespan(app: FastAPI):
         for task in list(_training_tasks.values()): task.cancel()
         if _training_tasks: await asyncio.gather(*list(_training_tasks.values()),return_exceptions=True)
 
-app=FastAPI(title="ZMK Vision API",version="2.2.2",description="On-premise API контура видеоаналитики",lifespan=lifespan)
+app=FastAPI(title="ZMK Vision API",version="2.2.3",description="On-premise API контура видеоаналитики",lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:5173").split(",") if x.strip()],allow_credentials=False,allow_methods=["GET","POST","PUT","PATCH","DELETE"],allow_headers=["Content-Type","X-API-Key","X-Telegram-Init-Data"])
 
 def custom_openapi():
@@ -225,6 +228,9 @@ class CameraTelemetry(BaseModel):
     status:Literal["online","offline","error","unknown"]
     fps:float=Field(default=0,ge=0,le=240)
     latency_ms:int=Field(default=0,ge=0,le=120000)
+class CameraSnapshotIn(BaseModel):
+    jpeg_base64:str=Field(min_length=16,max_length=1_800_000)
+    captured_at:datetime|None=None
 class SettingIn(BaseModel): value:float=Field(ge=.1,le=1)
 class AckIn(BaseModel): note:str=Field(default="",max_length=500)
 class DetectionIn(BaseModel):
@@ -290,7 +296,7 @@ def capabilities():
     return {"demo_mode":SEED_TEST_DATA,"training_worker":worker["reachable"],"training":worker,"external_inference_gateway":True,"camera_crud":True,"diagnostics":True,"search":True}
 
 @app.get("/api/health")
-def health(): return {"status":"ok","version":"2.2.2","uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
+def health(): return {"status":"ok","version":"2.2.3","uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
 
 @app.get("/api/dashboard")
 def dashboard():
@@ -346,6 +352,7 @@ def delete_camera(camera_id:str,delete_events:bool=False):
     con.execute("BEGIN IMMEDIATE")
     if delete_events: con.execute("DELETE FROM events WHERE camera_id=?",(camera_id,))
     con.execute("DELETE FROM cameras WHERE id=?",(camera_id,)); con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(now_iso(),"WARNING","camera_manager",f"Camera deleted: {camera[0]}",camera_id)); con.commit(); con.close()
+    snapshot=(SNAPSHOT_DIR or (DB_PATH.parent/"snapshots"))/f"{camera_id}.jpg"; snapshot.unlink(missing_ok=True)
     return {"id":camera_id,"deleted":True,"deleted_events":event_count if delete_events else 0}
 
 @app.patch("/api/cameras/{camera_id}/toggle")
@@ -359,6 +366,21 @@ def camera_telemetry(camera_id:str,payload:CameraTelemetry):
     con=db(); cur=con.execute("UPDATE cameras SET status=?,fps=?,latency_ms=?,updated_at=? WHERE id=?",(payload.status,payload.fps,payload.latency_ms,now_iso(),camera_id)); con.commit(); con.close()
     if not cur.rowcount: raise HTTPException(404,"Камера не найдена")
     return {"id":camera_id,**payload.model_dump()}
+
+@app.post("/api/cameras/{camera_id}/snapshot",status_code=204)
+def upload_camera_snapshot(camera_id:str,payload:CameraSnapshotIn):
+    con=db(); exists=con.execute("SELECT 1 FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
+    if not exists: raise HTTPException(404,"Камера не найдена")
+    try: image=base64.b64decode(payload.jpeg_base64,validate=True)
+    except (binascii.Error,ValueError): raise HTTPException(422,"Некорректный base64 JPEG")
+    if len(image)>1_300_000 or not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"): raise HTTPException(422,"Некорректный или слишком большой JPEG")
+    directory=SNAPSHOT_DIR or (DB_PATH.parent/"snapshots"); directory.mkdir(parents=True,exist_ok=True); target=directory/f"{camera_id}.jpg"; temp=directory/f".{camera_id}.tmp"; temp.write_bytes(image); temp.replace(target)
+
+@app.get("/api/cameras/{camera_id}/snapshot")
+def camera_snapshot(camera_id:str):
+    target=(SNAPSHOT_DIR or (DB_PATH.parent/"snapshots"))/f"{camera_id}.jpg"
+    if not target.exists(): raise HTTPException(404,"Кадр ещё не получен")
+    return FileResponse(target,media_type="image/jpeg",headers={"Cache-Control":"no-store"})
 
 def diagnose_camera_row(camera_id:str):
     con=db(); row=con.execute("SELECT id,name,rtsp_url,enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()

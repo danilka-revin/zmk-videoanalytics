@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import os
 import time
@@ -20,7 +21,7 @@ def file_sha256(path:Path):
   for chunk in iter(lambda:stream.read(1024*1024),b''): hasher.update(chunk)
  return hasher.hexdigest()
 class Runtime:
- def __init__(self): self.model=None; self.model_name=''; self.captures={}; self.last_telemetry={}; self.frame_counts={}
+ def __init__(self): self.model=None; self.model_name=''; self.captures={}; self.last_telemetry={}; self.last_snapshot={}; self.frame_counts={}
  async def get(self,path,internal=False):
   headers={'X-Worker-Token':WORKER_TOKEN} if internal else ({'X-API-Key':API_KEY} if API_KEY else {})
   async with httpx.AsyncClient(headers=headers,timeout=15) as c: r=await c.get(API+path); r.raise_for_status(); return r.json()
@@ -46,6 +47,11 @@ class Runtime:
   if now-self.last_telemetry.get(cid,now)>10 or cid not in self.last_telemetry:
    elapsed=max(.001,now-self.last_telemetry.get(cid,now)); effective=self.frame_counts[cid]/elapsed if cid in self.last_telemetry else 0
    await self.post(f'/api/cameras/{cid}/telemetry',{'status':'online' if ok else 'offline','fps':effective,'latency_ms':latency}); self.last_telemetry[cid]=now; self.frame_counts[cid]=0
+  if ok and now-self.last_snapshot.get(cid,0)>5:
+   height,width=image.shape[:2]
+   if width>960: image=cv2.resize(image,(960,int(height*960/width)))
+   encoded_ok,encoded=cv2.imencode('.jpg',image,[cv2.IMWRITE_JPEG_QUALITY,75])
+   if encoded_ok: await self.post(f'/api/cameras/{cid}/snapshot',{'jpeg_base64':base64.b64encode(encoded).decode(),'captured_at':datetime.now(timezone.utc).isoformat()}); self.last_snapshot[cid]=now
   if not ok or self.model is None: return
   result=(await asyncio.to_thread(self.model.track,image,persist=True,conf=CONF,device=DEVICE,verbose=False))[0]; detections=[]; stamp=datetime.now(timezone.utc).isoformat()
   track_ids=result.boxes.id.int().cpu().tolist() if result.boxes.id is not None else [None]*len(result.boxes)
@@ -59,7 +65,7 @@ class Runtime:
   while True:
    try:
     await self.load_model(); cameras=await self.get('/api/internal/cameras',True); active_ids={c['id'] for c in cameras}
-    for stale in set(self.captures)-active_ids: self.captures.pop(stale).release(); self.last_telemetry.pop(stale,None); self.frame_counts.pop(stale,None)
+    for stale in set(self.captures)-active_ids: self.captures.pop(stale).release(); self.last_telemetry.pop(stale,None); self.last_snapshot.pop(stale,None); self.frame_counts.pop(stale,None)
     for cam in cameras:
      await self.frame(cam); await asyncio.sleep(max(.01,1/float(cam['fps_limit'])))
     if not cameras: await asyncio.sleep(5)

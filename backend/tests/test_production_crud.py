@@ -1,3 +1,5 @@
+import base64
+
 from app import main
 from fastapi.testclient import TestClient
 
@@ -35,7 +37,11 @@ def test_camera_full_crud_search_telemetry_and_diagnostics(monkeypatch):
         assert results and results[0]['kind']=='camera'
         diag=c.post(f'/api/cameras/{camera_id}/diagnostics').json()
         assert diag['reachable'] is False and diag['status']=='unreachable'
+        jpeg=b'\xff\xd8'+b'camera-frame'+b'\xff\xd9'
+        assert c.post(f'/api/cameras/{camera_id}/snapshot',json={'jpeg_base64':base64.b64encode(jpeg).decode()}).status_code==204
+        assert c.get(f'/api/cameras/{camera_id}/snapshot').status_code==200
         assert c.delete(f'/api/cameras/{camera_id}').status_code==200
+        assert c.get(f'/api/cameras/{camera_id}/snapshot').status_code==404
         assert c.get('/api/cameras').json()==[]
 
 

@@ -1,13 +1,11 @@
-# ZMK Vision v2.2.2 — CPU Fallback & NVIDIA Runtime Detection
+# ZMK Vision v2.2.3 — Camera Live Snapshots & Delete Fix
 
-Исправлена ошибка запуска:
-
-`could not select device driver "nvidia" with capabilities: [[gpu]]`
-
-- GPU reservation удалён из базового `docker-compose.yml`.
-- Inference и training workers всегда запускаются на CPU, если NVIDIA runtime отсутствует.
-- Добавлен `docker-compose.gpu.yml` с `gpus: all` для машин с NVIDIA Container Toolkit.
-- Windows/Linux installers автоматически проверяют Docker runtimes и подключают GPU override только при наличии `nvidia`.
-- `INFERENCE_DEVICE=auto` и `TRAINING_DEVICE=auto` выбирают CUDA при доступности, иначе CPU.
-- Capability API считает training worker рабочим и в CPU-режиме, отдельно возвращая `gpu` и `device`.
-- Образы больше не падают на старте на компьютерах без NVIDIA.
+- Inference worker каждые 5 секунд сохраняет реальный JPEG последнего RTSP-кадра.
+- Кадр уменьшается до 960 px и JPEG quality 75 для ограничения трафика.
+- Добавлены защищённые upload/get snapshot API; RTSP credentials не раскрываются.
+- Web-панель загружает изображения через fetch с API key и обновляет их без перезагрузки.
+- Object URLs освобождаются, утечки памяти в браузере исключены.
+- При отсутствии кадра показывается нейтральная иконка, а не поддельное изображение.
+- Кнопка удаления теперь имеет видимый текст, подтверждение и удаляет связанные snapshot-файлы.
+- Удаление камеры с событиями по-прежнему требует явного подтверждения `delete_events=true`.
+- Добавлены regression-тесты upload/get/delete snapshot.
