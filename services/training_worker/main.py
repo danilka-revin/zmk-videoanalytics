@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from ultralytics import YOLO
 
-API=os.getenv('ZMK_API_URL','http://api:8000').rstrip('/'); KEY=os.getenv('ZMK_API_KEY',''); BASE_MODEL=os.getenv('BASE_TRAIN_MODEL','yolo11n.pt'); ROOT=Path(os.getenv('TRAINING_DATA_DIR','/data')); MODELS=Path(os.getenv('MODEL_DIR','/models'))
+API=os.getenv('ZMK_API_URL','http://api:8000').rstrip('/'); DEVICE_SETTING=os.getenv('TRAINING_DEVICE','auto'); DEVICE=(0 if torch.cuda.is_available() else 'cpu') if DEVICE_SETTING=='auto' else DEVICE_SETTING; KEY=os.getenv('ZMK_API_KEY',''); BASE_MODEL=os.getenv('BASE_TRAIN_MODEL','yolo11n.pt'); ROOT=Path(os.getenv('TRAINING_DATA_DIR','/data')); MODELS=Path(os.getenv('MODEL_DIR','/models'))
 app=FastAPI(title='ZMK Training Worker',version='1.0.0'); running:set[int]=set(); tasks:dict[int,asyncio.Task]={}
 class Job(BaseModel):
  id:int; camera_id:str; rtsp_url:str; target_name:str; base_artifact:str|None=None; image_count:int=Field(ge=20,le=5000); epochs:int=Field(ge=1,le=300); fps_limit:float=Field(default=2,gt=0,le=10); batch:int=Field(default=8,ge=1,le=128); imgsz:int=Field(default=640,ge=320,le=1920); patience:int=Field(default=20,ge=0,le=100); confidence:float=Field(default=.35,ge=.05,le=.95); val_split:float=Field(default=.2,ge=.1,le=.4)
@@ -47,7 +47,7 @@ def train(job:Job, updates=None):
   split='val' if index < max(1,int(len(labeled)*job.val_split)) else 'train'; image=images/f'{label.stem}.jpg'; shutil.move(str(image),work/'images'/split/image.name); shutil.move(str(label),work/'labels'/split/label.name)
  data=work/'data.yaml'; data.write_text(yaml.safe_dump({'path':str(work),'train':'images/train','val':'images/val','names':pseudo_model.names},allow_unicode=True))
  trainer=YOLO(BASE_MODEL); updates and updates.put(('progress',60,'Обучение YOLO11n'))
- result=trainer.train(data=str(data),epochs=job.epochs,imgsz=job.imgsz,batch=job.batch,patience=job.patience,device=0,project=str(work/'runs'),name='train',exist_ok=True,verbose=False)
+ result=trainer.train(data=str(data),epochs=job.epochs,imgsz=job.imgsz,batch=job.batch,patience=job.patience,device=DEVICE,project=str(work/'runs'),name='train',exist_ok=True,verbose=False)
  updates and updates.put(('progress',90,'Экспорт ONNX'))
  best=work/'runs'/'train'/'weights'/'best.pt'; MODELS.mkdir(parents=True,exist_ok=True); target=MODELS/f'{job.target_name}.pt'; shutil.copy2(best,target); exported=YOLO(str(target)).export(format='onnx',dynamic=True,simplify=True); onnx=MODELS/f'{job.target_name}.onnx'; shutil.move(str(exported),onnx)
  metrics=getattr(result,'results_dict',{}); return onnx,float(metrics.get('metrics/precision(B)',0))*100,float(metrics.get('metrics/recall(B)',0))*100
@@ -77,7 +77,7 @@ async def execute(job:Job):
   if process.is_alive(): process.terminate()
   process.join(timeout=5); running.discard(job.id); tasks.pop(job.id,None); updates.close()
 @app.get('/health')
-def health(): return {'status':'ok','gpu':torch.cuda.is_available(),'running_jobs':list(running)}
+def health(): return {'status':'ok','gpu':torch.cuda.is_available(),'device':str(DEVICE),'running_jobs':list(running)}
 @app.post('/jobs',status_code=202)
 async def jobs(job:Job):
  if running: raise HTTPException(409,'Training worker is busy')

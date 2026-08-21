@@ -1,11 +1,13 @@
-# ZMK Vision v2.2.1 — Worker Reliability Fixes
+# ZMK Vision v2.2.2 — CPU Fallback & NVIDIA Runtime Detection
 
-- Реальная отмена обучения теперь завершает отдельный GPU process, а не только asyncio task.
-- Progress callbacks добавлены для capture, pseudo-labeling, training и ONNX export.
-- Ошибки дочернего ML process безопасно возвращаются backend.
-- Inference worker использует YOLO tracking и передаёт устойчивый person_id для event cooldown.
-- Удалённые камеры закрывают RTSP capture и освобождают ресурсы.
-- Добавлены OpenCV RTSP open/read timeouts.
-- SHA-256 больших моделей считается потоково без загрузки файла целиком в память.
-- Telemetry сообщает фактическую скорость обработки worker, а не FPS источника.
-- Исправлены cleanup multiprocessing queue/process при error/cancel/shutdown.
+Исправлена ошибка запуска:
+
+`could not select device driver "nvidia" with capabilities: [[gpu]]`
+
+- GPU reservation удалён из базового `docker-compose.yml`.
+- Inference и training workers всегда запускаются на CPU, если NVIDIA runtime отсутствует.
+- Добавлен `docker-compose.gpu.yml` с `gpus: all` для машин с NVIDIA Container Toolkit.
+- Windows/Linux installers автоматически проверяют Docker runtimes и подключают GPU override только при наличии `nvidia`.
+- `INFERENCE_DEVICE=auto` и `TRAINING_DEVICE=auto` выбирают CUDA при доступности, иначе CPU.
+- Capability API считает training worker рабочим и в CPU-режиме, отдельно возвращая `gpu` и `device`.
+- Образы больше не падают на старте на компьютерах без NVIDIA.

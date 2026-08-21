@@ -105,6 +105,11 @@ if ($inference -match '^(y|Y|true|1)$') {
   Set-DotEnvValue "ZMK_WORKER_TOKEN" $workerToken
   $ComposeProfile += @("--profile", "inference")
 }
+$runtimes = docker info --format '{{json .Runtimes}}' 2>$null
+if ($runtimes -match 'nvidia') {
+  $env:COMPOSE_FILE = "docker-compose.yml;docker-compose.gpu.yml"
+  Write-Host "NVIDIA Container Runtime found: GPU enabled" -ForegroundColor Green
+} else { Write-Host "NVIDIA runtime not found: workers will use CPU fallback" -ForegroundColor Yellow }
 
 docker compose @ComposeProfile config --quiet
 if ($LASTEXITCODE -ne 0) { throw "docker-compose.yml or .env validation failed" }

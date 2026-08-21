@@ -6,7 +6,7 @@
 
 > Впервые работаете с Docker и серверными приложениями? Откройте **[подробную инструкцию для начинающих](docs/BEGINNER_GUIDE_RU.md)** — в ней пошагово разобраны Windows, Linux, Telegram, MAX, камеры, безопасность, обновление и типовые ошибки.
 
-![Version](https://img.shields.io/badge/version-2.2.1-25332d)
+![Version](https://img.shields.io/badge/version-2.2.2-25332d)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688)
 ![React](https://img.shields.io/badge/React-TypeScript-61dafb)
@@ -218,8 +218,14 @@ Web Admin ── Telegram/MAX Bot ── Mini App ── СКУД Webhook
 
 ```bash
 # в .env: TRAINING_WORKER_URL=http://training-worker:8010
+# CPU fallback (запускается везде)
 docker compose --profile training up -d --build
+
+# NVIDIA Container Toolkit установлен
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile training up -d --build
 ```
+
+Базовый Compose больше не требует NVIDIA runtime и не падает на компьютерах без GPU. Установщик сам подключает `docker-compose.gpu.yml`, только если Docker сообщает о runtime `nvidia`.
 
 При ручном запуске из панели worker захватывает кадры выбранной RTSP-камеры, создаёт псевдоразметку активной моделью (или YOLO11n), обучает YOLO11n, экспортирует ONNX в persistent `model-data` и регистрирует модель через API. Если получено меньше 10 размеченных кадров, задача завершается ошибкой — пустые метрики не генерируются.
 
@@ -282,7 +288,7 @@ docker-compose.yml       Локальная и production-конфигураци
 
 ## Статус
 
-Версия `2.2.1` является рабочим интеграционным контуром без витринных данных. Web-панель, REST API, camera CRUD, диагностика, поиск, отчёты, Telegram/MAX и внешний inference gateway работают локально. Для распознавания подключите RTSP ingestion worker и зарегистрируйте реальный артефакт модели. Обучение включается Compose-профилем `training` и требует NVIDIA Driver/Container Toolkit; без доступной CUDA кнопка запуска остаётся недоступной.
+Версия `2.2.2` является рабочим интеграционным контуром без витринных данных. Web-панель, REST API, camera CRUD, диагностика, поиск, отчёты, Telegram/MAX и внешний inference gateway работают локально. Для распознавания подключите RTSP ingestion worker и зарегистрируйте реальный артефакт модели. Обучение включается Compose-профилем `training` и требует NVIDIA Driver/Container Toolkit; без доступной CUDA кнопка запуска остаётся недоступной.
 
 ## Защита API и эксплуатационная безопасность
 

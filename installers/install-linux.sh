@@ -92,6 +92,12 @@ if [[ "$INFERENCE" =~ ^([yY]|true|1)$ ]]; then
   set_env ZMK_WORKER_TOKEN "$TOKEN_VALUE"
   PROFILE+=(--profile inference)
 fi
+if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -qi nvidia; then
+  export COMPOSE_FILE="docker-compose.yml:docker-compose.gpu.yml"
+  echo "NVIDIA Container Runtime найден: workers получат GPU"
+else
+  echo "NVIDIA Container Runtime не найден: workers запустятся в CPU fallback без ошибки"
+fi
 
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml or .env validation failed"
 if ! "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose startup failed"; fi

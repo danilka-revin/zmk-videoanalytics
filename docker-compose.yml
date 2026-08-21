@@ -1,8 +1,10 @@
 services:
   api:
     build: ./backend
-    ports: ["127.0.0.1:8000:8000"]
-    volumes: ["./data:/app/data"]
+    ports:
+    - 127.0.0.1:8000:8000
+    volumes:
+    - ./data:/app/data
     environment:
       VIDEOANALYTICS_DB: /app/data/videoanalytics.db
       ZMK_API_KEY: ${ZMK_API_KEY:-}
@@ -17,17 +19,27 @@ services:
       TELEGRAM_OPERATOR_IDS: ${TELEGRAM_OPERATOR_IDS:-}
       TELEGRAM_VIEWER_IDS: ${TELEGRAM_VIEWER_IDS:-}
     restart: unless-stopped
-    healthcheck: {test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')"], interval: 15s, timeout: 3s, retries: 3}
+    healthcheck:
+      test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://localhost:8000/api/health')
+      interval: 15s
+      timeout: 3s
+      retries: 3
   web:
     build: ./frontend
-    ports: ["5173:80"]
+    ports:
+    - 5173:80
     depends_on:
       api:
         condition: service_healthy
     restart: unless-stopped
   telegram-bot:
     build: ./services/telegram_bot
-    profiles: ["telegram"]
+    profiles:
+    - telegram
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ADMIN_IDS: ${TELEGRAM_ADMIN_IDS:-}
@@ -42,7 +54,8 @@ services:
     restart: unless-stopped
   max-bot:
     build: ./services/max_bot
-    profiles: ["max"]
+    profiles:
+    - max
     environment:
       MAX_BOT_TOKEN: ${MAX_BOT_TOKEN:-}
       MAX_ADMIN_IDS: ${MAX_ADMIN_IDS:-}
@@ -56,61 +69,64 @@ services:
     restart: unless-stopped
   inference-worker:
     build: ./services/inference_worker
-    profiles: ["inference"]
+    profiles:
+    - inference
     environment:
       ZMK_API_URL: http://api:8000
       ZMK_API_KEY: ${ZMK_API_KEY:-}
       ZMK_WORKER_TOKEN: ${ZMK_WORKER_TOKEN:-}
-      INFERENCE_DEVICE: ${INFERENCE_DEVICE:-0}
+      INFERENCE_DEVICE: ${INFERENCE_DEVICE:-auto}
       INFERENCE_CONF: ${INFERENCE_CONF:-0.5}
     volumes:
-      - model-data:/models
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    - model-data:/models
     depends_on:
       api:
         condition: service_healthy
     restart: unless-stopped
   training-worker:
     build: ./services/training_worker
-    profiles: ["training"]
+    profiles:
+    - training
     environment:
       ZMK_API_URL: http://api:8000
       ZMK_API_KEY: ${ZMK_API_KEY:-}
       TRAINING_DATA_DIR: /data
       MODEL_DIR: /models
+      TRAINING_DEVICE: ${TRAINING_DEVICE:-auto}
     volumes:
-      - training-data:/data
-      - model-data:/models
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
+    - training-data:/data
+    - model-data:/models
     depends_on:
       api:
         condition: service_healthy
     restart: unless-stopped
   redis:
     image: redis:7-alpine
-    profiles: ["production"]
+    profiles:
+    - production
     restart: unless-stopped
   postgres:
     image: postgres:16-alpine
-    profiles: ["production"]
-    environment: {POSTGRES_DB: videoanalytics, POSTGRES_USER: zmk, POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-change-before-production}"}
-    volumes: ["postgres-data:/var/lib/postgresql/data"]
+    profiles:
+    - production
+    environment:
+      POSTGRES_DB: videoanalytics
+      POSTGRES_USER: zmk
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-before-production}
+    volumes:
+    - postgres-data:/var/lib/postgresql/data
   minio:
     image: minio/minio
-    profiles: ["production"]
+    profiles:
+    - production
     command: server /data --console-address :9001
-    environment: {MINIO_ROOT_USER: "${MINIO_ROOT_USER:-zmkadmin}", MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-change-before-production}"}
-    volumes: ["minio-data:/data"]
-volumes: {postgres-data: {}, minio-data: {}, training-data: {}, model-data: {}}
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-zmkadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-change-before-production}
+    volumes:
+    - minio-data:/data
+volumes:
+  postgres-data: {}
+  minio-data: {}
+  training-data: {}
+  model-data: {}

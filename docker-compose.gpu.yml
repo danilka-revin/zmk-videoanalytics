@@ -1,0 +1,5 @@
+services:
+  inference-worker:
+    gpus: all
+  training-worker:
+    gpus: all

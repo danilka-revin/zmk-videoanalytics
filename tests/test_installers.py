@@ -36,6 +36,8 @@ def test_windows_wrapper_and_powershell_structure():
 
 def test_compose_and_environment_are_consistent():
     compose = yaml.safe_load((ROOT/'docker-compose.yml').read_text())
+    gpu_override = yaml.safe_load((ROOT/'docker-compose.gpu.yml').read_text())
+    assert gpu_override['services']['training-worker']['gpus'] == 'all'
     assert compose['services']['web']['build'] == './frontend'
     assert 'healthcheck' in compose['services']['api']
     assert compose['services']['api']['environment']['VIDEOANALYTICS_DB'] == '/app/data/videoanalytics.db'
