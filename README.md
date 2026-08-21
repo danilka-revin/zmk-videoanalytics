@@ -6,7 +6,7 @@
 
 > Впервые работаете с Docker и серверными приложениями? Откройте **[подробную инструкцию для начинающих](docs/BEGINNER_GUIDE_RU.md)** — в ней пошагово разобраны Windows, Linux, Telegram, MAX, камеры, безопасность, обновление и типовые ошибки.
 
-![Version](https://img.shields.io/badge/version-2.0.0-25332d)
+![Version](https://img.shields.io/badge/version-2.1.0-25332d)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688)
 ![React](https://img.shields.io/badge/React-TypeScript-61dafb)
@@ -50,7 +50,8 @@
 - audit log переключений;
 - запуск автодообучения по кадрам выбранной камеры;
 - этапы захвата, quality gate, псевдоразметки, train/validation и экспорта ONNX;
-- единичная очередь GPU-задач, отмена обучения и восстановление после перезапуска;
+- реальный NVIDIA training worker: захват RTSP, псевдоразметка, YOLO11n fine-tuning и ONNX export;
+- единичная очередь GPU-задач, отмена обучения и callback прогресса;
 - блокировка активации моделей ниже минимальных Precision/Recall;
 - регистрация новой версии после завершения обучения;
 - ручная активация обученной модели после проверки метрик.
@@ -211,6 +212,17 @@ Web Admin ── Telegram/MAX Bot ── Mini App ── СКУД Webhook
 | `GET` | `/api/reports/events.csv` | CSV событий |
 | `GET` | `/api/system-health` | Состояние ресурсов |
 
+## Реальное обучение на NVIDIA GPU
+
+Установите NVIDIA Driver и NVIDIA Container Toolkit, затем запустите:
+
+```bash
+# в .env: TRAINING_WORKER_URL=http://training-worker:8010
+docker compose --profile training up -d --build
+```
+
+При ручном запуске из панели worker захватывает кадры выбранной RTSP-камеры, создаёт псевдоразметку активной моделью (или YOLO11n), обучает YOLO11n, экспортирует ONNX в persistent `model-data` и регистрирует модель через API. Если получено меньше 10 размеченных кадров, задача завершается ошибкой — пустые метрики не генерируются.
+
 ## Production-профиль
 
 ```bash
@@ -270,7 +282,7 @@ docker-compose.yml       Локальная и production-конфигураци
 
 ## Статус
 
-Версия `2.0.0` является рабочим интеграционным контуром без витринных данных. Web-панель, REST API, camera CRUD, диагностика, поиск, отчёты, Telegram/MAX и внешний inference gateway работают локально. Для распознавания подключите RTSP ingestion worker и зарегистрируйте реальный артефакт модели. Обучение доступно только после подключения внешнего GPU training worker.
+Версия `2.1.0` является рабочим интеграционным контуром без витринных данных. Web-панель, REST API, camera CRUD, диагностика, поиск, отчёты, Telegram/MAX и внешний inference gateway работают локально. Для распознавания подключите RTSP ingestion worker и зарегистрируйте реальный артефакт модели. Обучение включается Compose-профилем `training` и требует NVIDIA Driver/Container Toolkit; без доступной CUDA кнопка запуска остаётся недоступной.
 
 ## Защита API и эксплуатационная безопасность
 

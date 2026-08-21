@@ -7,7 +7,7 @@ $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
 function Assert-ProjectFiles {
-  $required = @("docker-compose.yml", ".env.example", "backend/Dockerfile", "frontend/Dockerfile", "services/telegram_bot/Dockerfile", "services/max_bot/Dockerfile")
+  $required = @("docker-compose.yml", ".env.example", "backend/Dockerfile", "frontend/Dockerfile", "services/telegram_bot/Dockerfile", "services/max_bot/Dockerfile", "services/training_worker/Dockerfile")
   foreach ($file in $required) { if (-not (Test-Path $file)) { throw "Missing project file: $file. Download and extract the complete release archive, not only the installer." } }
 }
 function Set-DotEnvValue([string]$Name, [string]$Value) {
@@ -94,6 +94,11 @@ switch ($messenger.ToLowerInvariant()) {
   default { throw "MESSENGER_PROVIDER must be telegram, max or none" }
 }
 docker compose --profile telegram --profile max stop telegram-bot max-bot 2>$null | Out-Null
+$training = if ($NonInteractive) { $env:ENABLE_TRAINING } else { Read-Host "Enable real YOLO auto-training on NVIDIA GPU? [y/N]" }
+if ($training -match '^(y|Y|true|1)$') {
+  Set-DotEnvValue "TRAINING_WORKER_URL" "http://training-worker:8010"
+  $ComposeProfile += @("--profile", "training")
+} else { Set-DotEnvValue "TRAINING_WORKER_URL" "" }
 
 docker compose @ComposeProfile config --quiet
 if ($LASTEXITCODE -ne 0) { throw "docker-compose.yml or .env validation failed" }

@@ -1,11 +1,20 @@
-# ZMK Vision v2.0.0 — Production Data & Camera Management
+# ZMK Vision v2.1.0 — Real NVIDIA Auto-Training
+
+## Реальное автодообучение
+- NVIDIA GPU worker на Ultralytics 8.4.126.
+- RTSP capture с FPS limit.
+- Псевдоразметка активной моделью или YOLO11n.
+- Раздельные train/validation наборы.
+- YOLO11n fine-tuning и динамический ONNX export.
+- Persistent model/data volumes, progress callback и cancellation.
+- Задача завершается ошибкой при недостатке кадров или разметки — успешные метрики не подставляются.
 
 ## Убраны витринные данные
 - Чистая установка стартует без камер, событий, пользователей и моделей.
 - Удалены фиктивные GPU/CPU/RAM/Disk, FPS, latency и модельные метрики.
 - Ресурсы сервера измеряются через psutil и NVIDIA NVML; при отсутствии GPU показывается `—`.
 - Генераторы тестовых событий и ошибок недоступны в production.
-- Симуляция обучения отключена: UI честно сообщает, что требуется внешний GPU training worker.
+- Симуляция обучения удалена и добавлен реальный NVIDIA GPU training worker: RTSP capture, pseudo-labeling, YOLO11n fine-tuning, ONNX export, progress callbacks и cancellation.
 - Dashboard отображает только фактически зарегистрированную модель и полученную телеметрию.
 
 ## Полное управление камерами

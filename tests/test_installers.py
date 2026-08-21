@@ -21,7 +21,7 @@ def test_windows_wrapper_and_powershell_structure():
     bat = (ROOT/'installers/install-windows.bat').read_text()
     ps = (ROOT/'installers/install-windows.ps1').read_text()
     assert 'install-windows.ps1' in bat and '%*' in bat
-    for required in ['param(', 'Assert-ProjectFiles', 'docker compose', 'Wait-Http', 'config --quiet', '--remove-orphans', 'MESSENGER_PROVIDER', 'MAX_BOT_TOKEN']:
+    for required in ['param(', 'Assert-ProjectFiles', 'docker compose', 'Wait-Http', 'config --quiet', '--remove-orphans', 'MESSENGER_PROVIDER', 'MAX_BOT_TOKEN', 'ENABLE_TRAINING', 'TRAINING_WORKER_URL']:
         assert required in ps
     # Lightweight delimiter guard for environments where pwsh is unavailable.
     clean = re.sub(r'(?s)<#.*?#>|#.*', '', ps)
@@ -43,6 +43,8 @@ def test_compose_and_environment_are_consistent():
     assert compose['services']['telegram-bot']['profiles'] == ['telegram']
     assert compose['services']['max-bot']['profiles'] == ['max']
     assert compose['services']['max-bot']['build'] == './services/max_bot'
+    assert compose['services']['training-worker']['profiles'] == ['training']
+    assert compose['services']['training-worker']['build'] == './services/training_worker'
     assert 'RUN nginx -t' in (ROOT/'frontend/Dockerfile').read_text()
     nginx = (ROOT/'frontend/nginx.conf').read_text()
     assert 'set $api_upstream http://api:8000' in nginx and 'proxy_pass $api_upstream' in nginx

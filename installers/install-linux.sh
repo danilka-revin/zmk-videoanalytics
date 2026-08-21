@@ -4,7 +4,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }
-required=(docker-compose.yml .env.example backend/Dockerfile frontend/Dockerfile services/telegram_bot/Dockerfile services/max_bot/Dockerfile)
+required=(docker-compose.yml .env.example backend/Dockerfile frontend/Dockerfile services/telegram_bot/Dockerfile services/max_bot/Dockerfile services/training_worker/Dockerfile)
 for file in "${required[@]}"; do [[ -f "$file" ]] || fail "Missing $file. Download and extract the complete release archive, not only the installer."; done
 
 if [[ "${1:-}" == "--check" ]]; then
@@ -78,6 +78,14 @@ case "$MESSENGER" in
   *) fail "MESSENGER_PROVIDER must be telegram, max or none";;
 esac
 "${DC[@]}" --profile telegram --profile max stop telegram-bot max-bot >/dev/null 2>&1 || true
+if [[ -n "${NONINTERACTIVE:-}" ]]; then TRAINING="${ENABLE_TRAINING:-false}"; else read -r -p "Включить реальное YOLO auto-training на NVIDIA GPU? [y/N]: " TRAINING; fi
+if [[ "$TRAINING" =~ ^([yY]|true|1)$ ]]; then
+  command -v nvidia-smi >/dev/null 2>&1 || echo "WARNING: nvidia-smi не найден; установите NVIDIA driver и Container Toolkit"
+  set_env TRAINING_WORKER_URL "http://training-worker:8010"
+  PROFILE+=(--profile training)
+else
+  set_env TRAINING_WORKER_URL ""
+fi
 
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml or .env validation failed"
 if ! "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose startup failed"; fi

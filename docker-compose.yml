@@ -9,6 +9,7 @@ services:
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
       MESSENGER_PROVIDER: ${MESSENGER_PROVIDER:-none}
+      TRAINING_WORKER_URL: ${TRAINING_WORKER_URL:-}
       RTSP_CAM_01: ${RTSP_CAM_01:-rtsp://camera-01/stream}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ADMIN_IDS: ${TELEGRAM_ADMIN_IDS:-}
@@ -52,6 +53,28 @@ services:
       api:
         condition: service_healthy
     restart: unless-stopped
+  training-worker:
+    build: ./services/training_worker
+    profiles: ["training"]
+    environment:
+      ZMK_API_URL: http://api:8000
+      ZMK_API_KEY: ${ZMK_API_KEY:-}
+      TRAINING_DATA_DIR: /data
+      MODEL_DIR: /models
+    volumes:
+      - training-data:/data
+      - model-data:/models
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    depends_on:
+      api:
+        condition: service_healthy
+    restart: unless-stopped
   redis:
     image: redis:7-alpine
     profiles: ["production"]
@@ -67,4 +90,4 @@ services:
     command: server /data --console-address :9001
     environment: {MINIO_ROOT_USER: "${MINIO_ROOT_USER:-zmkadmin}", MINIO_ROOT_PASSWORD: "${MINIO_ROOT_PASSWORD:-change-before-production}"}
     volumes: ["minio-data:/data"]
-volumes: {postgres-data: {}, minio-data: {}}
+volumes: {postgres-data: {}, minio-data: {}, training-data: {}, model-data: {}}
