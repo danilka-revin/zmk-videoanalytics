@@ -1,14 +1,13 @@
 import time
 import uuid
 
-from app.main import app
+from app.main import app, db, now_iso
 from fastapi.testclient import TestClient
 
 
 def test_error_report_and_csv():
     with TestClient(app) as c:
-        created = c.post('/api/admin/logs/simulate-error')
-        assert created.status_code == 201
+        con=db(); con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(now_iso(),'ERROR','test','Fixture error','cam_01')); con.commit(); con.close()
         report = c.get('/api/reports/errors?hours=24')
         assert report.status_code == 200
         assert set(report.json()['summary']) == {'WARNING', 'ERROR', 'CRITICAL'}

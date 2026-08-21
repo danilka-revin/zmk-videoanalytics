@@ -76,8 +76,8 @@ def dashboard_text(d: dict[str, Any]) -> str:
             f"Критические: <b>{d['critical_unacked']}</b>\n"
             f"Средний FPS: <b>{d['avg_fps']}</b>\n"
             f"Задержка: <b>{d['avg_latency_ms']} мс</b>\n"
-            f"GPU: <b>{d['gpu_load']}%</b>\n"
-            f"Precision / Recall: <b>{d['precision']}% / {d['recall']}%</b>")
+            f"GPU: <b>{str(d['gpu_load'])+'%' if d['gpu_load'] is not None else '—'}</b>\n"
+            f"Precision / Recall: <b>{str(d['precision'])+'%' if d['precision'] is not None else '—'} / {str(d['recall'])+'%' if d['recall'] is not None else '—'}</b>")
 
 def event_text(e: dict[str, Any]) -> str:
     labels={"no_helmet":"Без каски","no_vest":"Без жилета","phone_usage":"Телефон","smoking":"Курение","restricted_zone":"Опасная зона","immobility":"Неподвижность"}
@@ -186,8 +186,7 @@ async def users_cmd(message: Message):
 @router.message(Command("alert_test"))
 async def alert_test_cmd(message: Message):
     if not await guard(message,"admin"): return
-    error=await api("POST","/api/admin/logs/simulate-error")
-    await message.answer(f"🚨 <b>Тестовое оповещение</b>\n<code>{html.escape(str(error['level']))}</code> {html.escape(str(error['service']))}\n{html.escape(str(error['message']))}")
+    await message.answer("✅ <b>Канал оповещений работает</b>\nЭто служебная проверка доставки; событие или ошибка в системе не создавались.")
 
 @router.message(Command("health"))
 async def health_cmd(message: Message):

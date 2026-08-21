@@ -9,7 +9,7 @@ def test_health_and_dashboard():
         assert d['cameras']['total'] == 10
         assert d['messenger_provider'] in {'none','telegram','max'}
 
-def test_simulate_and_ack():
+def test_ack_existing_event():
     with TestClient(app) as c:
-        e=c.post('/api/events/simulate').json()
-        assert c.post(f"/api/events/{e['id']}/ack",json={'note':'Проверено'}).status_code == 200
+        event=c.get('/api/events?limit=1').json()[0]
+        assert c.post(f"/api/events/{event['id']}/ack",json={'note':'Проверено'}).status_code == 200

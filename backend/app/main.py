@@ -7,15 +7,19 @@ import hmac
 import io
 import json
 import os
-import secrets
+import socket
 import sqlite3
 import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import parse_qsl
+from urllib.parse import parse_qsl, urlparse
 
+import psutil
+import pynvml
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
@@ -32,11 +36,9 @@ _rate_buckets: dict[str, list[float]] = {}
 _training_tasks: dict[int,asyncio.Task] = {}
 MESSENGER_PROVIDER = os.getenv("MESSENGER_PROVIDER", "none").lower()
 if MESSENGER_PROVIDER not in {"none", "telegram", "max"}: MESSENGER_PROVIDER = "none"
+SEED_TEST_DATA = os.getenv("ZMK_SEED_TEST_DATA", "false").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_ROLES = {**{int(x):"viewer" for x in os.getenv("TELEGRAM_VIEWER_IDS","").split(",") if x.strip().isdigit()},**{int(x):"operator" for x in os.getenv("TELEGRAM_OPERATOR_IDS","").split(",") if x.strip().isdigit()},**{int(x):"admin" for x in os.getenv("TELEGRAM_ADMIN_IDS","").split(",") if x.strip().isdigit()}}
-SYSTEM_RANDOM = secrets.SystemRandom()
-EVENT_TYPES = ["no_helmet", "no_vest", "phone_usage", "smoking", "restricted_zone", "immobility"]
-SEVERITIES = ["critical", "high", "medium", "low"]
 
 def now_iso(): return datetime.now(TZ).isoformat(timespec="seconds")
 def db():
@@ -62,14 +64,21 @@ def init_db():
     con = db()
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript("""
-    CREATE TABLE IF NOT EXISTS cameras(id TEXT PRIMARY KEY, name TEXT NOT NULL, zone TEXT NOT NULL, rtsp_url TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, fps REAL NOT NULL, latency_ms INTEGER NOT NULL, enabled INTEGER NOT NULL DEFAULT 1, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS cameras(id TEXT PRIMARY KEY, name TEXT NOT NULL, zone TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rtsp_url TEXT NOT NULL DEFAULT '', fps_limit REAL NOT NULL DEFAULT 8, status TEXT NOT NULL DEFAULT 'unknown', fps REAL NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, camera_id TEXT NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL, confidence REAL NOT NULL, person_id TEXT, external_id TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '', FOREIGN KEY(camera_id) REFERENCES cameras(id));
     CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, level TEXT NOT NULL, service TEXT NOT NULL, message TEXT NOT NULL, camera_id TEXT);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS model_registry(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, format TEXT NOT NULL, status TEXT NOT NULL, precision REAL, recall REAL, trained_at TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'baseline');
+    CREATE TABLE IF NOT EXISTS model_registry(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, format TEXT NOT NULL, status TEXT NOT NULL, precision REAL, recall REAL, trained_at TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'external', artifact_uri TEXT NOT NULL DEFAULT '', checksum TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS training_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, camera_id TEXT NOT NULL, base_model TEXT NOT NULL, target_name TEXT NOT NULL, image_count INTEGER NOT NULL, epochs INTEGER NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL, error TEXT, FOREIGN KEY(camera_id) REFERENCES cameras(id));
     CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, login TEXT UNIQUE NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
     """)
+    camera_columns={r[1] for r in con.execute("PRAGMA table_info(cameras)").fetchall()}
+    for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''"}.items():
+        if column not in camera_columns: con.execute(f"ALTER TABLE cameras ADD COLUMN {column} {ddl}")
+    con.execute("UPDATE cameras SET created_at=updated_at WHERE created_at='' OR created_at IS NULL")
+    model_columns={r[1] for r in con.execute("PRAGMA table_info(model_registry)").fetchall()}
+    for column,ddl in {"artifact_uri":"TEXT NOT NULL DEFAULT ''","checksum":"TEXT NOT NULL DEFAULT ''"}.items():
+        if column not in model_columns: con.execute(f"ALTER TABLE model_registry ADD COLUMN {column} {ddl}")
     event_columns={r[1] for r in con.execute("PRAGMA table_info(events)").fetchall()}
     if "external_id" not in event_columns: con.execute("ALTER TABLE events ADD COLUMN external_id TEXT")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_events_external_id ON events(external_id) WHERE external_id IS NOT NULL")
@@ -79,19 +88,8 @@ def init_db():
     con.execute("CREATE INDEX IF NOT EXISTS ix_logs_timestamp_level ON logs(timestamp DESC,level)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_training_status ON training_jobs(status,created_at DESC)")
     con.execute("UPDATE training_jobs SET status='failed',stage='Прервано перезапуском',error='Worker restarted before completion',updated_at=? WHERE status IN ('queued','running')",(now_iso(),))
-    if con.execute("SELECT COUNT(*) FROM cameras").fetchone()[0] == 0:
-        cams=[(f"cam_{i:02}", f"Камера {i:02}", ["Цех №1","Склад","Проходная","Зона погрузки"][i%4], os.getenv(f"RTSP_CAM_{i:02}",f"rtsp://camera-{i:02}/stream"), "online" if i not in (7,) else "offline", round(SYSTEM_RANDOM.uniform(6.8,9.8),1), SYSTEM_RANDOM.randint(110,420),1,now_iso()) for i in range(1,11)]
-        con.executemany("INSERT INTO cameras VALUES(?,?,?,?,?,?,?,?,?)",cams)
-        for i in range(48):
-            ts=(datetime.now(TZ)-timedelta(minutes=i*37)).isoformat(timespec="seconds")
-            typ=EVENT_TYPES[i%len(EVENT_TYPES)]; sev=SEVERITIES[i%len(SEVERITIES)]
-            con.execute("INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id,acknowledged,note) VALUES(?,?,?,?,?,?,?,?)",(ts,f"cam_{i%10+1:02}",typ,sev,round(.72+(i%25)/100,2),f"P-{1000+i}",1 if i%5==0 else 0,""))
-        for level,msg in [("INFO","Сервис аналитики запущен"),("WARNING","Снижение FPS на cam_07"),("INFO","Модель siz-guard-v2.1 загружена")]:
-            con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(now_iso(),level,"ai_inference",msg,"cam_07" if "07" in msg else None))
-        defaults={"helmet_conf":"0.85","vest_conf":"0.80","phone_conf":"0.78","smoking_conf":"0.80","restricted_zone_conf":"0.82","immobility_conf":"0.80","active_model":"siz-guard-v2.1"}
-        con.executemany("INSERT INTO settings VALUES(?,?)", defaults.items())
     config_defaults={
-        "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
+        "active_model":"", "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
         "retention_days":"90", "archive_quality":"90", "archive_clip_seconds":"10",
         "inference_fps":"8", "inference_device":"cuda:0", "batch_size":"4", "nms_iou":"0.45",
         "helmet_conf":"0.85", "vest_conf":"0.80", "phone_conf":"0.78", "smoking_conf":"0.80", "restricted_zone_conf":"0.82", "immobility_conf":"0.80", "min_model_precision":"90", "min_model_recall":"85",
@@ -101,19 +99,13 @@ def init_db():
         "rtsp_reconnect_seconds":"5", "event_cooldown_seconds":"30"
     }
     for key,value in config_defaults.items(): con.execute("INSERT OR IGNORE INTO settings VALUES(?,?)",(key,value))
-    if con.execute("SELECT COUNT(*) FROM users").fetchone()[0] == 0:
-        con.executemany("INSERT INTO users(name,login,role,active,created_at) VALUES(?,?,?,?,?)",[("Алексей Петров","admin","admin",1,now_iso()),("Оператор смены","operator","operator",1,now_iso()),("Наблюдатель","viewer","viewer",1,now_iso())])
-    if con.execute("SELECT COUNT(*) FROM model_registry").fetchone()[0] == 0:
-        con.executemany("INSERT INTO model_registry(name,format,status,precision,recall,trained_at,source) VALUES(?,?,?,?,?,?,?)", [
-            ("siz-guard-v2.1","TensorRT FP16","ready",92.4,87.1,now_iso(),"baseline"),
-            ("siz-guard-v2.0","ONNX FP32","ready",90.8,85.9,now_iso(),"baseline")])
     active_row=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()
     active_ok=active_row and con.execute("SELECT 1 FROM model_registry WHERE name=? AND status='ready'",(active_row[0],)).fetchone()
     if not active_ok:
         fallback=con.execute("SELECT name FROM model_registry WHERE status='ready' ORDER BY id DESC LIMIT 1").fetchone()
-        if not fallback: con.close(); raise RuntimeError("No ready model available")
-        con.execute("INSERT INTO settings(key,value) VALUES('active_model',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(fallback[0],))
-        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"Active model repaired to {fallback[0]}"))
+        value=fallback[0] if fallback else ""
+        con.execute("INSERT INTO settings(key,value) VALUES('active_model',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(value,))
+        if fallback: con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"Active model repaired to {fallback[0]}"))
     apply_retention(con)
     con.commit(); con.close()
 
@@ -125,7 +117,7 @@ async def lifespan(app: FastAPI):
         for task in list(_training_tasks.values()): task.cancel()
         if _training_tasks: await asyncio.gather(*list(_training_tasks.values()),return_exceptions=True)
 
-app=FastAPI(title="ZMK Vision API",version="1.4.0",description="On-premise API контура видеоаналитики",lifespan=lifespan)
+app=FastAPI(title="ZMK Vision API",version="2.0.0",description="On-premise API контура видеоаналитики",lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:5173").split(",") if x.strip()],allow_credentials=False,allow_methods=["GET","POST","PUT","PATCH","DELETE"],allow_headers=["Content-Type","X-API-Key","X-Telegram-Init-Data"])
 
 def custom_openapi():
@@ -196,12 +188,33 @@ async def security_middleware(request: Request, call_next):
     return response
 
 class CameraIn(BaseModel):
-    name:str=Field(min_length=2,max_length=80); zone:str=Field(min_length=2,max_length=80); rtsp_url:str=Field(default="",max_length=2048); enabled:bool=True
+    name:str=Field(min_length=2,max_length=80)
+    zone:str=Field(default="Без зоны",min_length=1,max_length=80)
+    description:str=Field(default="",max_length=500)
+    rtsp_url:str=Field(default="",max_length=2048)
+    fps_limit:float=Field(default=8,ge=.1,le=60)
+    enabled:bool=True
     @field_validator("rtsp_url")
     @classmethod
     def validate_rtsp(cls,value:str):
         if value and not value.startswith(("rtsp://","rtsps://")): raise ValueError("Требуется RTSP(S) URL")
         return value
+class CameraUpdate(BaseModel):
+    name:str=Field(min_length=2,max_length=80)
+    zone:str=Field(default="Без зоны",min_length=1,max_length=80)
+    description:str=Field(default="",max_length=500)
+    rtsp_url:str|None=Field(default=None,max_length=2048)
+    fps_limit:float=Field(default=8,ge=.1,le=60)
+    enabled:bool=True
+    @field_validator("rtsp_url")
+    @classmethod
+    def validate_rtsp(cls,value:str|None):
+        if value and not value.startswith(("rtsp://","rtsps://")): raise ValueError("Требуется RTSP(S) URL")
+        return value
+class CameraTelemetry(BaseModel):
+    status:Literal["online","offline","error","unknown"]
+    fps:float=Field(default=0,ge=0,le=240)
+    latency_ms:int=Field(default=0,ge=0,le=120000)
 class SettingIn(BaseModel): value:float=Field(ge=.1,le=1)
 class AckIn(BaseModel): note:str=Field(default="",max_length=500)
 class DetectionIn(BaseModel):
@@ -226,6 +239,14 @@ class UserIn(BaseModel):
     name:str=Field(min_length=2,max_length=80)
     login:str=Field(min_length=2,max_length=40,pattern=r"^[a-zA-Z0-9._-]+$")
     role:Literal["admin","operator","viewer"]
+class ModelIn(BaseModel):
+    name:str=Field(min_length=2,max_length=120,pattern=r"^[a-zA-Z0-9._-]+$")
+    format:Literal["ONNX","ONNX FP16","TensorRT","TensorRT FP16","PyTorch"]
+    precision:float=Field(ge=0,le=100)
+    recall:float=Field(ge=0,le=100)
+    source:str=Field(default="external",max_length=200)
+    artifact_uri:str=Field(min_length=1,max_length=1000)
+    checksum:str=Field(default="",max_length=128,pattern=r"^[a-fA-F0-9]*$")
 class TrainingIn(BaseModel):
     camera_id:str
     image_count:int=Field(default=100,ge=20,le=5000)
@@ -235,8 +256,11 @@ class TrainingIn(BaseModel):
 def rows(query,args=()):
     con=db(); result=[dict(r) for r in con.execute(query,args).fetchall()]; con.close(); return result
 
+@app.get("/api/capabilities")
+def capabilities(): return {"demo_mode":SEED_TEST_DATA,"training_worker":False,"external_inference_gateway":True,"camera_crud":True,"diagnostics":True,"search":True}
+
 @app.get("/api/health")
-def health(): return {"status":"ok","version":"1.4.0","uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
+def health(): return {"status":"ok","version":"2.0.0","uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
 
 @app.get("/api/dashboard")
 def dashboard():
@@ -250,21 +274,77 @@ def dashboard():
         end=datetime.now(TZ)-timedelta(hours=h); start=end-timedelta(hours=1)
         n=con.execute("SELECT COUNT(*) FROM events WHERE timestamp BETWEEN ? AND ?",(start.isoformat(),end.isoformat())).fetchone()[0]
         trend.append({"label":end.strftime("%H:00"),"value":n})
-    con.close(); return {"cameras":{"total":total,"online":online},"events24h":events24,"critical_unacked":critical,"avg_fps":round(avg[0],1),"avg_latency_ms":round(avg[1]),"gpu_load":68,"messenger_provider":MESSENGER_PROVIDER,"active_model":model[0] if model else None,"precision":model[1] if model else None,"recall":model[2] if model else None,"trend":trend}
+    con.close(); gpu=gpu_metrics(); return {"cameras":{"total":total,"online":online},"events24h":events24,"critical_unacked":critical,"avg_fps":round(avg[0],1),"avg_latency_ms":round(avg[1]),"gpu_load":gpu["gpu"],"gpu_temp":gpu["gpu_temp"],"messenger_provider":MESSENGER_PROVIDER,"active_model":model[0] if model else None,"precision":model[1] if model else None,"recall":model[2] if model else None,"trend":trend}
 
 @app.get("/api/cameras")
 def cameras():
-    # RTSP credentials never leave the backend through list endpoints.
-    return rows("SELECT id,name,zone,status,fps,latency_ms,enabled,updated_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras ORDER BY id")
+    return rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras ORDER BY created_at,id")
+
+@app.get("/api/cameras/{camera_id}")
+def camera_detail(camera_id:str):
+    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras WHERE id=?",(camera_id,))
+    if not data: raise HTTPException(404,"Камера не найдена")
+    return data[0]
+
 @app.post("/api/cameras",status_code=201)
 def add_camera(payload:CameraIn):
-    con=db(); num=con.execute("SELECT COUNT(*) FROM cameras").fetchone()[0]+1; cid=f"cam_{num:02}"
-    con.execute("INSERT INTO cameras VALUES(?,?,?,?,?,?,?,?,?)",(cid,payload.name,payload.zone,payload.rtsp_url,"offline",0,0,int(payload.enabled),now_iso())); con.commit(); con.close(); return {"id":cid,"name":payload.name,"zone":payload.zone,"enabled":payload.enabled,"configured":bool(payload.rtsp_url)}
+    cid=f"cam_{uuid.uuid4().hex[:12]}"; timestamp=now_iso(); con=db()
+    con.execute("INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(cid,payload.name,payload.zone,payload.description,payload.rtsp_url,payload.fps_limit,"unknown",0,0,int(payload.enabled),timestamp,timestamp)); con.commit(); con.close()
+    return {"id":cid,"name":payload.name,"zone":payload.zone,"description":payload.description,"fps_limit":payload.fps_limit,"enabled":payload.enabled,"configured":bool(payload.rtsp_url),"status":"unknown"}
+
+@app.put("/api/cameras/{camera_id}")
+def update_camera(camera_id:str,payload:CameraUpdate):
+    con=db(); current=con.execute("SELECT 1 FROM cameras WHERE id=?",(camera_id,)).fetchone()
+    if not current: con.close(); raise HTTPException(404,"Камера не найдена")
+    con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=COALESCE(?,rtsp_url),fps_limit=?,enabled=?,updated_at=? WHERE id=?",(payload.name,payload.zone,payload.description,payload.rtsp_url,payload.fps_limit,int(payload.enabled),now_iso(),camera_id)); con.commit(); con.close()
+    return {"id":camera_id,"updated":True}
+
+@app.delete("/api/cameras/{camera_id}")
+def delete_camera(camera_id:str,delete_events:bool=False):
+    con=db(); camera=con.execute("SELECT name FROM cameras WHERE id=?",(camera_id,)).fetchone()
+    if not camera: con.close(); raise HTTPException(404,"Камера не найдена")
+    event_count=con.execute("SELECT COUNT(*) FROM events WHERE camera_id=?",(camera_id,)).fetchone()[0]
+    if event_count and not delete_events: con.close(); raise HTTPException(409,f"У камеры есть события: {event_count}. Подтвердите delete_events=true")
+    con.execute("BEGIN IMMEDIATE")
+    if delete_events: con.execute("DELETE FROM events WHERE camera_id=?",(camera_id,))
+    con.execute("DELETE FROM cameras WHERE id=?",(camera_id,)); con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(now_iso(),"WARNING","camera_manager",f"Camera deleted: {camera[0]}",camera_id)); con.commit(); con.close()
+    return {"id":camera_id,"deleted":True,"deleted_events":event_count if delete_events else 0}
+
 @app.patch("/api/cameras/{camera_id}/toggle")
 def toggle_camera(camera_id:str):
     con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone()
-    if not row: raise HTTPException(404,"Камера не найдена")
+    if not row: con.close(); raise HTTPException(404,"Камера не найдена")
     enabled=0 if row[0] else 1; con.execute("UPDATE cameras SET enabled=?,updated_at=? WHERE id=?",(enabled,now_iso(),camera_id)); con.commit(); con.close(); return {"id":camera_id,"enabled":bool(enabled)}
+
+@app.post("/api/cameras/{camera_id}/telemetry")
+def camera_telemetry(camera_id:str,payload:CameraTelemetry):
+    con=db(); cur=con.execute("UPDATE cameras SET status=?,fps=?,latency_ms=?,updated_at=? WHERE id=?",(payload.status,payload.fps,payload.latency_ms,now_iso(),camera_id)); con.commit(); con.close()
+    if not cur.rowcount: raise HTTPException(404,"Камера не найдена")
+    return {"id":camera_id,**payload.model_dump()}
+
+def diagnose_camera_row(camera_id:str):
+    con=db(); row=con.execute("SELECT id,name,rtsp_url,enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
+    if not row: raise HTTPException(404,"Камера не найдена")
+    if not row[2]: return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"not_configured","latency_ms":None,"message":"RTSP URL не задан"}
+    parsed=urlparse(row[2]); host=parsed.hostname; port=parsed.port or (322 if parsed.scheme=="rtsps" else 554)
+    if not host: return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"invalid_url","latency_ms":None,"message":"Некорректный RTSP URL"}
+    started=time.perf_counter()
+    try:
+        with socket.create_connection((host,port),timeout=3): pass
+        latency=round((time.perf_counter()-started)*1000)
+        return {"camera_id":camera_id,"name":row[1],"reachable":True,"status":"reachable","latency_ms":latency,"message":"TCP-подключение установлено"}
+    except OSError as exc:
+        return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"unreachable","latency_ms":None,"message":str(exc)[:200]}
+
+@app.post("/api/cameras/{camera_id}/diagnostics")
+def diagnose_camera(camera_id:str):
+    return diagnose_camera_row(camera_id)
+
+@app.get("/api/diagnostics")
+def diagnostics():
+    camera_ids=[r["id"] for r in rows("SELECT id FROM cameras ORDER BY id")]
+    with ThreadPoolExecutor(max_workers=min(10,max(1,len(camera_ids)))) as pool: camera_results=list(pool.map(diagnose_camera_row,camera_ids))
+    return {"generated_at":now_iso(),"system":system_health_data(),"cameras":camera_results}
 
 @app.get("/api/events")
 def events(limit:int=Query(50,ge=1,le=500),severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None):
@@ -277,12 +357,6 @@ def ack(event_id:int,payload:AckIn):
     con=db(); cur=con.execute("UPDATE events SET acknowledged=1,note=? WHERE id=?",(payload.note,event_id)); con.commit(); con.close()
     if not cur.rowcount: raise HTTPException(404,"Событие не найдено")
     return {"id":event_id,"acknowledged":True}
-@app.post("/api/events/simulate",status_code=201)
-def simulate_event():
-    typ=secrets.choice(EVENT_TYPES); sev=secrets.choice(SEVERITIES[:3]); cam=f"cam_{SYSTEM_RANDOM.randint(1,10):02}"; conf=round(SYSTEM_RANDOM.uniform(.78,.98),2)
-    con=db(); cur=con.execute("INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id) VALUES(?,?,?,?,?,?)",(now_iso(),cam,typ,sev,conf,f"P-{SYSTEM_RANDOM.randint(1100,9999)}")); con.commit(); eid=cur.lastrowid; con.close()
-    return {"id":eid,"timestamp":now_iso(),"camera_id":cam,"type":typ,"severity":sev,"confidence":conf}
-
 @app.post("/api/inference/detections")
 def ingest_detections(payload:DetectionBatch):
     """Validated contract from inference workers to the event subsystem."""
@@ -382,9 +456,16 @@ def update_setting(key:Literal["helmet_conf","vest_conf","phone_conf","smoking_c
 @app.get("/api/models")
 def models():
     active=rows("SELECT value FROM settings WHERE key='active_model'")[0]["value"]
-    data=rows("SELECT name,format,status,precision,recall,trained_at,source FROM model_registry ORDER BY id DESC")
+    data=rows("SELECT name,format,status,precision,recall,trained_at,source,artifact_uri,checksum FROM model_registry ORDER BY id DESC")
     for item in data: item["active"]=item["name"]==active
     return data
+
+@app.post("/api/models",status_code=201)
+def register_model(payload:ModelIn):
+    con=db()
+    try: con.execute("INSERT INTO model_registry(name,format,status,precision,recall,trained_at,source,artifact_uri,checksum) VALUES(?,?,?,?,?,?,?,?,?)",(payload.name,payload.format,"ready",payload.precision,payload.recall,now_iso(),payload.source,payload.artifact_uri,payload.checksum)); con.commit()
+    except sqlite3.IntegrityError: con.close(); raise HTTPException(409,"Модель с таким именем уже существует")
+    con.close(); return {"name":payload.name,"status":"ready","registered":True}
 @app.get("/api/models/active/health")
 def active_model_health():
     con=db(); active=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone(); model=con.execute("SELECT name,format,status,precision,recall,trained_at,source FROM model_registry WHERE name=?",(active[0],)).fetchone() if active else None
@@ -409,22 +490,11 @@ def activate(name:str):
     con.commit(); con.close(); return {"active_model":name,"previous_model":old,"hot_swap":True,"idempotent":False,"control_plane_switch_ms":round((time.perf_counter()-started)*1000,2),"downtime_ms":0}
 
 async def run_training(job_id:int):
-    try:
-        stages=[(8,"Захват кадров с RTSP"),(22,"Контроль качества изображений"),(38,"Псевдоразметка базовой моделью"),(55,"Подготовка train/val выборки"),(72,"Дообучение YOLO"),(88,"Валидация метрик"),(96,"Экспорт ONNX"),(100,"Модель готова")]
-        for progress,stage in stages:
-            await asyncio.sleep(.7)
-            con=db(); con.execute("UPDATE training_jobs SET status=?,progress=?,stage=?,updated_at=? WHERE id=?",("running" if progress<100 else "completed",progress,stage,now_iso(),job_id)); con.commit(); con.close()
-        con=db(); job=con.execute("SELECT target_name,camera_id FROM training_jobs WHERE id=?",(job_id,)).fetchone()
-        if not job: con.close(); return
-        con.execute("INSERT INTO model_registry(name,format,status,precision,recall,trained_at,source) VALUES(?,?,?,?,?,?,?)",(job[0],"ONNX FP16","ready",round(SYSTEM_RANDOM.uniform(91.5,94.2),1),round(SYSTEM_RANDOM.uniform(86.0,89.4),1),now_iso(),f"camera:{job[1]}"))
-        con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(now_iso(),"INFO","training",f"Training completed: {job[0]}",job[1])); con.commit(); con.close()
-    except asyncio.CancelledError:
-        con=db(); con.execute("UPDATE training_jobs SET status='cancelled',stage='Отменено',updated_at=? WHERE id=? AND status IN ('queued','running')",(now_iso(),job_id)); con.commit(); con.close(); raise
-    except Exception as exc:  # noqa: BLE001 - persist every worker failure
-        con=db(); con.execute("UPDATE training_jobs SET status='failed',stage='Ошибка',error=?,updated_at=? WHERE id=?",(str(exc)[:500],now_iso(),job_id)); con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"ERROR","training",f"Job {job_id} failed: {str(exc)[:300]}")); con.commit(); con.close()
+    con=db(); con.execute("UPDATE training_jobs SET status='failed',stage='Worker не подключён',error='External GPU training worker is not configured',updated_at=? WHERE id=?",(now_iso(),job_id)); con.commit(); con.close()
 
 @app.post("/api/training/jobs",status_code=202)
 async def start_training(payload:TrainingIn):
+    if not SEED_TEST_DATA: raise HTTPException(503,"Сервис обучения не подключён. Настройте внешний GPU training worker")
     con=db(); cam=con.execute("SELECT status FROM cameras WHERE id=?",(payload.camera_id,)).fetchone()
     if not cam: con.close(); raise HTTPException(404,"Камера не найдена")
     if cam[0] != "online": con.close(); raise HTTPException(409,"Камера офлайн: кадры недоступны")
@@ -470,14 +540,33 @@ def error_report_csv(hours:int=Query(24,ge=1,le=720)):
     since=(datetime.now(TZ)-timedelta(hours=hours)).isoformat(); data=sanitize_csv_rows(rows("SELECT timestamp,level,service,camera_id,message FROM logs WHERE level IN ('WARNING','ERROR','CRITICAL') AND timestamp>=? ORDER BY id DESC",(since,)))
     out=io.StringIO(); fields=['timestamp','level','service','camera_id','message']; w=csv.DictWriter(out,fieldnames=fields); w.writeheader(); w.writerows(data)
     return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=zmk-error-report.csv"})
-@app.post("/api/admin/logs/simulate-error",status_code=201)
-def simulate_error():
-    samples=[("ERROR","ai_inference","CUDA out of memory during batch inference"),("CRITICAL","ingestion","RTSP stream unavailable for 30 seconds"),("WARNING","archive","MinIO write latency exceeded 2 seconds")]
-    level,service,message=secrets.choice(samples); cam=f"cam_{SYSTEM_RANDOM.randint(1,10):02}"
-    con=db(); cur=con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(now_iso(),level,service,message,cam)); con.commit(); lid=cur.lastrowid; con.close(); return {"id":lid,"level":level,"service":service,"message":message,"camera_id":cam,"timestamp":now_iso()}
+@app.get("/api/search")
+def global_search(q:str=Query(min_length=2,max_length=100),limit:int=Query(20,ge=1,le=50)):
+    term=f"%{q.strip()}%"; con=db(); results=[]
+    for row in con.execute("SELECT id,name,zone,description,status FROM cameras WHERE name LIKE ? OR zone LIKE ? OR description LIKE ? LIMIT ?",(term,term,term,limit)).fetchall(): results.append({"kind":"camera","id":row[0],"title":row[1],"subtitle":f"{row[2]} · {row[4]}"})
+    remaining=max(0,limit-len(results))
+    if remaining:
+        for row in con.execute("SELECT id,type,camera_id,severity,timestamp FROM events WHERE type LIKE ? OR person_id LIKE ? OR note LIKE ? ORDER BY timestamp DESC LIMIT ?",(term,term,term,remaining)).fetchall(): results.append({"kind":"event","id":row[0],"title":row[1],"subtitle":f"{row[2]} · {row[3]} · {row[4]}"})
+    remaining=max(0,limit-len(results))
+    if remaining:
+        for row in con.execute("SELECT name,format,status,source FROM model_registry WHERE name LIKE ? OR source LIKE ? LIMIT ?",(term,term,remaining)).fetchall(): results.append({"kind":"model","id":row[0],"title":row[0],"subtitle":f"{row[1]} · {row[2]}"})
+    con.close(); return {"query":q,"results":results}
+
+def gpu_metrics():
+    try:
+        pynvml.nvmlInit(); handle=pynvml.nvmlDeviceGetHandleByIndex(0); util=pynvml.nvmlDeviceGetUtilizationRates(handle); memory=pynvml.nvmlDeviceGetMemoryInfo(handle); temperature=pynvml.nvmlDeviceGetTemperature(handle,pynvml.NVML_TEMPERATURE_GPU)
+        return {"gpu":round(float(util.gpu),1),"vram":round(memory.used/memory.total*100,1) if memory.total else 0,"gpu_temp":round(float(temperature),1),"available":True}
+    except pynvml.NVMLError: return {"gpu":None,"vram":None,"gpu_temp":None,"available":False}
+    finally:
+        try: pynvml.nvmlShutdown()
+        except pynvml.NVMLError: pass
+
+def system_health_data():
+    gpu=gpu_metrics(); con=db(); con.execute("SELECT 1").fetchone(); camera_count=con.execute("SELECT COUNT(*) FROM cameras WHERE enabled=1").fetchone()[0]; model=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone(); con.close()
+    return {"cpu":round(psutil.cpu_percent(interval=.05),1),"ram":round(psutil.virtual_memory().percent,1),"disk":round(psutil.disk_usage(str(DB_PATH.parent)).percent,1),**gpu,"messenger_provider":MESSENGER_PROVIDER,"services":[{"name":"api","status":"healthy"},{"name":"database","status":"healthy"},{"name":"ingestion","status":"configured" if camera_count else "not_configured"},{"name":"inference","status":"configured" if model and model[0] else "not_configured"}]}
 
 @app.get("/api/system-health")
-def system_health(): return {"cpu":41,"ram":57,"gpu":68,"vram":72,"disk":38,"messenger_provider":MESSENGER_PROVIDER,"services":[{"name":n,"status":"healthy"} for n in ["ingestion","inference","events","archive","api"]]}
+def system_health(): return system_health_data()
 def csv_safe(value:Any):
     """Prevent spreadsheet formula injection in exported operator-controlled fields."""
     if isinstance(value,str) and value.startswith(("=","+","-","@","\t","\r")): return "'"+value
@@ -494,5 +583,5 @@ def report_csv():
 async def stream():
     async def generate():
         while True:
-            yield f"data: {json.dumps({'time':now_iso(),'gpu':SYSTEM_RANDOM.randint(63,73)},ensure_ascii=False)}\n\n"; await asyncio.sleep(3)
+            yield f"data: {json.dumps({'time':now_iso(),**gpu_metrics()},ensure_ascii=False)}\n\n"; await asyncio.sleep(3)
     return StreamingResponse(generate(),media_type="text/event-stream",headers={"X-Accel-Buffering":"no","Cache-Control":"no-cache"})

@@ -1,46 +1,36 @@
-# ZMK Vision v1.4.0 — Telegram or MAX Messenger
+# ZMK Vision v2.0.0 — Production Data & Camera Management
 
-## Главное
-При установке теперь можно выбрать один вариант:
+## Убраны витринные данные
+- Чистая установка стартует без камер, событий, пользователей и моделей.
+- Удалены фиктивные GPU/CPU/RAM/Disk, FPS, latency и модельные метрики.
+- Ресурсы сервера измеряются через psutil и NVIDIA NVML; при отсутствии GPU показывается `—`.
+- Генераторы тестовых событий и ошибок недоступны в production.
+- Симуляция обучения отключена: UI честно сообщает, что требуется внешний GPU training worker.
+- Dashboard отображает только фактически зарегистрированную модель и полученную телеметрию.
 
-1. Telegram-бот;
-2. бот в российском мессенджере MAX;
-3. запуск без бота.
+## Полное управление камерами
+- Создание, просмотр, редактирование и удаление камер.
+- Название, зона, описание, RTSP URL, enabled и индивидуальный FPS limit.
+- RTSP secret не возвращается в браузер после сохранения.
+- Удаление камеры с событиями требует явного `delete_events=true`.
+- Endpoint телеметрии ingestion worker: status, фактический FPS и latency.
+- TCP-диагностика одной камеры и параллельная диагностика всех камер.
 
-Установщики Windows и Linux останавливают прежний bot-сервис и запускают только выбранный профиль. Выбор сохраняется в `MESSENGER_PROVIDER`.
+## Реальные функции интерфейса
+- Рабочий глобальный поиск по камерам, событиям и моделям.
+- Рабочая кнопка диагностики и отдельный раздел диагностики.
+- Рабочие кнопки добавления, редактирования, проверки и удаления камер.
+- Регистрация внешнего ONNX/TensorRT/PyTorch артефакта с метриками, URI и checksum.
+- Пустые состояния вместо вымышленных показателей.
+- Исправлены светлые элементы в тёмной теме: модальные окна, формы, таблицы, статусы, селекты, уведомления и карточки.
 
-## MAX-бот
-Добавлен отдельный сервис `services/max_bot` на `maxapi 1.2.1`:
+## Интеграция
+- Inference gateway остаётся канонической точкой приёма детекций.
+- Camera telemetry API предназначен для реального RTSP/GStreamer worker.
+- Capability API сообщает, какие внешние workers подключены.
+- Telegram или MAX по-прежнему выбираются при установке.
 
-- whitelist и роли `admin`, `operator`, `viewer`;
-- `/status`, `/cameras`, `/events`, `/health`;
-- `/logs`, `/report`, `/models`, `/thresholds`;
-- `/switch_model`, `/set_threshold`;
-- `/train`, `/cancel_training`, `/alert_test`;
-- CSV-отчёты;
-- автоматические критические уведомления;
-- API key и retry временных сетевых ошибок.
-
-Бот создаётся через `@MasterBot` в MAX. Для production официальный MAX API рекомендует HTTPS webhook; текущий сервис использует polling и удаляет старую webhook-подписку перед запуском.
-
-## Docker и установка
-
-- Добавлен Compose profile `max`.
-- Добавлены `MAX_BOT_TOKEN`, `MAX_ADMIN_IDS`, `MAX_OPERATOR_IDS`, `MAX_VIEWER_IDS`.
-- CI, release pipeline, pip-audit, Ruff, Bandit и Docker build проверяют оба messenger-сервиса.
-- Удаление проекта учитывает Telegram и MAX profiles.
-- README и подробный beginner guide обновлены для обоих вариантов.
-
-## Запуск вручную
-
-Telegram:
-
-```bash
-docker compose --profile telegram up -d --build
-```
-
-MAX:
-
-```bash
-docker compose --profile max up -d --build
-```
+## Проверки
+- Отдельные production-тесты подтверждают пустой старт без fake data.
+- Camera CRUD, telemetry, diagnostics, search, guarded delete и model registration покрыты тестами.
+- CI собирает API, Web, Telegram и MAX Docker images и выполняет security/dependency audits.

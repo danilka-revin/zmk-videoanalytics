@@ -80,9 +80,9 @@ def dashboard_text(data: dict[str, Any]) -> str:
         f"Критические: {data['critical_unacked']}\n"
         f"FPS: {data['avg_fps']}\n"
         f"Задержка: {data['avg_latency_ms']} мс\n"
-        f"GPU: {data['gpu_load']}%\n"
-        f"Модель: {data['active_model']}\n"
-        f"Precision / Recall: {data['precision']}% / {data['recall']}%"
+        f"GPU: {str(data['gpu_load'])+'%' if data['gpu_load'] is not None else '—'}\n"
+        f"Модель: {data['active_model'] or '—'}\n"
+        f"Precision / Recall: {str(data['precision'])+'%' if data['precision'] is not None else '—'} / {str(data['recall'])+'%' if data['recall'] is not None else '—'}"
     )
 
 
@@ -238,8 +238,7 @@ async def cancel_training(event: MessageCreated):
 async def alert_test(event: MessageCreated):
     if not await guard(event, "admin"):
         return
-    result = await api("POST", "/api/admin/logs/simulate-error")
-    await event.message.answer(f"🚨 {result['level']} {result['service']}\n{result['message']}")
+    await event.message.answer("✅ Канал оповещений работает. Событие или ошибка в системе не создавались.")
 
 
 async def alert_worker():
