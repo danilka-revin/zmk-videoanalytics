@@ -11,9 +11,13 @@ import sys
 import types
 from pathlib import Path
 
-import cv2
-import numpy as np
 import pytest
+
+# opencv is a heavy runtime dependency that is only guaranteed inside the
+# training_worker container image; skip these tests when it is unavailable
+# (e.g. the bare CI python env).
+cv2 = pytest.importorskip("cv2")
+import numpy as np
 
 WORKER = Path(__file__).resolve().parents[1] / "services" / "training_worker"
 
