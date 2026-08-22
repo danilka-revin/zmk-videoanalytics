@@ -33,7 +33,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-APP_VERSION = "2.5.0"
+APP_VERSION = "2.6.0"
 TZ = timezone(timedelta(hours=7))
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
@@ -368,8 +368,21 @@ def internal_active_model():
     data=rows("SELECT m.name,m.format,m.artifact_uri,m.checksum FROM model_registry m JOIN settings s ON s.key='active_model' AND s.value=m.name WHERE m.status='ready'")
     return data[0] if data else None
 
+import re as _re
+
+
+def _valid_camera_id(camera_id:str) -> bool:
+    """Camera ids are server-generated as cam_<hex>; reject anything that could
+    traverse the filesystem or smuggle unsafe characters."""
+    return bool(_re.fullmatch(r"[A-Za-z0-9_-]{1,64}", camera_id or ""))
 def snapshot_path_for(camera_id:str) -> Path:
-    return (SNAPSHOT_DIR or (DB_PATH.parent/"snapshots"))/f"{camera_id}.jpg"
+    base=(SNAPSHOT_DIR or (DB_PATH.parent/"snapshots"))
+    if not _valid_camera_id(camera_id):
+        raise HTTPException(400,"Некорректный идентификатор камеры")
+    target=(base/f"{camera_id}.jpg").resolve()
+    if base.resolve() != target.parent:
+        raise HTTPException(400,"Недопустимый путь снимка")
+    return target
 
 def snapshot_age_seconds(camera_id:str) -> int|None:
     """Seconds since the last stored frame, or None if no frame yet."""
@@ -413,7 +426,7 @@ def delete_camera(camera_id:str,delete_events:bool=False):
     con.execute("BEGIN IMMEDIATE")
     if delete_events: con.execute("DELETE FROM events WHERE camera_id=?",(camera_id,))
     con.execute("DELETE FROM cameras WHERE id=?",(camera_id,)); con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(now_iso(),"WARNING","camera_manager",f"Camera deleted: {camera[0]}",camera_id)); con.commit(); con.close()
-    snapshot=(SNAPSHOT_DIR or (DB_PATH.parent/"snapshots"))/f"{camera_id}.jpg"; snapshot.unlink(missing_ok=True)
+    snapshot=snapshot_path_for(camera_id); snapshot.unlink(missing_ok=True)
     return {"id":camera_id,"deleted":True,"deleted_events":event_count if delete_events else 0}
 
 @app.patch("/api/cameras/{camera_id}/toggle")
@@ -435,11 +448,11 @@ def upload_camera_snapshot(camera_id:str,payload:CameraSnapshotIn):
     try: image=base64.b64decode(payload.jpeg_base64,validate=True)
     except (binascii.Error,ValueError): raise HTTPException(422,"Некорректный base64 JPEG")
     if len(image)>1_300_000 or not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"): raise HTTPException(422,"Некорректный или слишком большой JPEG")
-    directory=SNAPSHOT_DIR or (DB_PATH.parent/"snapshots"); directory.mkdir(parents=True,exist_ok=True); target=directory/f"{camera_id}.jpg"; temp=directory/f".{camera_id}.tmp"; temp.write_bytes(image); temp.replace(target)
+    target=snapshot_path_for(camera_id); target.parent.mkdir(parents=True,exist_ok=True); temp=target.with_name(f".{target.stem}.tmp"); temp.write_bytes(image); temp.replace(target)
 
 @app.get("/api/cameras/{camera_id}/snapshot")
 def camera_snapshot(camera_id:str):
-    target=(SNAPSHOT_DIR or (DB_PATH.parent/"snapshots"))/f"{camera_id}.jpg"
+    target=snapshot_path_for(camera_id)
     if not target.exists(): raise HTTPException(404,"Кадр ещё не получен")
     return FileResponse(target,media_type="image/jpeg",headers={"Cache-Control":"no-store"})
 
@@ -650,6 +663,23 @@ def list_datasets():
     for item in data:
         item["path"]=str(DATASET_DIR/item["name"]); item["exists"]=Path(item["path"]).is_dir()
     return data
+
+def _safe_extract_zip(zf,dest):
+    """Extract members individually, enforcing the resolutions already checked
+    (no absolute/../ paths, no links/devices) and a total decompressed cap."""
+    total=0
+    for member in zf.infolist():
+        if member.is_dir(): dest.mkdir(parents=True,exist_ok=True); continue
+        target=dest.joinpath(*[p for p in Path(member.filename).parts if p not in ("",".")])
+        target.parent.mkdir(parents=True,exist_ok=True)
+        with zf.open(member) as src, open(target,"wb") as out:
+            while True:
+                chunk=src.read(1024*1024)
+                if not chunk: break
+                total+=len(chunk)
+                if total>2_000_000_000: raise HTTPException(413,"Архив распаковывается слишком большим (лимит 2 ГБ)")
+                out.write(chunk)
+
 @app.post("/api/datasets",status_code=201)
 def upload_dataset(name:str=Query(min_length=2,max_length=120),payload:bytes=Body(...)):
     safe=_slugify(name)
@@ -661,12 +691,20 @@ def upload_dataset(name:str=Query(min_length=2,max_length=120),payload:bytes=Bod
     try:
         try:
             with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                if len(zf.infolist())>15000: raise HTTPException(413,"Слишком много файлов в архиве (лимит 15000)")
+                total_uncompressed=0
                 for member in zf.infolist():
                     if member.is_dir(): continue
                     member_path=Path(member.filename)
                     if member_path.is_absolute() or ".." in member_path.parts or member_path.suffix.lower() in {".sh",".exe",".bat",".cmd",".ps1"}:
                         raise HTTPException(422,f"Недопустимый файл в архиве: {member.filename}")
-                zf.extractall(workdir)
+                    # Reject dangerous link/device entries (zip-bomb / symlink tampering).
+                    if (member.external_attr >> 16) & 0o170000 in (0o120000,0o060000,0o020000):
+                        raise HTTPException(422,f"Ссылки/устройства недопустимы: {member.filename}")
+                    if member.file_size>1_000_000_000: raise HTTPException(413,f"Файл слишком велик: {member.filename}")
+                    total_uncompressed+=member.file_size
+                    if total_uncompressed>2_000_000_000: raise HTTPException(413,"Архив распаковывается слишком большим (лимит 2 ГБ)")
+                _safe_extract_zip(zf,workdir)
         except zipfile.BadZipFile as exc: raise HTTPException(422,"Повреждённый zip-архив") from exc
         try: inspected=_inspect_dataset(workdir)
         except ValueError as exc: raise HTTPException(422,str(exc)) from exc
