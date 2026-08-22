@@ -33,7 +33,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.8.0"
 TZ = timezone(timedelta(hours=7))
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
@@ -754,6 +754,39 @@ def delete_dataset(dataset_id:int):
     con=db(); con.execute("DELETE FROM datasets WHERE id=?",(dataset_id,)); con.commit(); con.close()
     shutil.rmtree(DATASET_DIR/name,ignore_errors=True)
     return {"id":dataset_id,"deleted":True,"name":name}
+
+class DatasetPreviewIn(BaseModel):
+    confidence:float|None=Field(default=None,ge=.05,le=.95)
+    limit:int=Field(default=5,ge=1,le=12)
+
+@app.post("/api/datasets/{dataset_name}/preview")
+def preview_dataset(dataset_name:str,payload:DatasetPreviewIn|None=None):
+    row=rows("SELECT name,path,kind FROM datasets WHERE name=?",(dataset_name,))
+    if not row: raise HTTPException(404,"Датасет не найден")
+    ds=row[0]
+    if not Path(ds["path"]).is_dir(): raise HTTPException(503,"Файлы датасета не найдены на диске")
+    if not TRAINING_WORKER_URL:
+        raise HTTPException(503,"Сервис обучения не подключён. Запустите Compose profile training")
+    active=con_value("active_model","")
+    artifact=None
+    if active:
+        m=rows("SELECT artifact_uri FROM model_registry WHERE name=? AND status='ready'",(active,))
+        artifact=m[0]["artifact_uri"] if m else None
+    conf=payload.confidence if payload and payload.confidence is not None else None
+    limit=payload.limit if payload else 5
+    body={"dataset_path":ds["path"],"base_artifact":artifact,"confidence":conf,"limit":limit,"kind":ds.get("kind") or "yolo"}
+    try:
+        response=httpx.post(f"{TRAINING_WORKER_URL}/preview",json=body,timeout=120)
+        if response.status_code==400:
+            raise HTTPException(422,response.json().get("detail","preview failed"))
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPError as exc:
+        raise HTTPException(503,f"Worker недоступен: {type(exc).__name__}") from exc
+
+def con_value(key:str,default:str) -> str:
+    row=rows("SELECT value FROM settings WHERE key=?",(key,))
+    return row[0]["value"] if row else default
 
 async def run_training(job_id:int):
     con=db(); con.execute("UPDATE training_jobs SET status='failed',stage='Worker не подключён',error='External GPU training worker is not configured',updated_at=? WHERE id=?",(now_iso(),job_id)); con.commit(); con.close()

@@ -94,6 +94,27 @@ def test_extract_frames_from_real_video(tmp_path):
     assert all(p.exists() for p in frames)
 
 
+def test_preview_dataset_returns_annotated_frames(tmp_path):
+    import main as worker
+
+    photos = tmp_path / "photos"
+    photos.mkdir()
+    for i in range(3):
+        img = np.zeros((120, 160, 3), dtype=np.uint8)
+        cv2.imwrite(str(photos / f"p{i}.jpg"), img)
+
+    req = worker.PreviewRequest(dataset_path=str(photos), base_artifact=None,
+                                confidence=0.35, limit=3, kind="images")
+    out = worker.preview_dataset(req)
+    assert out["count"] >= 1
+    assert "image" in out["items"][0]
+    assert out["items"][0]["source"].endswith(".jpg")
+    # the returned payload decodes back to a real JPEG
+    import base64
+    data = base64.b64decode(out["items"][0]["image"])
+    assert data[:2] == b"\xff\xd8" and data[-2:] == b"\xff\xd9"
+
+
 def test_finalize_dataset_writes_data_yaml_and_splits(tmp_path):
     import main as worker
 

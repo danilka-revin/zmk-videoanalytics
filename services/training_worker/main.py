@@ -160,6 +160,59 @@ def train(job:Job, updates=None):
   if kind=='videos': return train_videos(job,work,updates)
   return train_finished_yolo(job,work,updates)
  return train_camera(job,work,updates)
+
+class PreviewRequest(BaseModel):
+ dataset_path:str; base_artifact:str|None=None; confidence:float=Field(default=.35,ge=.05,le=.95); limit:int=Field(default=5,ge=1,le=12); kind:str='images'
+
+def _to_list(value):
+ try: value=value.cpu()
+ except AttributeError: pass
+ return value.tolist()
+
+def _annotate_frame(result,image):
+ for box,cls,score in zip(_to_list(result.boxes.xyxy),_to_list(result.boxes.cls),_to_list(result.boxes.conf)):
+  x1,y1,x2,y2=map(int,box); label=f"{int(cls)} {score:.2f}"
+  cv2.rectangle(image,(x1,y1),(x2,y2),(255,255,0),2)
+  cv2.putText(image,label,(min(x1,max(image.shape[1]-140,0)),max(y1-5,14)),cv2.FONT_HERSHEY_SIMPLEX,.45,(255,255,0),1,cv2.LINE_AA)
+ return image
+
+def preview_dataset(req:PreviewRequest):
+ import base64 as _b64
+ dpath=Path(req.dataset_path)
+ if not dpath.is_dir(): raise RuntimeError(f'Dataset directory not found: {req.dataset_path}')
+ model_src=req.base_artifact.removeprefix('file://') if req.base_artifact else BASE_MODEL
+ pseudo_model=YOLO(model_src)
+ frames=[]
+ if req.kind=='videos':
+  videos=_gather_videos(dpath)
+  if not videos: raise RuntimeError('No video files found')
+  for video in videos:
+   cap=cv2.VideoCapture(str(video)); i=0; step=30; got=0
+   while got<req.limit and i<400:
+    ok,img=cap.read()
+    if not ok: break
+    if i%step==0: frames.append((video.name,img)); got+=1
+    i+=1
+   cap.release()
+   if len(frames)>=req.limit: break
+ else:
+  for p in _gather_images(dpath)[:req.limit]:
+   img=cv2.imread(str(p))
+   if img is not None: frames.append((p.name,img))
+ results=[]
+ for source,img in frames:
+  if img is None: continue
+  try: result=pseudo_model.predict(img,verbose=False,conf=req.confidence)[0]
+  except (RuntimeError,ValueError,OSError,TypeError): continue
+  annotated=_annotate_frame(result,img.copy())
+  ok,buf=cv2.imencode('.jpg',annotated)
+  if not ok: continue
+  n_obj=len(_to_list(result.boxes.xyxy))
+  results.append({'source':source,'label':f'{n_obj} объектов','image':_b64.b64encode(buf).decode()})
+  if len(results)>=req.limit: break
+ if not results: raise RuntimeError('Псевдоразметка не нашла объектов для предпросмотра')
+ return {'count':len(results),'items':results}
+
 def train_entry(payload, updates):
  try:
   artifact,precision,recall=train(Job(**payload),updates); updates.put(('success',str(artifact),precision,recall))
@@ -193,6 +246,10 @@ async def execute(job:Job):
   process.join(timeout=5); running.discard(job.id); tasks.pop(job.id,None); updates.close()
 @app.get('/health')
 def health(): return {'status':'ok','gpu':torch.cuda.is_available(),'device':str(DEVICE),'running_jobs':list(running)}
+@app.post('/preview')
+def preview(req:PreviewRequest):
+ try: return preview_dataset(req)
+ except RuntimeError as exc: raise HTTPException(400,str(exc)) from exc
 @app.post('/jobs',status_code=202)
 async def jobs(job:Job):
  if running: raise HTTPException(409,'Training worker is busy')

@@ -40,3 +40,12 @@ html[data-theme=dark] .trainer-head select,html[data-theme=dark] .error-report s
 .train-ctrl select,.ds-upload .hint{font-size:9px}
 .ds-upload{display:flex;align-items:center;gap:12px;padding:8px 20px;border-top:1px solid var(--line)}
 .ds-upload .hint{color:var(--muted)}
+
+.preview-btn{display:flex;align-items:center;gap:6px;cursor:pointer;border:1px solid var(--line);background:var(--surface-2);color:var(--text);border-radius:7px;padding:9px 12px;font-size:10px;white-space:nowrap}
+.preview-btn:disabled{opacity:.5;cursor:default}
+.preview-sub{font-size:10px;color:var(--muted);margin:4px 0 14px}
+.preview-modal{width:min(760px,100%)}
+.preview-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px;max-height:60vh;overflow:auto}
+.preview-grid figure{margin:0;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--surface-2)}
+.preview-grid img{width:100%;height:auto;display:block}
+.preview-grid figcaption{font-size:8px;color:var(--muted);padding:7px 9px;border-top:1px solid var(--line)}

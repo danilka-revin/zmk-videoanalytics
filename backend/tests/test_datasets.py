@@ -109,6 +109,36 @@ def test_upload_videos_auto_detects_videos_kind(dataset_dir):
         assert body["class_count"] == 0
 
 
+def test_preview_proxies_to_worker_and_returns_items(dataset_dir, monkeypatch):
+
+    with TestClient(main.app) as c:
+        c.post("/api/datasets?name=Px", content=make_photos_zip(),
+               headers={"Content-Type": "application/zip"})
+        monkeypatch.setattr(main, "TRAINING_WORKER_URL", "http://test-worker:8010")
+
+        class _Resp:
+            status_code = 200
+            def json(self): return {"count": 2, "items": [{"source": "p0.jpg", "label": "1 объектов", "image": "AAAA"}]}
+            def raise_for_status(self): return None
+        monkeypatch.setattr(main.httpx, "post", lambda *a, **k: _Resp())
+        r = c.post("/api/datasets/Px/preview", json={"limit": 3})
+        assert r.status_code == 200, r.text
+        body = r.json()
+        assert body["count"] == 2
+        assert body["items"][0]["source"] == "p0.jpg"
+
+
+def test_preview_requires_worker_and_degrades_honestly(dataset_dir):
+    with TestClient(main.app) as c:
+        c.post("/api/datasets?name=PreviewDS", content=make_photos_zip(),
+               headers={"Content-Type": "application/zip"})
+        # Without a configured training worker the preview must report an
+        # honest 503, not fake a result.
+        r = c.post("/api/datasets/PreviewDS/preview", json={"limit": 3})
+        assert r.status_code == 503, r.text
+        assert "worker" in r.json()["detail"].lower() or "training" in r.json()["detail"].lower()
+
+
 def test_images_kind_job_routes_to_dataset_source(dataset_dir):
     with TestClient(main.app) as c:
         c.post("/api/datasets?name=PhotoDS", content=make_photos_zip(),
