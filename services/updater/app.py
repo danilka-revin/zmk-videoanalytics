@@ -29,7 +29,7 @@ TOKEN = os.getenv("ZMK_UPDATE_TOKEN", "").strip()
 API_URL = os.getenv("ZMK_UPDATE_API", "") or None
 DL_BASE = os.getenv("ZMK_UPDATE_DL_BASE", "") or None
 
-app = FastAPI(title="ZMK Vision Updater", version="2.11.0")
+app = FastAPI(title="ZMK Vision Updater", version="2.11.1")
 
 
 def _require_token(x_update_token: str | None) -> None:

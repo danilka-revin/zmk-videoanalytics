@@ -13,3 +13,11 @@ def test_ack_existing_event():
     with TestClient(app) as c:
         event=c.get('/api/events?limit=1').json()[0]
         assert c.post(f"/api/events/{event['id']}/ack",json={'note':'Проверено'}).status_code == 200
+
+
+def test_capabilities_expose_inference_worker_flag():
+    with TestClient(app) as c:
+        cap=c.get('/api/capabilities').json()
+        assert 'inference_worker' in cap
+        assert isinstance(cap['inference_worker'], bool)
+        assert 'fresh_snapshots' in cap

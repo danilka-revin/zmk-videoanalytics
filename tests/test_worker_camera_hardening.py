@@ -106,6 +106,23 @@ def test_offline_reported_only_after_threshold(worker_mod):
 
 def test_worker_sets_tcp_transport_and_threshold(worker_mod):
     worker = worker_mod
-    assert worker.RTSP_TRANSPORT == "tcp"
+    assert worker.RTSP_TRANSPORT in ("auto", "tcp", "udp")
+    assert worker.TRANSPORT_ORDER  # either ["tcp","udp"] (auto) or a single mode
+    # Per-open options include the transport of the current attempt.
+    r = worker.Runtime()
+    r._open_capture("rtsp://x/stream", "tcp")
     assert "rtsp_transport;tcp" in str(worker.os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", ""))
     assert worker.OFFLINE_AFTER >= 1
+
+
+def test_transport_fallback_order(worker_mod):
+    # auto -> alternates tcp/udp; fixed stays fixed
+    worker_mod.RTSP_TRANSPORT = "auto"
+    worker_mod.TRANSPORT_ORDER = ["tcp", "udp"]
+    r = worker_mod.Runtime()
+    assert r._next_transport("cam_x") == "udp"      # from default tcp -> udp
+    assert r._next_transport("cam_x") == "tcp"      # back to tcp
+    # fixed
+    worker_mod.RTSP_TRANSPORT = "tcp"
+    worker_mod.TRANSPORT_ORDER = ["tcp"]
+    assert r._next_transport("cam_y") == "tcp"

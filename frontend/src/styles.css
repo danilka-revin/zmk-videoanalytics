@@ -72,3 +72,9 @@ html[data-theme=dark] .trainer-head select,html[data-theme=dark] .error-report s
 
 .setting-hint{display:block;font-size:7.5px;color:var(--muted);margin-top:3px;line-height:1.35}
 .config label small,.config .key-hint{display:block;font-size:8px;color:var(--muted);margin-top:4px;line-height:1.35}
+
+.inference-banner{display:flex;gap:10px;align-items:flex-start;margin:0 18px 14px;border-radius:9px;padding:11px 13px;font-size:10px;line-height:1.45}
+.inference-banner.ok{background:#e9f6ed;border:1px solid #bfe0c8;color:#2f6b45}
+.inference-banner.warn{background:#312b1b;border:1px solid #584b27;color:#e9c66e}
+.inference-banner code{background:rgba(0,0,0,.12);padding:1px 5px;border-radius:4px;font-size:9px}
+.inference-banner svg{flex-shrink:0;margin-top:1px}

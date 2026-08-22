@@ -35,7 +35,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-APP_VERSION = "2.11.0"
+APP_VERSION = "2.11.1"
 TZ = timezone(timedelta(hours=7))
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
@@ -416,7 +416,13 @@ def capabilities():
         try:
             response=httpx.get(f"{TRAINING_WORKER_URL}/health",timeout=2); response.raise_for_status(); data=response.json(); worker.update({"reachable":True,"gpu":bool(data.get("gpu")),"device":data.get("device","cpu")})
         except httpx.HTTPError: pass
-    return {"demo_mode":SEED_TEST_DATA,"training_worker":worker["reachable"],"training":worker,"external_inference_gateway":True,"camera_crud":True,"diagnostics":True,"search":True,"update_service":bool(UPDATE_SERVICE_URL)}
+    snap_dir=SNAPSHOT_DIR or (DB_PATH.parent/"snapshots")
+    fresh=sum(1 for r in snap_dir.glob("*.jpg") if (time.time()-r.stat().st_mtime)<15) if snap_dir.exists() else 0
+    # "inference_worker": whether the inference worker is actually feeding
+    # fresh snapshots. If false, the camera is offline/unblacked because the
+    # worker isn't running (profile not enabled) or the stream won't open.
+    inference_active=bool(fresh)
+    return {"demo_mode":SEED_TEST_DATA,"training_worker":worker["reachable"],"training":worker,"external_inference_gateway":True,"camera_crud":True,"diagnostics":True,"search":True,"update_service":bool(UPDATE_SERVICE_URL),"inference_worker":inference_active,"fresh_snapshots":fresh}
 
 @app.get("/api/health")
 def health(): return {"status":"ok","version":APP_VERSION,"uptime_seconds":int(time.time()-STARTED),"time":now_iso()}

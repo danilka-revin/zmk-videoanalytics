@@ -25,10 +25,14 @@ def _worker_token():
  except OSError: pass
  return ''
 WORKER_TOKEN=_worker_token()
-# Force RTSP over TCP for the default thread: UDP is often dropped on the
-# default OpenCV path, which yields a black frame even though VLC works fine.
-RTSP_TRANSPORT=os.getenv('RTSP_TRANSPORT','tcp')
-os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS']=f'rtsp_transport;{RTSP_TRANSPORT},stimeout;5000000'
+# RTSP transport handling. "auto" (default) tries TCP first, then falls back
+# to UDP on failure -> solves "works in VLC but not here" because VLC may use a
+# transport that OpenCV/FFmpeg rejects. Fixed values disable the fallback.
+RTSP_TRANSPORT=os.getenv('RTSP_TRANSPORT','auto').lower()
+if RTSP_TRANSPORT not in ('auto','tcp','udp'): RTSP_TRANSPORT='auto'
+TRANSPORT_ORDER=['tcp','udp'] if RTSP_TRANSPORT=='auto' else [RTSP_TRANSPORT]
+# Optional FFmpeg buffer size; only set if the operator explicitly asks.
+_RTSP_BUFSIZE=os.getenv('RTSP_BUFFER_SIZE','').strip()
 OFFLINE_AFTER=int(os.getenv('OFFLINE_AFTER_FRAMES','3'))  # consecutive failed reads before "offline"
 RECONNECT_MIN=int(os.getenv('RTSP_RECONNECT_SECONDS','5'))
 EVENT_CLASSES={'no_helmet','no_vest','phone_usage','smoking','restricted_zone','immobility'}
@@ -38,7 +42,7 @@ def file_sha256(path:Path):
   for chunk in iter(lambda:stream.read(1024*1024),b''): hasher.update(chunk)
  return hasher.hexdigest()
 class Runtime:
- def __init__(self): self.model=None; self.model_name=''; self.captures={}; self.last_telemetry={}; self.last_snapshot={}; self.frame_counts={}; self.last_error={}; self.fail_counts={}; self.next_open={}
+ def __init__(self): self.model=None; self.model_name=''; self.captures={}; self.last_telemetry={}; self.last_snapshot={}; self.frame_counts={}; self.last_error={}; self.fail_counts={}; self.next_open={}; self.transport={}; self.open_attempts={}
  async def get(self,path,internal=False):
   # Re-resolve the worker token on EVERY internal call: the token lives on
   # the shared model-data volume and may be provisioned/rotated after this
@@ -63,11 +67,23 @@ class Runtime:
    digest=await asyncio.to_thread(file_sha256,path)
    if digest.lower()!=info['checksum'].lower(): raise RuntimeError('Model checksum mismatch')
   self.model=await asyncio.to_thread(YOLO,str(path)); self.model_name=info['name']
- def _open_capture(self,url):
+ def _next_transport(self,cid):
+  # rotate through TRANSPORT_ORDER so a fixed mode stays fixed and "auto"
+  # alternates tcp/udp on each reconnect attempt.
+  cur=self.transport.get(cid,TRANSPORT_ORDER[0])
+  try: idx=TRANSPORT_ORDER.index(cur)
+  except ValueError: idx=0
+  nxt=TRANSPORT_ORDER[(idx+1)%len(TRANSPORT_ORDER)]
+  self.transport[cid]=nxt
+  return nxt
+ def _open_capture(self,url,transport):
+  # set the transport/options for THIS open (FFmpeg reads them via the env)
+  opts=f'rtsp_transport;{transport},stimeout;5000000'
+  if _RTSP_BUFSIZE: opts+=f',buffer_size;{_RTSP_BUFSIZE}'
+  os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS']=opts
   cap=cv2.VideoCapture(url,cv2.CAP_FFMPEG)
   cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,8000)
   cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC,8000)
-  cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
   return cap
  async def frame(self,cam):
   cid=cam['id']; now=time.time()
@@ -81,11 +97,14 @@ class Runtime:
    if old_cap is not None:
     try: old_cap.release()
     except (RuntimeError,OSError,ValueError): pass
-   cap=self._open_capture(cam['rtsp_url'])
+   transport=self._next_transport(cid); self.open_attempts[cid]=self.open_attempts.get(cid,0)+1
+   cap=self._open_capture(cam['rtsp_url'],transport)
    if not cap.isOpened():
     self.next_open[cid]=now+RECONNECT_MIN
-    print(f'inference: camera {cid}: failed to open ({cam["name"]}) - retrying in {RECONNECT_MIN}s',flush=True)
+    print(f'inference: camera {cid}: FAILED to open via {transport} ({cam["name"]}) - will retry in {RECONNECT_MIN}s (transport mode: {RTSP_TRANSPORT}; attempts: {self.open_attempts[cid]})',flush=True)
     return
+   if (self.open_attempts.get(cid,0)>1) or (not self.transport.get(cid)):
+    print(f'inference: camera {cid}: OPENED via {transport} ({cam["name"]})',flush=True)
    self.captures[cid]=cap
   started=time.perf_counter(); ok,image=await asyncio.to_thread(cap.read); latency=round((time.perf_counter()-started)*1000)
   fail=self.fail_counts.get(cid,0)
@@ -98,7 +117,7 @@ class Runtime:
     self.last_telemetry.pop(cid,None)
     self.next_open[cid]=now+RECONNECT_MIN
     if now-self.last_error.get(cid,0)>15:
-     print(f'inference: camera {cid}: stream lost ({cam["name"]}) after {fail} bad reads - reconnecting',flush=True)
+     print(f'inference: camera {cid}: stream lost ({cam["name"]}) after {fail} reads (transport={self.transport.get(cid,"?")}) - reconnecting',flush=True)
      self.last_error[cid]=now
   else:
    fail=0; self.fail_counts[cid]=0
