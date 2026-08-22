@@ -29,7 +29,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-APP_VERSION = "2.4.0"
+APP_VERSION = "2.4.1"
 TZ = timezone(timedelta(hours=7))
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
@@ -357,15 +357,28 @@ def internal_active_model():
     data=rows("SELECT m.name,m.format,m.artifact_uri,m.checksum FROM model_registry m JOIN settings s ON s.key='active_model' AND s.value=m.name WHERE m.status='ready'")
     return data[0] if data else None
 
+def snapshot_path_for(camera_id:str) -> Path:
+    return (SNAPSHOT_DIR or (DB_PATH.parent/"snapshots"))/f"{camera_id}.jpg"
+
+def snapshot_age_seconds(camera_id:str) -> int|None:
+    """Seconds since the last stored frame, or None if no frame yet."""
+    target=snapshot_path_for(camera_id)
+    if not target.exists(): return None
+    return int(time.time()-target.stat().st_mtime)
+
+def camera_with_snapshot(row:dict|sqlite3.Row) -> dict:
+    data=dict(row); data["snapshot_age_seconds"]=snapshot_age_seconds(row["id"]); return data
+
 @app.get("/api/cameras")
 def cameras():
-    return rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras ORDER BY created_at,id")
+    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras ORDER BY created_at,id")
+    return [camera_with_snapshot(r) for r in data]
 
 @app.get("/api/cameras/{camera_id}")
 def camera_detail(camera_id:str):
     data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras WHERE id=?",(camera_id,))
     if not data: raise HTTPException(404,"Камера не найдена")
-    return data[0]
+    return camera_with_snapshot(data[0])
 
 @app.post("/api/cameras",status_code=201)
 def add_camera(payload:CameraIn):
@@ -441,6 +454,8 @@ def diagnose_camera(camera_id:str):
 def diagnostics():
     camera_ids=[r["id"] for r in rows("SELECT id FROM cameras ORDER BY id")]
     with ThreadPoolExecutor(max_workers=min(10,max(1,len(camera_ids)))) as pool: camera_results=list(pool.map(diagnose_camera_row,camera_ids))
+    for result in camera_results:
+        age=snapshot_age_seconds(result["camera_id"]); result["snapshot_age_seconds"]=age; result["snapshot"]="fresh" if age is not None and age<15 else ("stale" if age is not None else "none")
     return {"generated_at":now_iso(),"system":system_health_data(),"cameras":camera_results}
 
 @app.get("/api/events")
@@ -682,8 +697,11 @@ def gpu_metrics():
         except pynvml.NVMLError: pass
 
 def system_health_data():
-    gpu=gpu_metrics(); con=db(); con.execute("SELECT 1").fetchone(); camera_count=con.execute("SELECT COUNT(*) FROM cameras WHERE enabled=1").fetchone()[0]; model=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone(); con.close()
-    return {"cpu":round(psutil.cpu_percent(interval=.05),1),"ram":round(psutil.virtual_memory().percent,1),"disk":round(psutil.disk_usage(str(DB_PATH.parent)).percent,1),**gpu,"messenger_provider":MESSENGER_PROVIDER,"services":[{"name":"api","status":"healthy"},{"name":"database","status":"healthy"},{"name":"ingestion","status":"configured" if camera_count else "not_configured"},{"name":"inference","status":"configured" if model and model[0] else "not_configured"}]}
+    gpu=gpu_metrics(); con=db(); con.execute("SELECT 1").fetchone(); camera_count=con.execute("SELECT COUNT(*) FROM cameras WHERE enabled=1").fetchone()[0]; con.close()
+    snap_dir=SNAPSHOT_DIR or (DB_PATH.parent/"snapshots")
+    fresh=sum(1 for r in snap_dir.glob("*.jpg") if (time.time()-r.stat().st_mtime)<10) if snap_dir.exists() else 0
+    def status(flag:bool): return "healthy" if flag else "not_configured"
+    return {"cpu":round(psutil.cpu_percent(interval=.05),1),"ram":round(psutil.virtual_memory().percent,1),"disk":round(psutil.disk_usage(str(DB_PATH.parent)).percent,1),**gpu,"messenger_provider":MESSENGER_PROVIDER,"services":[{"name":"api","status":"healthy"},{"name":"database","status":"healthy"},{"name":"ingestion","status":status(bool(camera_count))},{"name":"inference","status":status(bool(fresh))}]}
 
 @app.get("/api/system-health")
 def system_health(): return system_health_data()

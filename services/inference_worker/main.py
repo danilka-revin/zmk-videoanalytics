@@ -21,7 +21,7 @@ def file_sha256(path:Path):
   for chunk in iter(lambda:stream.read(1024*1024),b''): hasher.update(chunk)
  return hasher.hexdigest()
 class Runtime:
- def __init__(self): self.model=None; self.model_name=''; self.captures={}; self.last_telemetry={}; self.last_snapshot={}; self.frame_counts={}
+ def __init__(self): self.model=None; self.model_name=''; self.captures={}; self.last_telemetry={}; self.last_snapshot={}; self.frame_counts={}; self.last_error={}
  async def get(self,path,internal=False):
   headers={'X-Worker-Token':WORKER_TOKEN} if internal else ({'X-API-Key':API_KEY} if API_KEY else {})
   async with httpx.AsyncClient(headers=headers,timeout=15) as c: r=await c.get(API+path); r.raise_for_status(); return r.json()
@@ -43,10 +43,16 @@ class Runtime:
   if cap is None or not cap.isOpened():
    cap=cv2.VideoCapture(); cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,5000); cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC,5000); cap.open(cam['rtsp_url']); self.captures[cid]=cap
   started=time.perf_counter(); ok,image=await asyncio.to_thread(cap.read); latency=round((time.perf_counter()-started)*1000)
+  if not cap.isOpened() or not ok:
+   last=self.last_error.get(cid,0)
+   if time.time()-last>15:
+    print(f'inference: camera {cid}: cannot read frame ({cam["name"]}) - check RTSP URL/credentials/network',flush=True)
+    self.last_error[cid]=time.time()
   now=time.time(); self.frame_counts[cid]=self.frame_counts.get(cid,0)+(1 if ok else 0)
   if now-self.last_telemetry.get(cid,now)>10 or cid not in self.last_telemetry:
    elapsed=max(.001,now-self.last_telemetry.get(cid,now)); effective=self.frame_counts[cid]/elapsed if cid in self.last_telemetry else 0
    await self.post(f'/api/cameras/{cid}/telemetry',{'status':'online' if ok else 'offline','fps':effective,'latency_ms':latency}); self.last_telemetry[cid]=now; self.frame_counts[cid]=0
+  if ok: self.last_error.pop(cid,None)
   if ok and now-self.last_snapshot.get(cid,0)>5:
    height,width=image.shape[:2]
    if width>960: image=cv2.resize(image,(960,int(height*960/width)))

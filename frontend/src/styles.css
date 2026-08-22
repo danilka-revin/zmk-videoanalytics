@@ -22,3 +22,8 @@ html[data-theme=dark] .trainer-head select,html[data-theme=dark] .error-report s
 .upbtn.has-update i{position:absolute;top:5px;right:5px;width:7px;height:7px;border-radius:50%;background:#e0a93e;box-shadow:0 0 0 3px var(--surface)}
 .updater{background:#17251f;color:var(--accent);border-color:#17251f;font-weight:600}
 .updater:disabled{opacity:.6;cursor:default}
+.feed-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;width:100%;height:100%;color:#93a39b;padding:0 12px;text-align:center}
+.feed-empty svg{color:#7d8f87;margin-bottom:2px}
+.feed-empty span{font-size:10px;font-weight:600;color:#a7b6ae}
+.feed-empty small{font-size:8px;color:#74867e;line-height:1.35}
+.frame-age{position:absolute;left:10px;bottom:8px;font-style:normal;font-size:8px;color:#d7f7c9;background:#0a100dcc;padding:3px 6px;border-radius:4px;z-index:2}
