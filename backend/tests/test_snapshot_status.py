@@ -1,10 +1,14 @@
 """The cameras API reports snapshot freshness, and diagnostics distinguishes
 fresh / stale / no-frame so the UI can explain why a card is blank."""
 import base64
-import io
 
 from app.main import app
 from fastapi.testclient import TestClient
+
+
+def _fake_jpeg() -> str:
+    """Return a base64 frame the API accepts (JPEG markers, no PIL needed)."""
+    return base64.b64encode(b"\xff\xd8" + b"\x00" * 40 + b"\xff\xd9").decode()
 
 
 def _add_camera(c: TestClient, name: str = "CamA") -> str:
@@ -24,15 +28,10 @@ def test_camera_reports_no_snapshot_before_any_frame():
 
 
 def test_camera_reports_snapshot_age_after_frame():
-    from PIL import Image
-
     with TestClient(app) as c:
         cid = _add_camera(c, "CamB")
-        im = Image.new("RGB", (64, 48), (120, 90, 40))
-        buf = io.BytesIO(); im.save(buf, "JPEG")
-        b64 = base64.b64encode(buf.getvalue()).decode()
         up = c.post(f"/api/cameras/{cid}/snapshot", json={
-            "jpeg_base64": b64, "captured_at": "2026-01-01T00:00:00+00:00",
+            "jpeg_base64": _fake_jpeg(), "captured_at": "2026-01-01T00:00:00+00:00",
         })
         assert up.status_code == 204, up.text
 
