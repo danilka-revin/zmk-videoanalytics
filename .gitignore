@@ -14,3 +14,4 @@ data/
 htmlcov/
 *.log
 .zmk-profiles
+.live-data/
