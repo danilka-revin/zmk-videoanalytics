@@ -13,7 +13,18 @@ import httpx
 import torch
 from ultralytics import YOLO
 
-API=os.getenv('ZMK_API_URL','http://api:8000').rstrip('/'); API_KEY=os.getenv('ZMK_API_KEY',''); WORKER_TOKEN=os.getenv('ZMK_WORKER_TOKEN',''); DEVICE_SETTING=os.getenv('INFERENCE_DEVICE','auto'); DEVICE=('0' if torch.cuda.is_available() else 'cpu') if DEVICE_SETTING=='auto' else DEVICE_SETTING; CONF=float(os.getenv('INFERENCE_CONF','0.5'))
+API=os.getenv('ZMK_API_URL','http://api:8000').rstrip('/'); API_KEY=os.getenv('ZMK_API_KEY',''); DEVICE_SETTING=os.getenv('INFERENCE_DEVICE','auto'); DEVICE=('0' if torch.cuda.is_available() else 'cpu') if DEVICE_SETTING=='auto' else DEVICE_SETTING; CONF=float(os.getenv('INFERENCE_CONF','0.5'))
+def _worker_token():
+ tok=os.getenv('ZMK_WORKER_TOKEN','').strip()
+ if tok: return tok
+ f=Path(os.getenv('ZMK_WORKER_TOKEN_FILE','/models/.worker-token'))
+ try:
+  if f.is_file():
+   t=f.read_text(encoding='utf-8').strip()
+   if t: return t
+ except OSError: pass
+ return ''
+WORKER_TOKEN=_worker_token()
 # Force RTSP over TCP for the default thread: UDP is often dropped on the
 # default OpenCV path, which yields a black frame even though VLC works fine.
 RTSP_TRANSPORT=os.getenv('RTSP_TRANSPORT','tcp')

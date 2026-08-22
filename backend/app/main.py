@@ -10,6 +10,7 @@ import io
 import json
 import os
 import re
+import secrets
 import shutil
 import socket
 import sqlite3
@@ -34,13 +35,12 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-APP_VERSION = "2.10.0"
+APP_VERSION = "2.10.1"
 TZ = timezone(timedelta(hours=7))
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
 STARTED = time.time()
 API_KEY = os.getenv("ZMK_API_KEY", "").strip()
-WORKER_TOKEN = os.getenv("ZMK_WORKER_TOKEN", "").strip()
 try: RATE_LIMIT_PER_MINUTE = max(10,int(os.getenv("RATE_LIMIT_PER_MINUTE", "120")))
 except ValueError: RATE_LIMIT_PER_MINUTE = 120
 _rate_buckets: dict[str, list[float]] = {}
@@ -50,6 +50,41 @@ if MESSENGER_PROVIDER not in {"none", "telegram", "max"}: MESSENGER_PROVIDER = "
 TRAINING_WORKER_URL = os.getenv("TRAINING_WORKER_URL", "").rstrip("/")
 DATASET_DIR = Path(os.getenv("DATASET_DIR", "")) if os.getenv("DATASET_DIR") else (DB_PATH.parent / "datasets")
 MODEL_DIR = Path(os.getenv("MODEL_DIR", "")) if os.getenv("MODEL_DIR") else (DB_PATH.parent / "models")
+WORKER_TOKEN_FILE = Path(os.getenv("ZMK_WORKER_TOKEN_FILE", "")) if os.getenv("ZMK_WORKER_TOKEN_FILE") else (MODEL_DIR / ".worker-token")
+
+def provision_worker_token(token_file: Path, env_token: str | None = None) -> str:
+    """Return the worker token, auto-provisioning a strong one if unset.
+
+    Precedence:
+      1) an explicit env token (operator-specified)
+      2) a shared secret file on the model-data volume (default
+         token_file = /models/.worker-token), generated once and read
+         identically by the api and all workers so they always agree.
+
+    This makes `docker compose --profile inference up` work out of the box
+    without manually setting ZMK_WORKER_TOKEN, while keeping a real
+    cryptographically-random shared secret. The internal endpoints are not
+    published to the host network in docker-compose.yml.
+    """
+    tok = (env_token or "").strip()
+    if tok:
+        return tok
+    try:
+        token_file.parent.mkdir(parents=True, exist_ok=True)
+        if token_file.is_file():
+            existing = token_file.read_text(encoding="utf-8").strip()
+            if existing:
+                return existing
+        generated = secrets.token_hex(32)
+        tmp = token_file.with_suffix(".tmp")
+        tmp.write_text(generated, encoding="utf-8")
+        tmp.replace(token_file)
+        token_file.chmod(0o600)
+        return generated
+    except OSError:
+        return ""
+
+WORKER_TOKEN = provision_worker_token(WORKER_TOKEN_FILE, os.getenv("ZMK_WORKER_TOKEN", ""))
 UPDATE_SERVICE_URL = os.getenv("UPDATE_SERVICE_URL", "").rstrip("/")
 # Catalog of ready-to-download pretrained models (real public weights).
 # Each entry has a real, checked download URL. These are COCO-pretrained
@@ -206,7 +241,11 @@ async def security_middleware(request: Request, call_next):
     public=path in {"/api/health","/docs","/openapi.json","/redoc"} or not path.startswith("/api/")
     if path.startswith("/api/internal/"):
         from fastapi.responses import JSONResponse
-        if not WORKER_TOKEN: return JSONResponse({"detail":"Worker API is not configured"},status_code=503)
+        # A worker token is auto-provisioned on the shared model-data volume.
+        # We only 503 if it could not be provisioned at all (e.g. volume
+        # read-only). Otherwise we require it strictly (constant-time).
+        if not WORKER_TOKEN:
+            return JSONResponse({"detail":"Worker token could not be provisioned: ensure model-data volume is writable"},status_code=503)
         if not hmac.compare_digest(request.headers.get("X-Worker-Token",""),WORKER_TOKEN): return JSONResponse({"detail":"Invalid worker token"},status_code=401)
     api_key_ok=bool(API_KEY and hmac.compare_digest(request.headers.get("X-API-Key",""),API_KEY))
     telegram_role=telegram_webapp_role(request.headers.get("X-Telegram-Init-Data",""))
