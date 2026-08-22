@@ -27,3 +27,16 @@ html[data-theme=dark] .trainer-head select,html[data-theme=dark] .error-report s
 .feed-empty span{font-size:10px;font-weight:600;color:#a7b6ae}
 .feed-empty small{font-size:8px;color:#74867e;line-height:1.35}
 .frame-age{position:absolute;left:10px;bottom:8px;font-style:normal;font-size:8px;color:#d7f7c9;background:#0a100dcc;padding:3px 6px;border-radius:4px;z-index:2}
+.train-mode{flex-shrink:0}
+.train-mode button{font-size:9px;padding:6px 10px;border:1px solid var(--line);background:var(--surface-2);color:var(--muted);border-radius:6px}
+.train-mode button.active{background:#17251f;color:var(--accent);border-color:#17251f}
+.upload-btn{display:flex;align-items:center;gap:6px;cursor:pointer;border:1px dashed var(--line);background:var(--surface-2);color:var(--text);border-radius:7px;padding:9px 12px;font-size:10px;white-space:nowrap}
+.ds-list{display:flex;flex-wrap:wrap;gap:8px;padding:12px 20px;border-top:1px solid var(--line)}
+.ds-list>span{display:flex;align-items:center;gap:8px;border:1px solid var(--line);background:var(--surface-2);border-radius:7px;padding:7px 10px;font-size:10px;color:var(--text)}
+.ds-list small{color:var(--muted);font-size:8px;margin-left:6px}
+.ds-list button{border:0;background:transparent;color:#c74f45;display:grid;place-items:center;cursor:pointer}
+
+.train-ctrl{display:flex;align-items:center;gap:8px;flex-wrap:wrap;justify-content:flex-end}
+.train-ctrl select,.ds-upload .hint{font-size:9px}
+.ds-upload{display:flex;align-items:center;gap:12px;padding:8px 20px;border-top:1px solid var(--line)}
+.ds-upload .hint{color:var(--muted)}

@@ -9,10 +9,13 @@ import hmac
 import io
 import json
 import os
+import shutil
 import socket
 import sqlite3
+import tempfile
 import time
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -23,13 +26,14 @@ from urllib.parse import parse_qsl, urlparse
 import httpx
 import psutil
 import pynvml
-from fastapi import FastAPI, HTTPException, Query, Request
+import yaml
+from fastapi import Body, FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-APP_VERSION = "2.4.1"
+APP_VERSION = "2.5.0"
 TZ = timezone(timedelta(hours=7))
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
@@ -43,6 +47,7 @@ _training_tasks: dict[int,asyncio.Task] = {}
 MESSENGER_PROVIDER = os.getenv("MESSENGER_PROVIDER", "none").lower()
 if MESSENGER_PROVIDER not in {"none", "telegram", "max"}: MESSENGER_PROVIDER = "none"
 TRAINING_WORKER_URL = os.getenv("TRAINING_WORKER_URL", "").rstrip("/")
+DATASET_DIR = Path(os.getenv("DATASET_DIR", "")) if os.getenv("DATASET_DIR") else (DB_PATH.parent / "datasets")
 UPDATE_SERVICE_URL = os.getenv("UPDATE_SERVICE_URL", "").rstrip("/")
 UPDATE_TOKEN = os.getenv("ZMK_UPDATE_TOKEN", "").strip()
 SEED_TEST_DATA = os.getenv("ZMK_SEED_TEST_DATA", "false").lower() == "true"
@@ -89,8 +94,9 @@ def init_db():
     for column,ddl in {"artifact_uri":"TEXT NOT NULL DEFAULT ''","checksum":"TEXT NOT NULL DEFAULT ''"}.items():
         if column not in model_columns: con.execute(f"ALTER TABLE model_registry ADD COLUMN {column} {ddl}")
     training_columns={r[1] for r in con.execute("PRAGMA table_info(training_jobs)").fetchall()}
-    for column,ddl in {"batch":"INTEGER NOT NULL DEFAULT 8","imgsz":"INTEGER NOT NULL DEFAULT 640","patience":"INTEGER NOT NULL DEFAULT 20","confidence":"REAL NOT NULL DEFAULT .35","val_split":"REAL NOT NULL DEFAULT .2","capture_fps":"REAL NOT NULL DEFAULT 2"}.items():
+    for column,ddl in {"batch":"INTEGER NOT NULL DEFAULT 8","imgsz":"INTEGER NOT NULL DEFAULT 640","patience":"INTEGER NOT NULL DEFAULT 20","confidence":"REAL NOT NULL DEFAULT .35","val_split":"REAL NOT NULL DEFAULT .2","capture_fps":"REAL NOT NULL DEFAULT 2","source":"TEXT NOT NULL DEFAULT 'camera'","dataset_name":"TEXT NOT NULL DEFAULT ''"}.items():
         if column not in training_columns: con.execute(f"ALTER TABLE training_jobs ADD COLUMN {column} {ddl}")
+    con.execute("CREATE TABLE IF NOT EXISTS datasets(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL, image_count INTEGER NOT NULL DEFAULT 0, class_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)")
     event_columns={r[1] for r in con.execute("PRAGMA table_info(events)").fetchall()}
     if "external_id" not in event_columns: con.execute("ALTER TABLE events ADD COLUMN external_id TEXT")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_events_external_id ON events(external_id) WHERE external_id IS NOT NULL")
@@ -181,7 +187,10 @@ async def security_middleware(request: Request, call_next):
             from fastapi.responses import JSONResponse
             return JSONResponse({"detail":"Insufficient Telegram role"},status_code=403)
     length=request.headers.get("content-length")
-    try: too_large=bool(length and int(length)>2_000_000)
+    # Dataset uploads carry a local zip archive, commonly larger than the
+    # JSON cap, so allow a generous size on that path only.
+    cap=512_000_000 if path.startswith("/api/datasets") and request.method=="POST" else 2_000_000
+    try: too_large=bool(length and int(length)>cap)
     except ValueError: too_large=True
     if too_large:
         from fastapi.responses import JSONResponse
@@ -285,6 +294,8 @@ class TrainingIn(BaseModel):
     confidence:float=Field(default=.35,ge=.05,le=.95)
     val_split:float=Field(default=.2,ge=.1,le=.4)
     capture_fps:float=Field(default=2,ge=.1,le=10)
+    source:Literal["camera","dataset"]="camera"
+    dataset_name:str|None=Field(default=None,min_length=2,max_length=120)
 
 def rows(query,args=()):
     con=db(); result=[dict(r) for r in con.execute(query,args).fetchall()]; con.close(); return result
@@ -606,39 +617,129 @@ def activate(name:str):
     con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","model_manager",f"Control-plane hot-swap {old} -> {name} completed"))
     con.commit(); con.close(); return {"active_model":name,"previous_model":old,"hot_swap":True,"idempotent":False,"control_plane_switch_ms":round((time.perf_counter()-started)*1000,2),"downtime_ms":0}
 
+IMAGE_EXTS={".jpg",".jpeg",".png",".bmp",".webp",".tif",".tiff"}
+def _slugify(name:str) -> str:
+    keep="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
+    return "".join(ch if ch in keep else "_" for ch in name).strip("._") or "dataset"
+def _find_dataset_yaml(root:Path) -> Path|None:
+    if (root/"data.yaml").is_file(): return root/"data.yaml"
+    if (root/"dataset.yaml").is_file(): return root/"dataset.yaml"
+    for sub in root.iterdir():
+        if sub.is_dir():
+            if (sub/"data.yaml").is_file(): return sub/"data.yaml"
+            if (sub/"dataset.yaml").is_file(): return sub/"dataset.yaml"
+    return None
+def _inspect_dataset(root:Path) -> dict:
+    """Validate a YOLO detection dataset dir; raise if unusable."""
+    data_yaml=_find_dataset_yaml(root)
+    if data_yaml is None: raise ValueError("В архиве нет data.yaml (ожидался YOLO-формат)")
+    try: cfg=yaml.safe_load(data_yaml.read_text(encoding="utf-8")) or {}
+    except yaml.YAMLError as exc: raise ValueError(f"Некорректный data.yaml: {exc}") from exc
+    names=cfg.get("names")
+    if not names: raise ValueError("В data.yaml отсутствует список классов 'names'")
+    class_count=len(names) if isinstance(names,(list,dict)) else 0
+    base=data_yaml.parent; images=0; labels=0
+    for p in base.rglob("*"):
+        if p.is_file() and p.suffix.lower() in IMAGE_EXTS: images+=1
+        if p.is_file() and p.suffix.lower()==".txt": labels+=1
+    if images<10: raise ValueError(f"В датасете только {images} изображений (нужно минимум 10)")
+    return {"root":base,"data_yaml":data_yaml,"names":names,"class_count":class_count,"image_count":images,"label_count":labels,"val_split":bool(cfg.get("val"))}
+@app.get("/api/datasets")
+def list_datasets():
+    data=rows("SELECT id,name,image_count,class_count,created_at FROM datasets ORDER BY id DESC")
+    for item in data:
+        item["path"]=str(DATASET_DIR/item["name"]); item["exists"]=Path(item["path"]).is_dir()
+    return data
+@app.post("/api/datasets",status_code=201)
+def upload_dataset(name:str=Query(min_length=2,max_length=120),payload:bytes=Body(...)):
+    safe=_slugify(name)
+    if rows("SELECT 1 FROM datasets WHERE name=?",(safe,)):
+        raise HTTPException(409,"Датасет с таким именем уже существует")
+    if len(payload)<100 or payload[:4]!=b"PK\x03\x04":
+        raise HTTPException(422,"Ожидался zip-архив датасета")
+    workdir=Path(tempfile.mkdtemp(prefix="zmk-ds-"))
+    try:
+        try:
+            with zipfile.ZipFile(io.BytesIO(payload)) as zf:
+                for member in zf.infolist():
+                    if member.is_dir(): continue
+                    member_path=Path(member.filename)
+                    if member_path.is_absolute() or ".." in member_path.parts or member_path.suffix.lower() in {".sh",".exe",".bat",".cmd",".ps1"}:
+                        raise HTTPException(422,f"Недопустимый файл в архиве: {member.filename}")
+                zf.extractall(workdir)
+        except zipfile.BadZipFile as exc: raise HTTPException(422,"Повреждённый zip-архив") from exc
+        try: inspected=_inspect_dataset(workdir)
+        except ValueError as exc: raise HTTPException(422,str(exc)) from exc
+        target=DATASET_DIR/safe; DATASET_DIR.mkdir(parents=True,exist_ok=True)
+        if target.exists(): shutil.rmtree(target)
+        shutil.copytree(inspected["root"],target)
+        con=db(); cur=con.execute("INSERT INTO datasets(name,path,image_count,class_count,created_at) VALUES(?,?,?,?,?)",(safe,str(target),inspected["image_count"],inspected["class_count"],now_iso())); con.commit(); ds_id=cur.lastrowid; con.close()
+        return {"id":ds_id,"name":safe,"image_count":inspected["image_count"],"class_count":inspected["class_count"],"label_count":inspected["label_count"],"val_split":inspected["val_split"]}
+    finally:
+        shutil.rmtree(workdir,ignore_errors=True)
+@app.delete("/api/datasets/{dataset_id}")
+def delete_dataset(dataset_id:int):
+    row=rows("SELECT id,name FROM datasets WHERE id=?",(dataset_id,))
+    if not row: raise HTTPException(404,"Датасет не найден")
+    name=row[0]["name"]
+    if rows("SELECT 1 FROM training_jobs WHERE dataset_name=? AND status IN ('queued','running')",(name,)):
+        raise HTTPException(409,"Датасет используется текущей задачей обучения")
+    con=db(); con.execute("DELETE FROM datasets WHERE id=?",(dataset_id,)); con.commit(); con.close()
+    shutil.rmtree(DATASET_DIR/name,ignore_errors=True)
+    return {"id":dataset_id,"deleted":True,"name":name}
+
 async def run_training(job_id:int):
     con=db(); con.execute("UPDATE training_jobs SET status='failed',stage='Worker не подключён',error='External GPU training worker is not configured',updated_at=? WHERE id=?",(now_iso(),job_id)); con.commit(); con.close()
 
 @app.post("/api/training/jobs",status_code=202)
 async def start_training(payload:TrainingIn):
     if not SEED_TEST_DATA and not TRAINING_WORKER_URL: raise HTTPException(503,"Сервис обучения не подключён. Запустите Compose profile training")
-    con=db(); cam=con.execute("SELECT status,rtsp_url,fps_limit FROM cameras WHERE id=?",(payload.camera_id,)).fetchone()
-    if not cam: con.close(); raise HTTPException(404,"Камера не найдена")
-    if cam[0] != "online": con.close(); raise HTTPException(409,"Камера офлайн: кадры недоступны")
+    con=db(); cam=None; rtsp=""
+    if payload.source=="dataset":
+        ds=con.execute("SELECT name,path FROM datasets WHERE name=?",(payload.dataset_name or "",)).fetchone()
+        if not ds: con.close(); raise HTTPException(404,"Датасет не найден. Загрузите его на вкладке Модели")
+        if not Path(ds[1]).is_dir(): con.close(); raise HTTPException(503,"Файлы датасета не найдены на диске")
+    else:
+        cam=con.execute("SELECT status,rtsp_url,fps_limit FROM cameras WHERE id=?",(payload.camera_id,)).fetchone()
+        if not cam: con.close(); raise HTTPException(404,"Камера не найдена")
+        if cam[0] != "online": con.close(); raise HTTPException(409,"Камера офлайн: кадры недоступны")
+        rtsp=cam[1]
     active=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()[0]
-    target=payload.target_name or f"siz-auto-{payload.camera_id}-{datetime.now(TZ).strftime('%m%d-%H%M%S')}"
+    suffix=payload.dataset_name or payload.camera_id
+    target=payload.target_name or f"siz-auto-{suffix}-{datetime.now(TZ).strftime('%m%d-%H%M%S')}"
     if con.execute("SELECT 1 FROM model_registry WHERE name=?",(target,)).fetchone() or con.execute("SELECT 1 FROM training_jobs WHERE target_name=? AND status IN ('queued','running')",(target,)).fetchone():
         con.close(); raise HTTPException(409,"Имя модели уже используется")
     if con.execute("SELECT 1 FROM training_jobs WHERE status IN ('queued','running')").fetchone():
         con.close(); raise HTTPException(409,"Уже выполняется другая задача обучения")
-    cur=con.execute("INSERT INTO training_jobs(created_at,updated_at,camera_id,base_model,target_name,image_count,epochs,status,progress,stage,batch,imgsz,patience,confidence,val_split,capture_fps) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(now_iso(),now_iso(),payload.camera_id,active,target,payload.image_count,payload.epochs,"queued",0,"В очереди",payload.batch,payload.imgsz,payload.patience,payload.confidence,payload.val_split,payload.capture_fps)); con.commit(); jid=cur.lastrowid; con.close()
+    dataset_name=payload.dataset_name or ""
+    # dataset-mode jobs may have no camera, so camera_id is allowed to be empty
+    # for them; relax the FK for this single insert only.
+    if payload.source=="dataset":
+        con.execute("PRAGMA foreign_keys=OFF")
+    cur=con.execute("INSERT INTO training_jobs(created_at,updated_at,camera_id,base_model,target_name,image_count,epochs,status,progress,stage,batch,imgsz,patience,confidence,val_split,capture_fps,source,dataset_name) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(now_iso(),now_iso(),payload.camera_id,active,target,payload.image_count,payload.epochs,"queued",0,"В очереди",payload.batch,payload.imgsz,payload.patience,payload.confidence,payload.val_split,payload.capture_fps,payload.source,dataset_name)); con.commit(); jid=cur.lastrowid; con.close()
     if SEED_TEST_DATA:
         task=asyncio.create_task(run_training(jid),name=f"training-{jid}"); _training_tasks[jid]=task; task.add_done_callback(lambda _: _training_tasks.pop(jid,None))
     else:
-        model=rows("SELECT artifact_uri FROM model_registry WHERE name=?",(active,)); request={"id":jid,"camera_id":payload.camera_id,"rtsp_url":cam[1],"target_name":target,"base_artifact":model[0]["artifact_uri"] if model else None,"image_count":payload.image_count,"epochs":payload.epochs,"fps_limit":min(float(cam[2]),payload.capture_fps),"batch":payload.batch,"imgsz":payload.imgsz,"patience":payload.patience,"confidence":payload.confidence,"val_split":payload.val_split}
+        model=rows("SELECT artifact_uri FROM model_registry WHERE name=?",(active,))
+        if payload.source=="dataset":
+            dataset_path=(DATASET_DIR/dataset_name)
+            request={"id":jid,"source":"dataset","dataset_path":str(dataset_path),"target_name":target,"base_artifact":model[0]["artifact_uri"] if model else None,"image_count":payload.image_count,"epochs":payload.epochs,"batch":payload.batch,"imgsz":payload.imgsz,"patience":payload.patience,"confidence":payload.confidence,"val_split":payload.val_split}
+        else:
+            request={"id":jid,"source":"camera","camera_id":payload.camera_id,"rtsp_url":rtsp,"target_name":target,"base_artifact":model[0]["artifact_uri"] if model else None,"image_count":payload.image_count,"epochs":payload.epochs,"fps_limit":min(float(cam[2]),payload.capture_fps),"batch":payload.batch,"imgsz":payload.imgsz,"patience":payload.patience,"confidence":payload.confidence,"val_split":payload.val_split}
         try:
             async with httpx.AsyncClient(timeout=15) as client: response=await client.post(f"{TRAINING_WORKER_URL}/jobs",json=request); response.raise_for_status()
         except httpx.HTTPError as exc:
             con=db(); con.execute("UPDATE training_jobs SET status='failed',stage='Worker недоступен',error=?,updated_at=? WHERE id=?",(str(exc)[:500],now_iso(),jid)); con.commit(); con.close(); raise HTTPException(503,"Training worker недоступен")
-    return {"id":jid,"status":"queued","target_name":target,"mode":"pseudo-label fine-tuning"}
+    return {"id":jid,"status":"queued","target_name":target,"mode":"dataset" if payload.source=="dataset" else "pseudo-label fine-tuning","source":payload.source}
 
 @app.put("/api/training/jobs/{job_id}/progress")
 def training_progress(job_id:int,payload:TrainingProgress):
-    con=db(); job=con.execute("SELECT target_name,camera_id FROM training_jobs WHERE id=?",(job_id,)).fetchone()
+    con=db(); job=con.execute("SELECT target_name,camera_id,source,dataset_name FROM training_jobs WHERE id=?",(job_id,)).fetchone()
     if not job: con.close(); raise HTTPException(404,"Задача не найдена")
     con.execute("UPDATE training_jobs SET status=?,progress=?,stage=?,error=?,updated_at=? WHERE id=?",(payload.status,payload.progress,payload.stage,payload.error,now_iso(),job_id))
     if payload.status=="completed" and payload.artifact_uri and payload.precision is not None and payload.recall is not None:
-        con.execute("INSERT OR REPLACE INTO model_registry(name,format,status,precision,recall,trained_at,source,artifact_uri,checksum) VALUES(?,?,?,?,?,?,?,?,?)",(job[0],"ONNX","ready",payload.precision,payload.recall,now_iso(),f"camera:{job[1]}",payload.artifact_uri,""))
+        origin=f"dataset:{job[3]}" if job[2]=="dataset" else f"camera:{job[1]}"
+        con.execute("INSERT OR REPLACE INTO model_registry(name,format,status,precision,recall,trained_at,source,artifact_uri,checksum) VALUES(?,?,?,?,?,?,?,?,?)",(job[0],"ONNX","ready",payload.precision,payload.recall,now_iso(),origin,payload.artifact_uri,""))
     con.commit(); con.close(); return {"id":job_id,"status":payload.status,"progress":payload.progress}
 
 @app.get("/api/training/jobs")

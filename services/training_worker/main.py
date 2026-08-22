@@ -18,7 +18,7 @@ from ultralytics import YOLO
 API=os.getenv('ZMK_API_URL','http://api:8000').rstrip('/'); DEVICE_SETTING=os.getenv('TRAINING_DEVICE','auto'); DEVICE=(0 if torch.cuda.is_available() else 'cpu') if DEVICE_SETTING=='auto' else DEVICE_SETTING; KEY=os.getenv('ZMK_API_KEY',''); BASE_MODEL=os.getenv('BASE_TRAIN_MODEL','yolo11n.pt'); ROOT=Path(os.getenv('TRAINING_DATA_DIR','/data')); MODELS=Path(os.getenv('MODEL_DIR','/models'))
 app=FastAPI(title='ZMK Training Worker',version='1.0.0'); running:set[int]=set(); tasks:dict[int,asyncio.Task]={}
 class Job(BaseModel):
- id:int; camera_id:str; rtsp_url:str; target_name:str; base_artifact:str|None=None; image_count:int=Field(ge=20,le=5000); epochs:int=Field(ge=1,le=300); fps_limit:float=Field(default=2,gt=0,le=10); batch:int=Field(default=8,ge=1,le=128); imgsz:int=Field(default=640,ge=320,le=1920); patience:int=Field(default=20,ge=0,le=100); confidence:float=Field(default=.35,ge=.05,le=.95); val_split:float=Field(default=.2,ge=.1,le=.4)
+ id:int; camera_id:str=''; rtsp_url:str=''; target_name:str; base_artifact:str|None=None; image_count:int=Field(ge=20,le=5000); epochs:int=Field(ge=1,le=300); fps_limit:float=Field(default=2,gt=0,le=10); batch:int=Field(default=8,ge=1,le=128); imgsz:int=Field(default=640,ge=320,le=1920); patience:int=Field(default=20,ge=0,le=100); confidence:float=Field(default=.35,ge=.05,le=.95); val_split:float=Field(default=.2,ge=.1,le=.4); source:str='camera'; dataset_path:str|None=None
 async def callback(job:int,**values):
  async with httpx.AsyncClient(base_url=API,headers={'X-API-Key':KEY} if KEY else {},timeout=30) as c: (await c.put(f'/api/training/jobs/{job}/progress',json=values)).raise_for_status()
 def capture(job:Job,path:Path):
@@ -30,8 +30,30 @@ def capture(job:Job,path:Path):
   frame+=1
  cap.release()
  if saved<20: raise RuntimeError(f'Captured only {saved} frames; RTSP stream unavailable or too short')
-def train(job:Job, updates=None):
- work=ROOT/f'job-{job.id}'; shutil.rmtree(work,ignore_errors=True); images=work/'images'/'all'; labels=work/'labels'/'all'; images.mkdir(parents=True); labels.mkdir(parents=True)
+def _common_train(data_yaml, job:Job, work:Path, updates=None):
+ trainer=YOLO(BASE_MODEL); updates and updates.put(('progress',60,'Обучение YOLO11n'))
+ result=trainer.train(data=str(data_yaml),epochs=job.epochs,imgsz=job.imgsz,batch=job.batch,patience=job.patience,device=DEVICE,project=str(work/'runs'),name='train',exist_ok=True,verbose=False)
+ updates and updates.put(('progress',90,'Экспорт ONNX'))
+ best=work/'runs'/'train'/'weights'/'best.pt'; MODELS.mkdir(parents=True,exist_ok=True); target=MODELS/f'{job.target_name}.pt'; shutil.copy2(best,target); exported=YOLO(str(target)).export(format='onnx',dynamic=True,simplify=True); onnx=MODELS/f'{job.target_name}.onnx'; shutil.move(str(exported),onnx)
+ metrics=getattr(result,'results_dict',{}); return onnx,float(metrics.get('metrics/precision(B)',0))*100,float(metrics.get('metrics/recall(B)',0))*100
+
+def train_dataset(job:Job, work:Path, updates=None):
+ dpath=Path(job.dataset_path)
+ if not dpath.is_dir(): raise RuntimeError(f'Dataset directory not found: {job.dataset_path}')
+ data_yaml=dpath/'data.yaml'
+ if not data_yaml.is_file(): raise RuntimeError('Dataset has no data.yaml')
+ cfg=yaml.safe_load(data_yaml.read_text(encoding='utf-8')) or {}
+ names=cfg.get('names')
+ if not names: raise RuntimeError("Dataset data.yaml has no 'names'")
+ images_dir=dpath/'images'
+ if not images_dir.is_dir() or not (any(p.is_file() and p.suffix.lower() in {'.jpg','.jpeg','.png','.bmp','.webp'} for p in images_dir.rglob('*'))):
+  raise RuntimeError('Dataset missing images/ directory with training images')
+ updates and updates.put(('progress',30,'Готовый датасет загружен'))
+ updates and updates.put(('progress',45,'Начало обучения на готовом датасете'))
+ return _common_train(str(data_yaml),job,work,updates)
+
+def train_camera(job:Job, work:Path, updates=None):
+ images=work/'images'/'all'; labels=work/'labels'/'all'; images.mkdir(parents=True); labels.mkdir(parents=True)
  capture(job,images); updates and updates.put(('progress',25,'Кадры захвачены')); base=job.base_artifact.removeprefix('file://') if job.base_artifact else BASE_MODEL; pseudo_model=YOLO(base)
  count=0
  for image in images.glob('*.jpg'):
@@ -46,11 +68,12 @@ def train(job:Job, updates=None):
  for index,label in enumerate(labeled):
   split='val' if index < max(1,int(len(labeled)*job.val_split)) else 'train'; image=images/f'{label.stem}.jpg'; shutil.move(str(image),work/'images'/split/image.name); shutil.move(str(label),work/'labels'/split/label.name)
  data=work/'data.yaml'; data.write_text(yaml.safe_dump({'path':str(work),'train':'images/train','val':'images/val','names':pseudo_model.names},allow_unicode=True))
- trainer=YOLO(BASE_MODEL); updates and updates.put(('progress',60,'Обучение YOLO11n'))
- result=trainer.train(data=str(data),epochs=job.epochs,imgsz=job.imgsz,batch=job.batch,patience=job.patience,device=DEVICE,project=str(work/'runs'),name='train',exist_ok=True,verbose=False)
- updates and updates.put(('progress',90,'Экспорт ONNX'))
- best=work/'runs'/'train'/'weights'/'best.pt'; MODELS.mkdir(parents=True,exist_ok=True); target=MODELS/f'{job.target_name}.pt'; shutil.copy2(best,target); exported=YOLO(str(target)).export(format='onnx',dynamic=True,simplify=True); onnx=MODELS/f'{job.target_name}.onnx'; shutil.move(str(exported),onnx)
- metrics=getattr(result,'results_dict',{}); return onnx,float(metrics.get('metrics/precision(B)',0))*100,float(metrics.get('metrics/recall(B)',0))*100
+ return _common_train(data,job,work,updates)
+
+def train(job:Job, updates=None):
+ work=ROOT/f'job-{job.id}'; shutil.rmtree(work,ignore_errors=True)
+ if job.source=='dataset': return train_dataset(job,work,updates)
+ return train_camera(job,work,updates)
 def train_entry(payload, updates):
  try:
   artifact,precision,recall=train(Job(**payload),updates); updates.put(('success',str(artifact),precision,recall))
@@ -59,7 +82,7 @@ def train_entry(payload, updates):
 async def execute(job:Job):
  running.add(job.id); ctx=mp.get_context('spawn'); updates=ctx.Queue(); process=ctx.Process(target=train_entry,args=(job.model_dump(),updates),daemon=True); process.start()
  try:
-  await callback(job.id,status='running',progress=5,stage='Захват RTSP кадров')
+  await callback(job.id,status='running',progress=5,stage='Обучение на готовом датасете' if job.source=='dataset' else 'Захват RTSP кадров')
   empty_after_exit=0
   while True:
    try: message=await asyncio.to_thread(updates.get,True,1)

@@ -5,8 +5,10 @@ services:
     - 127.0.0.1:8000:8000
     volumes:
     - ./data:/app/data
+    - dataset-data:/datasets
     environment:
       VIDEOANALYTICS_DB: /app/data/videoanalytics.db
+      DATASET_DIR: /datasets
       ZMK_API_KEY: ${ZMK_API_KEY:-}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
@@ -94,10 +96,12 @@ services:
       ZMK_API_KEY: ${ZMK_API_KEY:-}
       TRAINING_DATA_DIR: /data
       MODEL_DIR: /models
+      DATASET_DIR: /datasets
       TRAINING_DEVICE: ${TRAINING_DEVICE:-auto}
     volumes:
     - training-data:/data
     - model-data:/models
+    - dataset-data:/datasets
     depends_on:
       api:
         condition: service_healthy
@@ -151,3 +155,4 @@ volumes:
   minio-data: {}
   training-data: {}
   model-data: {}
+  dataset-data: {}
