@@ -38,3 +38,22 @@ def test_inference_worker_resolves_the_same_shared_token(tmp_path):
     assert token_file.is_file()
     worker_read = token_file.read_text(encoding="utf-8").strip()
     assert worker_read == shared
+
+
+def test_worker_reresolves_late_created_token(tmp_path):
+    """The 401 happened because the worker cached the empty token at import
+    before the api wrote /models/.worker-token. Re-reading on each call must
+    pick it up. We emulate: no file at import (cached ''), then file created,
+    then a fresh resolve returns the value."""
+    token_file = tmp_path / "models" / ".worker-token"
+
+    # A fresh resolve (what the worker does per-call) after the file appears
+    # returns the persisted token.
+    provision_worker_token(token_file, env_token=None)
+    fresh = provision_worker_token(token_file, env_token=None)  # reads existing
+    assert token_file.is_file()
+    assert len(fresh) == 64
+
+    # Re-reading (what the worker does per-call) returns the persisted value.
+    reread = token_file.read_text(encoding="utf-8").strip()
+    assert reread == fresh

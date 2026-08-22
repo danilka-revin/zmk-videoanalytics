@@ -40,7 +40,15 @@ def file_sha256(path:Path):
 class Runtime:
  def __init__(self): self.model=None; self.model_name=''; self.captures={}; self.last_telemetry={}; self.last_snapshot={}; self.frame_counts={}; self.last_error={}; self.fail_counts={}; self.next_open={}
  async def get(self,path,internal=False):
-  headers={'X-Worker-Token':WORKER_TOKEN} if internal else ({'X-API-Key':API_KEY} if API_KEY else {})
+  # Re-resolve the worker token on EVERY internal call: the token lives on
+  # the shared model-data volume and may be provisioned/rotated after this
+  # worker started (or the api container may create it first). Caching it at
+  # import time is what produced constant 401s when the worker started before
+  # the api had written /models/.worker-token.
+  token=WORKER_TOKEN
+  if internal:
+   token=_worker_token()
+  headers={'X-Worker-Token':token} if internal else ({'X-API-Key':API_KEY} if API_KEY else {})
   async with httpx.AsyncClient(headers=headers,timeout=15) as c: r=await c.get(API+path); r.raise_for_status(); return r.json()
  async def post(self,path,data):
   headers={'X-API-Key':API_KEY} if API_KEY else {}
