@@ -21,3 +21,22 @@ def test_capabilities_expose_inference_worker_flag():
         assert 'inference_worker' in cap
         assert isinstance(cap['inference_worker'], bool)
         assert 'fresh_snapshots' in cap
+
+
+def test_camera_edit_preserves_rtsp_url_and_never_leaks_it():
+    with TestClient(app) as c:
+        created=c.post('/api/cameras',json={'name':'Sec Cam','zone':'Z','rtsp_url':'rtsp://u:p@cam/stream','fps_limit':8}).json()
+        cid=created['id']
+        # The camera list must NOT expose the raw URL.
+        item=next(x for x in c.get('/api/cameras').json() if x['id']==cid)
+        assert 'rtsp_url' not in item or item.get('rtsp_url') in (None,'')
+        assert bool(item.get('configured')) is True
+        # Edit WITHOUT a new URL: null must keep the existing one.
+        r=c.put(f'/api/cameras/{cid}',json={'name':'Sec Cam 2','zone':'Z','rtsp_url':None,'fps_limit':8,'enabled':True})
+        assert r.status_code==200 and bool(r.json()['configured']) is True
+        # Also, sending an empty string must NOT wipe it either.
+        c.put(f'/api/cameras/{cid}',json={'name':'Sec Cam 3','zone':'Z','rtsp_url':'','fps_limit':8,'enabled':True})
+        # Raw URL is still stored and not leaked.
+        item2=next(x for x in c.get('/api/cameras').json() if x['id']==cid)
+        assert bool(item2.get('configured')) is True
+        assert 'rtsp_url' not in item2 or item2.get('rtsp_url') in (None,'')

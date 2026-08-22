@@ -35,7 +35,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-APP_VERSION = "2.11.1"
+APP_VERSION = "2.11.2"
 TZ = timezone(timedelta(hours=7))
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
@@ -493,10 +493,15 @@ def add_camera(payload:CameraIn):
 
 @app.put("/api/cameras/{camera_id}")
 def update_camera(camera_id:str,payload:CameraUpdate):
-    con=db(); current=con.execute("SELECT 1 FROM cameras WHERE id=?",(camera_id,)).fetchone()
+    con=db(); current=con.execute("SELECT rtsp_url FROM cameras WHERE id=?",(camera_id,)).fetchone()
     if not current: con.close(); raise HTTPException(404,"Камера не найдена")
-    con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=COALESCE(?,rtsp_url),fps_limit=?,enabled=?,updated_at=? WHERE id=?",(payload.name,payload.zone,payload.description,payload.rtsp_url,payload.fps_limit,int(payload.enabled),now_iso(),camera_id)); con.commit(); con.close()
-    return {"id":camera_id,"updated":True}
+    # The RTSP URL is a secret and is never returned by the API. It is only
+    # replaced when the client supplies a non-empty value; null or "" ("leave
+    # as is" from the edit form) keeps the existing URL.
+    new_rtsp=payload.rtsp_url if payload.rtsp_url else current[0]
+    rtsp_updated=bool(payload.rtsp_url)
+    con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,updated_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),now_iso(),camera_id)); con.commit(); con.close()
+    return {"id":camera_id,"updated":True,"configured":bool(new_rtsp),"rtsp_updated":rtsp_updated}
 
 @app.delete("/api/cameras/{camera_id}")
 def delete_camera(camera_id:str,delete_events:bool=False):
