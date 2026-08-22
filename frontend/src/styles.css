@@ -65,3 +65,10 @@ html[data-theme=dark] .trainer-head select,html[data-theme=dark] .error-report s
 .preset-dl{margin-top:auto;border:1px solid var(--line);background:var(--surface);color:var(--text);border-radius:7px;padding:8px;display:flex;align-items:center;justify-content:center;gap:6px;font-size:9px;cursor:pointer}
 .preset-dl:disabled{opacity:.6;cursor:default}
 .preset-note{font-size:8px;color:#b58b3a;background:#332a19;border:1px solid #584b27;border-radius:7px;padding:9px 11px;margin-top:12px;line-height:1.45}
+
+.model-del{margin-left:8px;border:1px solid #e3c7c4!important;background:#fbecea!important;color:#c74f45!important}
+.tag.recovering{background:#fff4dc;color:#c18722}
+.live.recovering{color:#e5b955}
+
+.setting-hint{display:block;font-size:7.5px;color:var(--muted);margin-top:3px;line-height:1.35}
+.config label small,.config .key-hint{display:block;font-size:8px;color:var(--muted);margin-top:4px;line-height:1.35}

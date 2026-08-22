@@ -34,7 +34,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-APP_VERSION = "2.9.0"
+APP_VERSION = "2.10.0"
 TZ = timezone(timedelta(hours=7))
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
@@ -708,6 +708,32 @@ def activate(name:str):
     con.execute("UPDATE settings SET value=? WHERE key='active_model'",(name,))
     con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","model_manager",f"Control-plane hot-swap {old} -> {name} completed"))
     con.commit(); con.close(); return {"active_model":name,"previous_model":old,"hot_swap":True,"idempotent":False,"control_plane_switch_ms":round((time.perf_counter()-started)*1000,2),"downtime_ms":0}
+
+@app.delete("/api/models/{name}")
+def delete_model(name:str):
+    """Remove a model from the registry (and its artifact file if it is a
+    locally-downloaded preset). Refuses to delete the currently active model."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]{2,120}",name or ""): raise HTTPException(422,"Недопустимое имя модели")
+    con=db(); row=con.execute("SELECT status,source,artifact_uri FROM model_registry WHERE name=?",(name,)).fetchone()
+    if not row: con.close(); raise HTTPException(404,"Модель не найдена")
+    active=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()[0]
+    if active==name: con.close(); raise HTTPException(409,"Нельзя удалить активную модель — сначала переключитесь на другую (или отключите) через 'Горячая замена'")
+    jobs=con.execute("SELECT COUNT(*) FROM training_jobs WHERE target_name=? AND status IN ('queued','running')",(name,)).fetchone()[0]
+    if jobs: con.close(); raise HTTPException(409,"Модель используется текущей задачей обучения")
+    source=row[1]; artifact_uri=row[2] or ""
+    con.execute("DELETE FROM model_registry WHERE name=?",(name,))
+    con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"Model deleted: {name} (source={source})"))
+    con.commit(); con.close()
+    removed_file=False
+    if source and source.startswith("preset:") and artifact_uri.startswith("file://"):
+        try:
+            artifact=Path(artifact_uri.removeprefix("file://")).resolve()
+            base=MODEL_DIR.resolve()
+            if base.exists() and base in artifact.parents and artifact.is_file():
+                artifact.unlink(); removed_file=True
+        except (OSError,ValueError):
+            removed_file=False
+    return {"name":name,"deleted":True,"removed_artifact_file":removed_file,"source":source}
 
 IMAGE_EXTS={".jpg",".jpeg",".png",".bmp",".webp",".tif",".tiff"}
 VIDEO_EXTS={".mp4",".avi",".mov",".mkv",".m4v",".webm",".mpg",".mpeg",".wmv"}

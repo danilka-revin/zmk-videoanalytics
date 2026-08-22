@@ -14,6 +14,12 @@ import torch
 from ultralytics import YOLO
 
 API=os.getenv('ZMK_API_URL','http://api:8000').rstrip('/'); API_KEY=os.getenv('ZMK_API_KEY',''); WORKER_TOKEN=os.getenv('ZMK_WORKER_TOKEN',''); DEVICE_SETTING=os.getenv('INFERENCE_DEVICE','auto'); DEVICE=('0' if torch.cuda.is_available() else 'cpu') if DEVICE_SETTING=='auto' else DEVICE_SETTING; CONF=float(os.getenv('INFERENCE_CONF','0.5'))
+# Force RTSP over TCP for the default thread: UDP is often dropped on the
+# default OpenCV path, which yields a black frame even though VLC works fine.
+RTSP_TRANSPORT=os.getenv('RTSP_TRANSPORT','tcp')
+os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS']=f'rtsp_transport;{RTSP_TRANSPORT},stimeout;5000000'
+OFFLINE_AFTER=int(os.getenv('OFFLINE_AFTER_FRAMES','3'))  # consecutive failed reads before "offline"
+RECONNECT_MIN=int(os.getenv('RTSP_RECONNECT_SECONDS','5'))
 EVENT_CLASSES={'no_helmet','no_vest','phone_usage','smoking','restricted_zone','immobility'}
 def file_sha256(path:Path):
  hasher=hashlib.sha256()
@@ -21,7 +27,7 @@ def file_sha256(path:Path):
   for chunk in iter(lambda:stream.read(1024*1024),b''): hasher.update(chunk)
  return hasher.hexdigest()
 class Runtime:
- def __init__(self): self.model=None; self.model_name=''; self.captures={}; self.last_telemetry={}; self.last_snapshot={}; self.frame_counts={}; self.last_error={}
+ def __init__(self): self.model=None; self.model_name=''; self.captures={}; self.last_telemetry={}; self.last_snapshot={}; self.frame_counts={}; self.last_error={}; self.fail_counts={}; self.next_open={}
  async def get(self,path,internal=False):
   headers={'X-Worker-Token':WORKER_TOKEN} if internal else ({'X-API-Key':API_KEY} if API_KEY else {})
   async with httpx.AsyncClient(headers=headers,timeout=15) as c: r=await c.get(API+path); r.raise_for_status(); return r.json()
@@ -38,27 +44,63 @@ class Runtime:
    digest=await asyncio.to_thread(file_sha256,path)
    if digest.lower()!=info['checksum'].lower(): raise RuntimeError('Model checksum mismatch')
   self.model=await asyncio.to_thread(YOLO,str(path)); self.model_name=info['name']
+ def _open_capture(self,url):
+  cap=cv2.VideoCapture(url,cv2.CAP_FFMPEG)
+  cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,8000)
+  cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC,8000)
+  cap.set(cv2.CAP_PROP_BUFFERSIZE,1)
+  return cap
  async def frame(self,cam):
-  cid=cam['id']; cap=self.captures.get(cid)
+  cid=cam['id']; now=time.time()
+  cap=self.captures.get(cid)
+  # (Re)open, respecting a minimum reconnect interval so a bad stream isn't
+  # hammered with thousands of open attempts per second.
   if cap is None or not cap.isOpened():
-   cap=cv2.VideoCapture(); cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,5000); cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC,5000); cap.open(cam['rtsp_url']); self.captures[cid]=cap
+   if now < self.next_open.get(cid,0):
+    await asyncio.sleep(.2); return
+   old_cap=self.captures.pop(cid,None)
+   if old_cap is not None:
+    try: old_cap.release()
+    except (RuntimeError,OSError,ValueError): pass
+   cap=self._open_capture(cam['rtsp_url'])
+   if not cap.isOpened():
+    self.next_open[cid]=now+RECONNECT_MIN
+    print(f'inference: camera {cid}: failed to open ({cam["name"]}) - retrying in {RECONNECT_MIN}s',flush=True)
+    return
+   self.captures[cid]=cap
   started=time.perf_counter(); ok,image=await asyncio.to_thread(cap.read); latency=round((time.perf_counter()-started)*1000)
-  if not cap.isOpened() or not ok:
-   last=self.last_error.get(cid,0)
-   if time.time()-last>15:
-    print(f'inference: camera {cid}: cannot read frame ({cam["name"]}) - check RTSP URL/credentials/network',flush=True)
-    self.last_error[cid]=time.time()
-  now=time.time(); self.frame_counts[cid]=self.frame_counts.get(cid,0)+(1 if ok else 0)
+  fail=self.fail_counts.get(cid,0)
+  if not ok or image is None:
+   fail+=1; self.fail_counts[cid]=fail
+   if fail>=OFFLINE_AFTER:
+    # stream is dead: drop the capture so the next frame reopens it.
+    try: self.captures.pop(cid,None).release()
+    except (RuntimeError,OSError,ValueError): self.captures.pop(cid,None)
+    self.last_telemetry.pop(cid,None)
+    self.next_open[cid]=now+RECONNECT_MIN
+    if now-self.last_error.get(cid,0)>15:
+     print(f'inference: camera {cid}: stream lost ({cam["name"]}) after {fail} bad reads - reconnecting',flush=True)
+     self.last_error[cid]=now
+  else:
+   fail=0; self.fail_counts[cid]=0
+   if cid in self.last_error: self.last_error.pop(cid,None)
+  # Report telemetry. Status goes offline only after OFFLINE_AFTER consecutive
+  # bad reads, to avoid constant online/offline flapping on a single dropped frame.
   if now-self.last_telemetry.get(cid,now)>10 or cid not in self.last_telemetry:
+   status='online' if fail==0 else ('offline' if fail>=OFFLINE_AFTER else 'recovering')
    elapsed=max(.001,now-self.last_telemetry.get(cid,now)); effective=self.frame_counts[cid]/elapsed if cid in self.last_telemetry else 0
-   await self.post(f'/api/cameras/{cid}/telemetry',{'status':'online' if ok else 'offline','fps':effective,'latency_ms':latency}); self.last_telemetry[cid]=now; self.frame_counts[cid]=0
-  if ok: self.last_error.pop(cid,None)
-  if ok and now-self.last_snapshot.get(cid,0)>5:
+   try: await self.post(f'/api/cameras/{cid}/telemetry',{'status':status,'fps':effective,'latency_ms':latency})
+   except (RuntimeError,OSError,ValueError): pass
+   self.last_telemetry[cid]=now; self.frame_counts[cid]=0
+  if fail>0 or self.model is None: return
+  if now-self.last_snapshot.get(cid,0)>5:
    height,width=image.shape[:2]
    if width>960: image=cv2.resize(image,(960,int(height*960/width)))
    encoded_ok,encoded=cv2.imencode('.jpg',image,[cv2.IMWRITE_JPEG_QUALITY,75])
-   if encoded_ok: await self.post(f'/api/cameras/{cid}/snapshot',{'jpeg_base64':base64.b64encode(encoded).decode(),'captured_at':datetime.now(timezone.utc).isoformat()}); self.last_snapshot[cid]=now
-  if not ok or self.model is None: return
+   if encoded_ok:
+    try: await self.post(f'/api/cameras/{cid}/snapshot',{'jpeg_base64':base64.b64encode(encoded).decode(),'captured_at':datetime.now(timezone.utc).isoformat()})
+    except (RuntimeError,OSError,ValueError): pass
+   self.last_snapshot[cid]=now
   result=(await asyncio.to_thread(self.model.predict,image,conf=CONF,device=DEVICE,verbose=False))[0]; detections=[]; stamp=datetime.now(timezone.utc).isoformat()
   for index,(xyxy,cls,score) in enumerate(zip(result.boxes.xyxy.cpu().tolist(),result.boxes.cls.cpu().tolist(),result.boxes.conf.cpu().tolist())):
    label=str(self.model.names[int(cls)])
