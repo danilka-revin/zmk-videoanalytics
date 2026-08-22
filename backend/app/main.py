@@ -29,6 +29,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
+APP_VERSION = "2.4.0"
 TZ = timezone(timedelta(hours=7))
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
@@ -42,6 +43,8 @@ _training_tasks: dict[int,asyncio.Task] = {}
 MESSENGER_PROVIDER = os.getenv("MESSENGER_PROVIDER", "none").lower()
 if MESSENGER_PROVIDER not in {"none", "telegram", "max"}: MESSENGER_PROVIDER = "none"
 TRAINING_WORKER_URL = os.getenv("TRAINING_WORKER_URL", "").rstrip("/")
+UPDATE_SERVICE_URL = os.getenv("UPDATE_SERVICE_URL", "").rstrip("/")
+UPDATE_TOKEN = os.getenv("ZMK_UPDATE_TOKEN", "").strip()
 SEED_TEST_DATA = os.getenv("ZMK_SEED_TEST_DATA", "false").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_ROLES = {**{int(x):"viewer" for x in os.getenv("TELEGRAM_VIEWER_IDS","").split(",") if x.strip().isdigit()},**{int(x):"operator" for x in os.getenv("TELEGRAM_OPERATOR_IDS","").split(",") if x.strip().isdigit()},**{int(x):"admin" for x in os.getenv("TELEGRAM_ADMIN_IDS","").split(",") if x.strip().isdigit()}}
@@ -126,7 +129,7 @@ async def lifespan(app: FastAPI):
         for task in list(_training_tasks.values()): task.cancel()
         if _training_tasks: await asyncio.gather(*list(_training_tasks.values()),return_exceptions=True)
 
-app=FastAPI(title="ZMK Vision API",version="2.3.0",description="On-premise API контура видеоаналитики",lifespan=lifespan)
+app=FastAPI(title="ZMK Vision API",version=APP_VERSION,description="On-premise API контура видеоаналитики",lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:5173").split(",") if x.strip()],allow_credentials=False,allow_methods=["GET","POST","PUT","PATCH","DELETE"],allow_headers=["Content-Type","X-API-Key","X-Telegram-Init-Data"])
 
 def custom_openapi():
@@ -286,6 +289,40 @@ class TrainingIn(BaseModel):
 def rows(query,args=()):
     con=db(); result=[dict(r) for r in con.execute(query,args).fetchall()]; con.close(); return result
 
+def update_headers() -> dict[str,str]:
+    headers = {}
+    if UPDATE_TOKEN: headers["X-Update-Token"] = UPDATE_TOKEN
+    return headers
+
+def _updater_status() -> dict[str,Any]:
+    if not UPDATE_SERVICE_URL:
+        return {"available": False, "current":APP_VERSION, "latest":"", "update_available":False, "reason":"updater service not configured"}
+    try:
+        response = httpx.get(f"{UPDATE_SERVICE_URL}/status", headers=update_headers(), timeout=5)
+        response.raise_for_status()
+        data = response.json()
+        data["available"] = True
+        return data
+    except httpx.HTTPError as exc:
+        return {"available": False, "current":APP_VERSION, "latest":"", "update_available":False, "reason":f"updater unreachable: {type(exc).__name__}"}
+
+@app.get("/api/update/status")
+def update_status():
+    return _updater_status()
+
+@app.post("/api/update/apply")
+def update_apply():
+    if not UPDATE_SERVICE_URL:
+        return {"status":"unavailable","message":"Сервис обновления не подключён. Запустите стенд командой ./start.sh (Linux) или .\\start.ps1 (Windows), после чего кнопка станет активной."}
+    try:
+        response = httpx.post(f"{UPDATE_SERVICE_URL}/apply", headers=update_headers(), timeout=120)
+        if response.status_code == 400:
+            return {"status":"error","message":response.json().get("detail","failed")}
+        response.raise_for_status()
+        return response.json()
+    except httpx.HTTPError as exc:
+        return {"status":"error","message":f"Не удалось запустить обновление: {type(exc).__name__}"}
+
 @app.get("/api/capabilities")
 def capabilities():
     worker={"configured":bool(TRAINING_WORKER_URL),"reachable":False,"gpu":False}
@@ -293,10 +330,10 @@ def capabilities():
         try:
             response=httpx.get(f"{TRAINING_WORKER_URL}/health",timeout=2); response.raise_for_status(); data=response.json(); worker.update({"reachable":True,"gpu":bool(data.get("gpu")),"device":data.get("device","cpu")})
         except httpx.HTTPError: pass
-    return {"demo_mode":SEED_TEST_DATA,"training_worker":worker["reachable"],"training":worker,"external_inference_gateway":True,"camera_crud":True,"diagnostics":True,"search":True}
+    return {"demo_mode":SEED_TEST_DATA,"training_worker":worker["reachable"],"training":worker,"external_inference_gateway":True,"camera_crud":True,"diagnostics":True,"search":True,"update_service":bool(UPDATE_SERVICE_URL)}
 
 @app.get("/api/health")
-def health(): return {"status":"ok","version":"2.3.0","uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
+def health(): return {"status":"ok","version":APP_VERSION,"uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
 
 @app.get("/api/dashboard")
 def dashboard():

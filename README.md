@@ -6,7 +6,7 @@
 
 > Впервые работаете с Docker и серверными приложениями? Откройте **[подробную инструкцию для начинающих](docs/BEGINNER_GUIDE_RU.md)** — в ней пошагово разобраны Windows, Linux, Telegram, MAX, камеры, безопасность, обновление и типовые ошибки.
 
-![Version](https://img.shields.io/badge/version-2.3.0-25332d)
+![Version](https://img.shields.io/badge/version-2.4.0-25332d)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688)
 ![React](https://img.shields.io/badge/React-TypeScript-61dafb)
@@ -137,6 +137,14 @@ ZMK_NO_AUTO_UPDATE=1 ./start.sh
 $env:ZMK_NO_AUTO_UPDATE = "1"; .\start.ps1
 ```
 
+### Кнопка «Обновить» в панели
+
+С `v2.4.0` в шапке панели есть кнопки **проверки обновления** и **«Обновить до последней версии»**. Они работают через сервис `updater`, который монтирует каталог проекта на хосте и Docker-сокет, поэтому обновление действительно применяется: скачивается архив, сверяется SHA256, новые файлы накладываются на место (сохраняя `.env`, `./data`, базы и профили) и стек пересобирается. Существующие данные и настройки не затрагиваются.
+
+Если сервис `updater` не запущен (например, стенд поднят вручную без него), кнопка честно сообщает, что обновление недоступно, и не выдаёт ложного успеха.
+
+Панельные кнопки проверяют версию через `GET /api/update/status` и запускают обновление через `POST /api/update/apply`.
+
 ## Запуск с Telegram-ботом
 
 1. Создайте бота через `@BotFather`.
@@ -233,6 +241,8 @@ Web Admin ── Telegram/MAX Bot ── Mini App ── СКУД Webhook
 | `GET` | `/api/diagnostics` | Диагностика системы и всех камер |
 | `GET` | `/api/search` | Глобальный поиск |
 | `GET` | `/api/capabilities` | Подключённые возможности и workers |
+| `GET` | `/api/update/status` | Текущая и последняя версия, наличие обновления |
+| `POST` | `/api/update/apply` | Применить обновление через сервис `updater` |
 | `GET` | `/api/events` | Журнал событий |
 | `POST` | `/api/events/{id}/ack` | Подтверждение события |
 | `GET` | `/api/models` | Реестр моделей |
@@ -312,7 +322,8 @@ backend/                 FastAPI, SQLite, события, модели и отч
 frontend/                React/TypeScript Web UI и Telegram Mini App
 services/telegram_bot/   Telegram-бот и push-оповещения
 services/max_bot/        MAX-бот и push-оповещения
-installers/              Установщики Windows и Linux
+services/updater/        Сервис самостоятельного обновления из панели
+installers/              Установщики и автообновление Windows и Linux
 docs/                    Архитектура и контракты
 docker-compose.yml       Локальная и production-конфигурация
 .github/workflows/       CI и автоматическая публикация релизов
@@ -320,7 +331,7 @@ docker-compose.yml       Локальная и production-конфигураци
 
 ## Статус
 
-Версия `2.3.0` является рабочим интеграционным контуром без витринных данных. Web-панель, REST API, camera CRUD, диагностика, поиск, отчёты, Telegram/MAX и внешний inference gateway работают локально. Для распознавания подключите RTSP ingestion worker и зарегистрируйте реальный артефакт модели. Обучение включается Compose-профилем `training` и требует NVIDIA Driver/Container Toolkit; без доступной CUDA кнопка запуска остаётся недоступной.
+Версия `2.4.0` является рабочим интеграционным контуром без витринных данных. Web-панель, REST API, camera CRUD, диагностика, поиск, отчёты, Telegram/MAX и внешний inference gateway работают локально. Для распознавания подключите RTSP ingestion worker и зарегистрируйте реальный артефакт модели. Обучение включается Compose-профилем `training` и требует NVIDIA Driver/Container Toolkit; без доступной CUDA кнопка запуска остаётся недоступной.
 
 ## Защита API и эксплуатационная безопасность
 

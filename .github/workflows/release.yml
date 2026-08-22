@@ -20,7 +20,7 @@ jobs:
       - uses: actions/setup-python@v6
         with: {python-version: '3.12'}
       - run: pip install -r backend/requirements-dev.txt -r services/telegram_bot/requirements.txt -r services/max_bot/requirements.txt
-      - run: pip-audit -r backend/requirements.txt -r services/telegram_bot/requirements.txt -r services/max_bot/requirements.txt
+      - run: pip-audit -r backend/requirements.txt -r services/telegram_bot/requirements.txt -r services/max_bot/requirements.txt -r services/updater/requirements.txt
       - run: ruff check backend services tests
       - run: bandit -r backend/app services -x services/telegram_bot/test_helpers.py,services/max_bot/test_helpers.py -q
       - run: PYTHONPATH=backend pytest backend/tests -q

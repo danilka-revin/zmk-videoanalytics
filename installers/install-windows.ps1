@@ -122,6 +122,8 @@ if ($inference -match '^(y|Y|true|1)$') {
   Set-DotEnvValue "ZMK_WORKER_TOKEN" $workerToken
   $ComposeProfile += @("--profile", "inference")
 }
+if (-not $env:ZMK_UPDATE_TOKEN) { Set-DotEnvValue "ZMK_UPDATE_TOKEN" ([guid]::NewGuid().ToString('N')) }
+Set-DotEnvValue "UPDATE_SERVICE_URL" "http://updater:8020"
 # Remember chosen profiles so start.ps1 can restart identically.
 [IO.File]::WriteAllLines((Join-Path $Root '.zmk-profiles'), [string[]]$ComposeProfile, ([Text.UTF8Encoding]::new($false)))
 

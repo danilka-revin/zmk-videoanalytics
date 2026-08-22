@@ -102,6 +102,11 @@ if [[ "$INFERENCE" =~ ^([yY]|true|1)$ ]]; then
   set_env ZMK_WORKER_TOKEN "$TOKEN_VALUE"
   PROFILE+=(--profile inference)
 fi
+# In-app updater behaves as a first-class service: protect its endpoints.
+if [[ -z "${ZMK_UPDATE_TOKEN:-}" ]]; then
+  set_env ZMK_UPDATE_TOKEN "$(tr -d '-' </proc/sys/kernel/random/uuid)"
+fi
+set_env UPDATE_SERVICE_URL "http://updater:8020"
 if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -qi nvidia; then
   export COMPOSE_FILE="docker-compose.yml:docker-compose.gpu.yml"
   echo "NVIDIA Container Runtime найден: workers получат GPU"

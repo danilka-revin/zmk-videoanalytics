@@ -17,3 +17,8 @@ html[data-theme=dark] .statusline{background:#172a20;border-color:#31513d;color:
 html[data-theme=dark] .trainer-head select,html[data-theme=dark] .error-report select{background:var(--surface-2);color:var(--text);border-color:var(--line)}html[data-theme=dark] .notice{background:#312b1b;border-color:#584b27;color:#e9c66e}html[data-theme=dark] .jobstatus{background:#302b1f;color:#e9c66e}html[data-theme=dark] .logsummary .warn,html[data-theme=dark] .level.warning{background:#302b1f;color:#e9c66e}html[data-theme=dark] .role.admin{background:#302b1f;color:#e9c66e}html[data-theme=dark] .mi.amber{background:#302b1f;color:#e9c66e}
 .training-options{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;padding:12px 20px;border-top:1px solid var(--line)}.training-options label{font-size:8px;color:var(--muted)}.training-options input{display:block;width:100%;margin-top:4px;padding:7px;border:1px solid var(--line);border-radius:6px;background:var(--surface-2);color:var(--text)}
 .camera-snapshot{width:100%;height:100%;object-fit:cover;display:block}.feed:has(.camera-snapshot){background:#050907}.feed:has(.camera-snapshot)>b{background:#0a100dcc;padding:3px 5px;border-radius:4px}
+.upbtn{position:relative}
+.upbtn.has-update{color:var(--accent)}
+.upbtn.has-update i{position:absolute;top:5px;right:5px;width:7px;height:7px;border-radius:50%;background:#e0a93e;box-shadow:0 0 0 3px var(--surface)}
+.updater{background:#17251f;color:var(--accent);border-color:#17251f;font-weight:600}
+.updater:disabled{opacity:.6;cursor:default}
