@@ -6,7 +6,7 @@
 
 > Впервые работаете с Docker и серверными приложениями? Откройте **[подробную инструкцию для начинающих](docs/BEGINNER_GUIDE_RU.md)** — в ней пошагово разобраны Windows, Linux, Telegram, MAX, камеры, безопасность, обновление и типовые ошибки.
 
-![Version](https://img.shields.io/badge/version-2.6.0-25332d)
+![Version](https://img.shields.io/badge/version-2.7.0-25332d)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688)
 ![React](https://img.shields.io/badge/React-TypeScript-61dafb)
@@ -265,7 +265,7 @@ Web Admin ── Telegram/MAX Bot ── Mini App ── СКУД Webhook
 | `GET` | `/api/models` | Реестр моделей |
 | `POST` | `/api/models/{name}/activate` | Атомарный hot-swap |
 | `GET/POST` | `/api/training/jobs` | Задачи автодообучения (source: `camera`/`dataset`) |
-| `GET/POST/DELETE` | `/api/datasets` | Загрузка, список и удаление YOLO-датасетов |
+| `GET/POST/DELETE` | `/api/datasets` | Загрузка/список/удаление фото-, видео- или YOLO-датасетов |
 | `GET/PUT` | `/api/admin/config` | Конфигурация платформы |
 | `GET/POST` | `/api/admin/users` | Пользователи и роли |
 | `GET` | `/api/reports/errors` | Отчёт по ошибкам |
@@ -291,7 +291,13 @@ docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile trainin
 
 ### Обучение на готовом датасете
 
-Помимо кадров с камеры, можно обучить модель на **загруженном YOLO-датасете** (`.zip` с `data.yaml`, `images/` и `labels/`). На вкладке **Модели** переключите источник на **«Готовый датасет»**, загрузите архив, выберите его и нажмите «Запустить». Worker обучит YOLO на вашем датасете без захвата кадров и псевдоразметки. API: `POST /api/datasets`, `GET /api/datasets`, `DELETE /api/datasets/{id}`, параметр `source=dataset` у `POST /api/training/jobs`. Загруженные данные хранятся в volume `dataset-data`, общем для API и training worker.
+Помимо кадров с камеры, можно обучить модель на **загруженном архиве**. Тип определяется автоматически:
+
+- **Папка фоток** (`.jpg/.png/.webp/...`) — worker авторазмечает каждое фото активной моделью (или YOLO11n) и обучает.
+- **Пачка видео** (`.mp4/.avi/.mov/.mkv/...`) — worker нарезает кадры, авторазмечает и обучает.
+- **YOLO-датасет** (`data.yaml` + `images/` + `labels/`) — обучение без авторазметки.
+
+На вкладке **Модели** переключите источник на **«Готовый датасет»**, загрузите `.zip`, выберите его и нажмите «Запустить». API: `POST /api/datasets`, `GET /api/datasets`, `DELETE /api/datasets/{id}`, параметр `source=dataset` (+ `dataset_kind: yolo|images|videos`) у `POST /api/training/jobs`. Данные хранятся в volume `dataset-data`, общем для API и training worker.
 
 ## Production-профиль
 
@@ -353,7 +359,7 @@ docker-compose.yml       Локальная и production-конфигураци
 
 ## Статус
 
-Версия `2.6.0` является рабочим интеграционным контуром без витринных данных. Web-панель, REST API, camera CRUD, диагностика, поиск, отчёты, Telegram/MAX и внешний inference gateway работают локально. Для распознавания подключите RTSP ingestion worker и зарегистрируйте реальный артефакт модели. Обучение включается Compose-профилем `training` и требует NVIDIA Driver/Container Toolkit; без доступной CUDA кнопка запуска остаётся недоступной.
+Версия `2.7.0` является рабочим интеграционным контуром без витринных данных. Web-панель, REST API, camera CRUD, диагностика, поиск, отчёты, Telegram/MAX и внешний inference gateway работают локально. Для распознавания подключите RTSP ingestion worker и зарегистрируйте реальный артефакт модели. Обучение включается Compose-профилем `training` и требует NVIDIA Driver/Container Toolkit; без доступной CUDA кнопка запуска остаётся недоступной.
 
 ## Защита API и эксплуатационная безопасность
 

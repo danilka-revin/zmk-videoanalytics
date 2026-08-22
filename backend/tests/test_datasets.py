@@ -11,6 +11,22 @@ from app import main
 from fastapi.testclient import TestClient
 
 
+def _make_zip(entries: dict[str, bytes]) -> bytes:
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for path, data in entries.items():
+            zf.writestr(path, data)
+    return buf.getvalue()
+
+
+def make_photos_zip() -> bytes:
+    return _make_zip({f"photos/img_{i}.jpg": b"photo" for i in range(15)})
+
+
+def make_videos_zip() -> bytes:
+    return _make_zip({f"videos/clip_{i}.mp4": b"video-bytes" for i in range(3)})
+
+
 def _make_dataset_zip() -> bytes:
     """Build a minimal valid YOLO detection dataset archive."""
     buf = io.BytesIO()
@@ -69,3 +85,36 @@ def test_dataset_job_creation_uses_dataset_source(dataset_dir):
         job = c.get(f"/api/training/jobs/{body['id']}").json()
         assert job["source"] == "dataset"
         assert job["dataset_name"] == "SafeDS"
+
+
+def test_upload_plain_photos_auto_detects_images_kind(dataset_dir):
+    with TestClient(main.app) as c:
+        r = c.post("/api/datasets?name=MyPhotos", content=make_photos_zip(),
+                   headers={"Content-Type": "application/zip"})
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["kind"] == "images"
+        assert body["image_count"] == 15
+        assert body["class_count"] == 0  # no labels; worker auto-labels
+
+
+def test_upload_videos_auto_detects_videos_kind(dataset_dir):
+    with TestClient(main.app) as c:
+        r = c.post("/api/datasets?name=MyVideos", content=make_videos_zip(),
+                   headers={"Content-Type": "application/zip"})
+        assert r.status_code == 201, r.text
+        body = r.json()
+        assert body["kind"] == "videos"
+        assert body["media_count"] == 3
+        assert body["class_count"] == 0
+
+
+def test_images_kind_job_routes_to_dataset_source(dataset_dir):
+    with TestClient(main.app) as c:
+        c.post("/api/datasets?name=PhotoDS", content=make_photos_zip(),
+               headers={"Content-Type": "application/zip"})
+        r = c.post("/api/training/jobs", json={
+            "camera_id": "", "source": "dataset", "dataset_name": "PhotoDS", "epochs": 5,
+        })
+        assert r.status_code == 202, r.text
+        assert r.json()["dataset_kind"] == "images"

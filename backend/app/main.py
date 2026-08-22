@@ -33,7 +33,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-APP_VERSION = "2.6.0"
+APP_VERSION = "2.7.0"
 TZ = timezone(timedelta(hours=7))
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
@@ -96,7 +96,10 @@ def init_db():
     training_columns={r[1] for r in con.execute("PRAGMA table_info(training_jobs)").fetchall()}
     for column,ddl in {"batch":"INTEGER NOT NULL DEFAULT 8","imgsz":"INTEGER NOT NULL DEFAULT 640","patience":"INTEGER NOT NULL DEFAULT 20","confidence":"REAL NOT NULL DEFAULT .35","val_split":"REAL NOT NULL DEFAULT .2","capture_fps":"REAL NOT NULL DEFAULT 2","source":"TEXT NOT NULL DEFAULT 'camera'","dataset_name":"TEXT NOT NULL DEFAULT ''"}.items():
         if column not in training_columns: con.execute(f"ALTER TABLE training_jobs ADD COLUMN {column} {ddl}")
-    con.execute("CREATE TABLE IF NOT EXISTS datasets(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL, image_count INTEGER NOT NULL DEFAULT 0, class_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL)")
+    con.execute("CREATE TABLE IF NOT EXISTS datasets(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL, image_count INTEGER NOT NULL DEFAULT 0, class_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'yolo', media_count INTEGER NOT NULL DEFAULT 0, label_count INTEGER NOT NULL DEFAULT 0)")
+    dataset_columns={r[1] for r in con.execute("PRAGMA table_info(datasets)").fetchall()}
+    for column,ddl in {"kind":"TEXT NOT NULL DEFAULT 'yolo'","media_count":"INTEGER NOT NULL DEFAULT 0","label_count":"INTEGER NOT NULL DEFAULT 0"}.items():
+        if column not in dataset_columns: con.execute(f"ALTER TABLE datasets ADD COLUMN {column} {ddl}")
     event_columns={r[1] for r in con.execute("PRAGMA table_info(events)").fetchall()}
     if "external_id" not in event_columns: con.execute("ALTER TABLE events ADD COLUMN external_id TEXT")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_events_external_id ON events(external_id) WHERE external_id IS NOT NULL")
@@ -631,6 +634,7 @@ def activate(name:str):
     con.commit(); con.close(); return {"active_model":name,"previous_model":old,"hot_swap":True,"idempotent":False,"control_plane_switch_ms":round((time.perf_counter()-started)*1000,2),"downtime_ms":0}
 
 IMAGE_EXTS={".jpg",".jpeg",".png",".bmp",".webp",".tif",".tiff"}
+VIDEO_EXTS={".mp4",".avi",".mov",".mkv",".m4v",".webm",".mpg",".mpeg",".wmv"}
 def _slugify(name:str) -> str:
     keep="abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-."
     return "".join(ch if ch in keep else "_" for ch in name).strip("._") or "dataset"
@@ -642,24 +646,48 @@ def _find_dataset_yaml(root:Path) -> Path|None:
             if (sub/"data.yaml").is_file(): return sub/"data.yaml"
             if (sub/"dataset.yaml").is_file(): return sub/"dataset.yaml"
     return None
+def _count_ext(root:Path,exts:set[str]) -> int:
+    return sum(1 for p in root.rglob("*") if p.is_file() and p.suffix.lower() in exts)
+
+def _find_media_root(root:Path) -> Path:
+    """If the zip unpacked to a single wrapper dir, descend into it."""
+    if any(p.is_dir() for p in root.iterdir()) and not any(p.is_file() for p in root.iterdir()):
+        subs=[p for p in root.iterdir() if p.is_dir()]
+        if len(subs)==1: return subs[0]
+    return root
+
 def _inspect_dataset(root:Path) -> dict:
-    """Validate a YOLO detection dataset dir; raise if unusable."""
-    data_yaml=_find_dataset_yaml(root)
-    if data_yaml is None: raise ValueError("В архиве нет data.yaml (ожидался YOLO-формат)")
-    try: cfg=yaml.safe_load(data_yaml.read_text(encoding="utf-8")) or {}
-    except yaml.YAMLError as exc: raise ValueError(f"Некорректный data.yaml: {exc}") from exc
-    names=cfg.get("names")
-    if not names: raise ValueError("В data.yaml отсутствует список классов 'names'")
-    class_count=len(names) if isinstance(names,(list,dict)) else 0
-    base=data_yaml.parent; images=0; labels=0
-    for p in base.rglob("*"):
-        if p.is_file() and p.suffix.lower() in IMAGE_EXTS: images+=1
-        if p.is_file() and p.suffix.lower()==".txt": labels+=1
-    if images<10: raise ValueError(f"В датасете только {images} изображений (нужно минимум 10)")
-    return {"root":base,"data_yaml":data_yaml,"names":names,"class_count":class_count,"image_count":images,"label_count":labels,"val_split":bool(cfg.get("val"))}
+    """Auto-detect and validate an uploaded dataset bundle and its kind.
+
+    Kinds:
+      yolo   - data.yaml + images/ + labels/ (fully labelled dataset)
+      images - a plain pack of photos (auto-labelled by the training worker)
+      videos - a pack of video files (frames auto-extracted + auto-labelled)
+    Returns a dict with the staging root and media stats; raises ValueError
+    if the bundle is not usable.
+    """
+    base=_find_media_root(root)
+    data_yaml=_find_dataset_yaml(base)
+    images=_count_ext(base,IMAGE_EXTS)
+    videos=_count_ext(base,VIDEO_EXTS)
+    labels=_count_ext(base,{".txt"})
+    if data_yaml is not None and (base/"images").exists():
+        try: cfg=yaml.safe_load(data_yaml.read_text(encoding="utf-8")) or {}
+        except yaml.YAMLError as exc: raise ValueError(f"Некорректный data.yaml: {exc}") from exc
+        names=cfg.get("names")
+        if not names: raise ValueError("В data.yaml отсутствует список классов 'names'")
+        class_count=len(names) if isinstance(names,(list,dict)) else 0
+        if images<10: raise ValueError(f"В датасете только {images} изображений (нужно минимум 10)")
+        return {"root":base,"data_yaml":data_yaml,"names":names,"class_count":class_count,"image_count":images,"label_count":labels,"val_split":bool(cfg.get("val")),"kind":"yolo"}
+    if videos>0:
+        return {"root":base,"data_yaml":None,"names":None,"class_count":0,"image_count":0,"label_count":0,"val_split":False,"kind":"videos","media_count":videos}
+    if images>=10:
+        return {"root":base,"data_yaml":None,"names":None,"class_count":0,"image_count":images,"label_count":0,"val_split":False,"kind":"images","media_count":images}
+    if images<10 and images>0: raise ValueError(f"Слишком мало изображений ({images}), нужно минимум 10")
+    raise ValueError("Архив должен содержать картинки (.jpg/.png/...), видео (.mp4/...) или YOLO-датасет с data.yaml")
 @app.get("/api/datasets")
 def list_datasets():
-    data=rows("SELECT id,name,image_count,class_count,created_at FROM datasets ORDER BY id DESC")
+    data=rows("SELECT id,name,image_count,class_count,media_count,label_count,kind,created_at FROM datasets ORDER BY id DESC")
     for item in data:
         item["path"]=str(DATASET_DIR/item["name"]); item["exists"]=Path(item["path"]).is_dir()
     return data
@@ -711,8 +739,9 @@ def upload_dataset(name:str=Query(min_length=2,max_length=120),payload:bytes=Bod
         target=DATASET_DIR/safe; DATASET_DIR.mkdir(parents=True,exist_ok=True)
         if target.exists(): shutil.rmtree(target)
         shutil.copytree(inspected["root"],target)
-        con=db(); cur=con.execute("INSERT INTO datasets(name,path,image_count,class_count,created_at) VALUES(?,?,?,?,?)",(safe,str(target),inspected["image_count"],inspected["class_count"],now_iso())); con.commit(); ds_id=cur.lastrowid; con.close()
-        return {"id":ds_id,"name":safe,"image_count":inspected["image_count"],"class_count":inspected["class_count"],"label_count":inspected["label_count"],"val_split":inspected["val_split"]}
+        media=inspected.get("media_count",inspected["image_count"])
+        con=db(); cur=con.execute("INSERT INTO datasets(name,path,image_count,class_count,created_at,kind,media_count,label_count) VALUES(?,?,?,?,?,?,?,?)",(safe,str(target),inspected["image_count"],inspected["class_count"],now_iso(),inspected["kind"],media,inspected["label_count"])); con.commit(); ds_id=cur.lastrowid; con.close()
+        return {"id":ds_id,"name":safe,"image_count":inspected["image_count"],"class_count":inspected["class_count"],"label_count":inspected["label_count"],"media_count":media,"kind":inspected["kind"],"val_split":inspected["val_split"]}
     finally:
         shutil.rmtree(workdir,ignore_errors=True)
 @app.delete("/api/datasets/{dataset_id}")
@@ -733,10 +762,12 @@ async def run_training(job_id:int):
 async def start_training(payload:TrainingIn):
     if not SEED_TEST_DATA and not TRAINING_WORKER_URL: raise HTTPException(503,"Сервис обучения не подключён. Запустите Compose profile training")
     con=db(); cam=None; rtsp=""
+    dataset_kind="yolo"
     if payload.source=="dataset":
-        ds=con.execute("SELECT name,path FROM datasets WHERE name=?",(payload.dataset_name or "",)).fetchone()
+        ds=con.execute("SELECT name,path,kind FROM datasets WHERE name=?",(payload.dataset_name or "",)).fetchone()
         if not ds: con.close(); raise HTTPException(404,"Датасет не найден. Загрузите его на вкладке Модели")
         if not Path(ds[1]).is_dir(): con.close(); raise HTTPException(503,"Файлы датасета не найдены на диске")
+        dataset_kind=ds[2] or "yolo"
     else:
         cam=con.execute("SELECT status,rtsp_url,fps_limit FROM cameras WHERE id=?",(payload.camera_id,)).fetchone()
         if not cam: con.close(); raise HTTPException(404,"Камера не найдена")
@@ -761,14 +792,14 @@ async def start_training(payload:TrainingIn):
         model=rows("SELECT artifact_uri FROM model_registry WHERE name=?",(active,))
         if payload.source=="dataset":
             dataset_path=(DATASET_DIR/dataset_name)
-            request={"id":jid,"source":"dataset","dataset_path":str(dataset_path),"target_name":target,"base_artifact":model[0]["artifact_uri"] if model else None,"image_count":payload.image_count,"epochs":payload.epochs,"batch":payload.batch,"imgsz":payload.imgsz,"patience":payload.patience,"confidence":payload.confidence,"val_split":payload.val_split}
+            request={"id":jid,"source":"dataset","dataset_path":str(dataset_path),"dataset_kind":dataset_kind,"target_name":target,"base_artifact":model[0]["artifact_uri"] if model else None,"image_count":payload.image_count,"epochs":payload.epochs,"batch":payload.batch,"imgsz":payload.imgsz,"patience":payload.patience,"confidence":payload.confidence,"val_split":payload.val_split}
         else:
             request={"id":jid,"source":"camera","camera_id":payload.camera_id,"rtsp_url":rtsp,"target_name":target,"base_artifact":model[0]["artifact_uri"] if model else None,"image_count":payload.image_count,"epochs":payload.epochs,"fps_limit":min(float(cam[2]),payload.capture_fps),"batch":payload.batch,"imgsz":payload.imgsz,"patience":payload.patience,"confidence":payload.confidence,"val_split":payload.val_split}
         try:
             async with httpx.AsyncClient(timeout=15) as client: response=await client.post(f"{TRAINING_WORKER_URL}/jobs",json=request); response.raise_for_status()
         except httpx.HTTPError as exc:
             con=db(); con.execute("UPDATE training_jobs SET status='failed',stage='Worker недоступен',error=?,updated_at=? WHERE id=?",(str(exc)[:500],now_iso(),jid)); con.commit(); con.close(); raise HTTPException(503,"Training worker недоступен")
-    return {"id":jid,"status":"queued","target_name":target,"mode":"dataset" if payload.source=="dataset" else "pseudo-label fine-tuning","source":payload.source}
+    return {"id":jid,"status":"queued","target_name":target,"mode":"dataset" if payload.source=="dataset" else "pseudo-label fine-tuning","source":payload.source,"dataset_kind":dataset_kind if payload.source=="dataset" else None}
 
 @app.put("/api/training/jobs/{job_id}/progress")
 def training_progress(job_id:int,payload:TrainingProgress):
