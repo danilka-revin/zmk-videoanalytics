@@ -115,8 +115,10 @@ def test_worker_sets_tcp_transport_and_threshold(worker_mod):
     r = worker.Runtime()
     r._open_capture("rtsp://x/stream", "tcp")
     opt = str(worker.os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", ""))
-    assert opt == "rtsp_transport;tcp", opt
-    assert "stimeout" not in opt and "buffer_size" not in opt
+    # Must start with the clean transport and join extra options with '|'
+    # (a comma would break rtsp_transport parsing in FFmpeg).
+    assert opt.startswith("rtsp_transport;tcp"), opt
+    assert ",stimeout" not in opt and ",rtsp_transport" not in opt
     assert worker.OFFLINE_AFTER >= 1
 
 

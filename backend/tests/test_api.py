@@ -40,3 +40,14 @@ def test_camera_edit_preserves_rtsp_url_and_never_leaks_it():
         item2=next(x for x in c.get('/api/cameras').json() if x['id']==cid)
         assert bool(item2.get('configured')) is True
         assert 'rtsp_url' not in item2 or item2.get('rtsp_url') in (None,'')
+
+
+def test_telemetry_accepts_recovering_status():
+    # The worker now reports 'recovering' (after transient read failures);
+    # previously this was rejected with 422 so the camera status never updated.
+    with TestClient(app) as c:
+        cid=c.post('/api/cameras',json={'name':'Rec','zone':'Z','rtsp_url':'rtsp://u:p@h/s','fps_limit':8}).json()['id']
+        r=c.post(f'/api/cameras/{cid}/telemetry',json={'status':'recovering','fps':2,'latency_ms':40})
+        assert r.status_code==200, r.text
+        item=next(x for x in c.get('/api/cameras').json() if x['id']==cid)
+        assert item['status']=='recovering'

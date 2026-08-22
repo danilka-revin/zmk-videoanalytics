@@ -35,7 +35,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-APP_VERSION = "2.11.3"
+APP_VERSION = "2.11.4"
 TZ = timezone(timedelta(hours=7))
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
@@ -312,7 +312,7 @@ class CameraUpdate(BaseModel):
         if value and not value.startswith(("rtsp://","rtsps://")): raise ValueError("Требуется RTSP(S) URL")
         return value
 class CameraTelemetry(BaseModel):
-    status:Literal["online","offline","error","unknown"]
+    status:Literal["online","offline","error","unknown","recovering"]
     fps:float=Field(default=0,ge=0,le=240)
     latency_ms:int=Field(default=0,ge=0,le=120000)
 class CameraSnapshotIn(BaseModel):

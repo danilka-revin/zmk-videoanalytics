@@ -33,6 +33,9 @@ if RTSP_TRANSPORT not in ('auto','tcp','udp'): RTSP_TRANSPORT='auto'
 TRANSPORT_ORDER=['tcp','udp'] if RTSP_TRANSPORT=='auto' else [RTSP_TRANSPORT]
 # Optional FFmpeg buffer size; only set if the operator explicitly asks.
 _RTSP_BUFSIZE=os.getenv('RTSP_BUFFER_SIZE','').strip()
+# Explicit RTSP socket timeout (ms) passed to FFmpeg. Prevents the default
+# ~30s "Stream timeout" stall in containers.
+_RTSP_STIMEOUT=int(os.getenv('RTSP_STIMEOUT','5000000'))
 OFFLINE_AFTER=int(os.getenv('OFFLINE_AFTER_FRAMES','3'))  # consecutive failed reads before "offline"
 RECONNECT_MIN=int(os.getenv('RTSP_RECONNECT_SECONDS','5'))
 EVENT_CLASSES={'no_helmet','no_vest','phone_usage','smoking','restricted_zone','immobility'}
@@ -77,16 +80,17 @@ class Runtime:
   self.transport[cid]=nxt
   return nxt
  def _open_capture(self,url,transport):
-  # IMPORTANT: the FFmpeg RTSP demuxer parses rtsp_transport as a bare value
-  # ('tcp' or 'udp'). Appending ',stimeout;...' or other keys here (we did)
-  # makes FFmpeg reject the whole option with "Invalid chars ... at the end of
-  # expression", so BOTH tcp and udp attempts fail and the camera never opens.
-  # Timeouts are already set via CAP_PROP_* below, so we only pass the
-  # transport. OpenCV reads options from this env var per open.
-  opts=f'rtsp_transport;{transport}'
+  # OpenCV reads OPENCV_FFMPEG_CAPTURE_OPTIONS as "key;value" pairs joined by
+  # '|' (NOT a comma). Using a comma (we once did) makes the RTSP demuxer
+  # reject rtsp_transport entirely ("Invalid chars ... at the end of
+  # expression"), so BOTH tcp/udp fail and the camera never opens.
+  # Correct form: 'rtsp_transport;tcp|stimeout;5000000[|buffer_size;N]'.
+  # stimeout gives the RTSP socket an explicit timeout, which avoids the
+  # default ~30s stall (Stream timeout) in containers.
+  parts=[f'rtsp_transport;{transport}',f'stimeout;{_RTSP_STIMEOUT}']
   if _RTSP_BUFSIZE:
-   opts+=f',buffer_size;{_RTSP_BUFSIZE}'
-  os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS']=opts
+   parts.append(f'buffer_size;{_RTSP_BUFSIZE}')
+  os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS']='|'.join(parts)
   cap=cv2.VideoCapture(url,cv2.CAP_FFMPEG)
   cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,8000)
   cap.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC,8000)

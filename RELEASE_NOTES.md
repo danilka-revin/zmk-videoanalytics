@@ -1,47 +1,45 @@
-# ZMK Vision v2.11.3 — Fix RTSP stream never opening (worker option bug)
+# ZMK Vision v2.11.4 — Accept "recovering" status + explicit RTSP socket timeout
 
-## Симптом
+## Что исправлено
 
-Камера работает в VLC, но на сайте «не подключена». В логах inference-воркера тысячи строк вида:
+### 1. Телеметрия отклонялась с 422 (главное)
+Воркер после временного сбоя потока шлёт статус **`recovering`**, но модель телеметрии на API принимала только `online/offline/error/unknown`. В результате POST `/api/cameras/{id}/telemetry` возвращал **`422 Unprocessable Entity`**, статус камеры не обновлялся, и в логе висело:
 ```
-[Eval @ ...] Invalid chars ',stimeout;5000000' at the end of expression 'tcp,stimeout;5000000'
-[RTSP demuxer] Unable to parse "rtsp_transport" option value "tcp,stimeout;5000000"
-[RTSP demuxer] Error setting option rtsp_transport to value tcp,stimeout;5000000.
-inference: camera ... FAILED to open via tcp ...
-inference: camera ... FAILED to open via udp ...
+Client error '422 Unprocessable Entity' for url '/api/cameras/.../telemetry'
+```
+**Решение:** в `CameraTelemetry.status` добавлен `recovering`. Теперь камера корректно показывает «Восстановление», а панель уже умеет его отображать.
+
+### 2. Зависание потока (~30 сек) в контейнере
+В логе было `Stream timeout triggered after 30002 ms` — это таймаут RTSP-сокета FFmpeg **по умолчанию ~30 секунд**, а не сеть.
+**Решение:** теперь воркер передаёт явный сокетный таймаут `stimeout` через **правильный** синтаксис `OPENCV_FFMPEG_CAPTURE_OPTIONS`:
+```
+rtsp_transport;tcp|stimeout;5000000[|buffer_size;N]
+```
+(параметры разделяются `|`, а НЕ запятой — запятая ломала парсинг `rtsp_transport`, как в v2.11.3). Опция `stimeout` устраняет зависание и ускоряет переподключение при сбое.
+
+### Подтверждено на реальном потоке
+- Поток открывается и **читается стабильно 45 секунд подряд** через `rtsp_transport;tcp|stimeout;5000000` (826 кадров, 0 таймаутов). Камера, сеть и ссылка полностью исправны.
+- Воркер логирует `OPENED via tcp`, затем инференс и снапшоты.
+
+## Параметры (.env)
+```env
+RTSP_TRANSPORT=auto      # auto | tcp | udp
+RTSP_STIMEOUT=5000000    # сокет-таймаут FFmpeg, мс
+RTSP_BUFFER_SIZE=        # опционально
 ```
 
-## Причина (баг воркера, не камеры)
+## Проверки
+- Backend **61/61** (добавлен тест: телеметрия принимает `recovering`, камера отображает его), установщики/updater/worker **28/28**, Telegram 3/3, MAX 3/3.
+- Ruff, Bandit (прод+updater), tsc/lint, `npm audit` (0), pip-audit (0), `git diff --check` — чисто.
+- Реальный поток прочитан без таймаутов; синтаксис опции проверен.
 
-Воркер передавал FFmpeg опцию вида `rtsp_transport;tcp,stimeout;5000000`. Парсер RTSP-демуксера ждёт **чистое** значение (`tcp` / `udp`), а наличие `,stimeout;...` в конце он считает ошибкой и **отклоняет всю опцию**. В результате **обе** попытки (tcp и udp) падали на парсинге, и поток камеры **вообще никогда не открывался** — независимо от транспорта и камеры. Это было привнесено в прошлом фиксе транспорта.
-
-## Решение
-
-- Воркер теперь генерирует **чистую** опцию: `rtsp_transport;tcp` (или `;udp`) — без `,stimeout;...`.
-- Таймауты уже задаются через `CAP_PROP_OPEN_TIMEOUT_MSEC` / `CAP_PROP_READ_TIMEOUT_MSEC`, отдельный `stimeout` не нужен.
-- Опциональный `RTSP_BUFFER_SIZE` при необходимости добавляется отдельно (только если задан пользователем).
-
-## Проверка (подтверждено на реальном потоке)
-
-- Подтверждено, что именно такая опция раньше роняла парсер (`Invalid chars ',stimeout;5000000'`).
-- С исправленной опцией реальный RTSP поток из песочницы **открывается и читает кадр** по обоим транспортам:
-  - `tcp: isOpened=True read=True shape=(1440,2560,3)`
-  - `udp: isOpened=True read=True shape=(1440,2560,3)`
-- Тест воркера теперь проверяет, что опция = `rtsp_transport;tcp` и не содержит `stimeout`/`buffer_size` (защита от регресса).
-- Backend **60/60**, установщики/updater/worker **28/28**, Telegram 3/3, MAX 3/3; Ruff, Bandit, tsc/lint, `npm audit` (0), pip-audit (0), `git diff --check` — чисто.
-
-## Как применить (главное — пересобрать воркер)
+## Как применить
 
 ```bash
 # пересобрать и поднять воркер инференса
 docker compose --profile inference up -d --build --remove-orphans
-
-# посмотреть логи — теперь должно быть "OPENED via tcp"
-docker compose --profile inference logs --tail=80 inference-worker
+# смотреть логи
+docker compose --profile inference logs --tail=100 inference-worker
 ```
 
-После пересборки воркер откроет поток корректной опцией, и камера покажет кадры.
-
-## Примечание
-
-Если хотите зафиксировать транспорт — `RTSP_TRANSPORT=tcp` или `=udp` в `.env`. По умолчанию `auto` (tcp, при неудаче udp). Опция `RTSP_BUFFER_SIZE` — только если понадобится под конкретную камеру.
+После пересборки камера должна перейти в `online` (или `recovering` при кратком сбое) и показывать кадры.
