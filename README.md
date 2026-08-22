@@ -6,7 +6,7 @@
 
 > Впервые работаете с Docker и серверными приложениями? Откройте **[подробную инструкцию для начинающих](docs/BEGINNER_GUIDE_RU.md)** — в ней пошагово разобраны Windows, Linux, Telegram, MAX, камеры, безопасность, обновление и типовые ошибки.
 
-![Version](https://img.shields.io/badge/version-2.10.2-25332d)
+![Version](https://img.shields.io/badge/version-2.11.0-25332d)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688)
 ![React](https://img.shields.io/badge/React-TypeScript-61dafb)
@@ -108,13 +108,37 @@ installers\install-windows.bat
 
 Установщик проверит Docker Desktop, создаст `.env`, предложит выбрать Telegram, MAX или запуск без бота и запустит систему.
 
-### Ubuntu / Debian
+### Ubuntu / Debian — запуск в один клик
+
+**Одна команда запускает всё:** при первом запуске откроется мастер настройки (выбор мессенджера — Telegram / MAX / «без бота», токены бота, включение inference/training воркеров), затем проект поднимется сам. Повторные запуски — без вопросов.
 
 ```bash
-bash installers/install-linux.sh
+./start.sh
 ```
 
-Скрипт проверит Docker и Compose, установит недостающие компоненты и запустит проект.
+или `bash start.sh`. Ещё проще — установите ярлык на рабочий стол и запускайте двойным кликом:
+
+```bash
+bash installers/create-desktop.sh
+```
+
+Дополнительно (всё то же самое, но по шагам):
+
+```bash
+# полная установка: зависимости + мастер + запуск
+bash installers/install-linux.sh
+
+# только мастер настройки (переспросить бота/воркеры)
+bash installers/install-linux.sh --setup
+
+# снова открыть мастер из start.sh
+./start.sh --setup
+
+# полностью неинтерактивно (нужны env-переменные)
+NONINTERACTIVE=1 MESSENGER_PROVIDER=none ENABLE_INFERENCE=true ./start.sh
+```
+
+Скрипт проверит Docker и Compose, при первом запуске спросит конфигурацию (мессенджер, воркеры, токены), сохранит её в `.env` и `.zmk-profiles`, и запустит проект.
 
 ### Автообновление
 
@@ -372,7 +396,7 @@ docker-compose.yml       Локальная и production-конфигураци
 
 ## Статус
 
-Версия `2.10.2` является рабочим интеграционным контуром без витринных данных. Web-панель, REST API, camera CRUD, диагностика, поиск, отчёты, Telegram/MAX и внешний inference gateway работают локально. Для распознавания подключите RTSP ingestion worker и зарегистрируйте реальный артефакт модели. Обучение включается Compose-профилем `training` и требует NVIDIA Driver/Container Toolkit; без доступной CUDA кнопка запуска остаётся недоступной.
+Версия `2.11.0` является рабочим интеграционным контуром без витринных данных. Web-панель, REST API, camera CRUD, диагностика, поиск, отчёты, Telegram/MAX и внешний inference gateway работают локально. Для распознавания подключите RTSP ingestion worker и зарегистрируйте реальный артефакт модели. Обучение включается Compose-профилем `training` и требует NVIDIA Driver/Container Toolkit; без доступной CUDA кнопка запуска остаётся недоступной.
 
 ## Защита API и эксплуатационная безопасность
 

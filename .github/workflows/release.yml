@@ -29,7 +29,7 @@ jobs:
       - run: pytest tests -q
       - name: Shell scripts syntax + installer dry check
         run: |
-          bash -n installers/*.sh installers/auto-update.sh start.sh
+          bash -n installers/*.sh installers/wizard.sh start.sh install.sh installers/create-desktop.sh
           bash installers/install-linux.sh --check
       - uses: actions/setup-node@v5
         with: {node-version: '24'}

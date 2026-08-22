@@ -8,13 +8,20 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_linux_installers_pass_shell_parser_and_dry_check():
-    scripts = [ROOT/'installers/install-linux.sh', ROOT/'installers/uninstall-linux.sh']
+    scripts = [ROOT/'installers/install-linux.sh', ROOT/'installers/uninstall-linux.sh', ROOT/'installers/wizard.sh', ROOT/'start.sh']
     subprocess.run(['bash','-n',*[str(x) for x in scripts]], check=True)
     result = subprocess.run(['bash',str(scripts[0]),'--check'], cwd=ROOT, text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
     assert 'Installer validation: OK' in result.stdout
-    linux = scripts[0].read_text()
-    assert 'MESSENGER_PROVIDER' in linux and 'MAX_BOT_TOKEN' in linux and '--profile max' in linux
+    # The config wizard lives in its own shared file sourced by both the
+    # installer and start.sh, so the messenger/token/profile logic is there.
+    wizard = (ROOT/'installers/wizard.sh').read_text()
+    for needle in ['MESSENGER_PROVIDER', 'MAX_BOT_TOKEN', '--profile max', '--profile telegram', 'run_config']:
+        assert needle in wizard
+    # start.sh must source the wizard and provide --setup / first-run path.
+    start = (ROOT/'start.sh').read_text()
+    assert 'installers/wizard.sh' in start and 'run_config' in start and '--setup' in start
+    assert '.zmk-profiles' in start
 
 
 def test_windows_wrapper_and_powershell_structure():
