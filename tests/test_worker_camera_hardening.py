@@ -108,10 +108,15 @@ def test_worker_sets_tcp_transport_and_threshold(worker_mod):
     worker = worker_mod
     assert worker.RTSP_TRANSPORT in ("auto", "tcp", "udp")
     assert worker.TRANSPORT_ORDER  # either ["tcp","udp"] (auto) or a single mode
-    # Per-open options include the transport of the current attempt.
+    # Per-open options include the transport of the current attempt and MUST
+    # NOT include extra ',stimeout;...' or other keys: FFmpeg rejects the whole
+    # rtsp_transport option when it sees trailing chars, which made BOTH tcp
+    # and udp fail (camera never opened). Guard against the regression.
     r = worker.Runtime()
     r._open_capture("rtsp://x/stream", "tcp")
-    assert "rtsp_transport;tcp" in str(worker.os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", ""))
+    opt = str(worker.os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", ""))
+    assert opt == "rtsp_transport;tcp", opt
+    assert "stimeout" not in opt and "buffer_size" not in opt
     assert worker.OFFLINE_AFTER >= 1
 
 

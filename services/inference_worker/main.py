@@ -77,9 +77,15 @@ class Runtime:
   self.transport[cid]=nxt
   return nxt
  def _open_capture(self,url,transport):
-  # set the transport/options for THIS open (FFmpeg reads them via the env)
-  opts=f'rtsp_transport;{transport},stimeout;5000000'
-  if _RTSP_BUFSIZE: opts+=f',buffer_size;{_RTSP_BUFSIZE}'
+  # IMPORTANT: the FFmpeg RTSP demuxer parses rtsp_transport as a bare value
+  # ('tcp' or 'udp'). Appending ',stimeout;...' or other keys here (we did)
+  # makes FFmpeg reject the whole option with "Invalid chars ... at the end of
+  # expression", so BOTH tcp and udp attempts fail and the camera never opens.
+  # Timeouts are already set via CAP_PROP_* below, so we only pass the
+  # transport. OpenCV reads options from this env var per open.
+  opts=f'rtsp_transport;{transport}'
+  if _RTSP_BUFSIZE:
+   opts+=f',buffer_size;{_RTSP_BUFSIZE}'
   os.environ['OPENCV_FFMPEG_CAPTURE_OPTIONS']=opts
   cap=cv2.VideoCapture(url,cv2.CAP_FFMPEG)
   cap.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC,8000)
