@@ -9,6 +9,7 @@ import hmac
 import io
 import json
 import os
+import re
 import shutil
 import socket
 import sqlite3
@@ -33,7 +34,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-APP_VERSION = "2.8.0"
+APP_VERSION = "2.9.0"
 TZ = timezone(timedelta(hours=7))
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
@@ -48,7 +49,39 @@ MESSENGER_PROVIDER = os.getenv("MESSENGER_PROVIDER", "none").lower()
 if MESSENGER_PROVIDER not in {"none", "telegram", "max"}: MESSENGER_PROVIDER = "none"
 TRAINING_WORKER_URL = os.getenv("TRAINING_WORKER_URL", "").rstrip("/")
 DATASET_DIR = Path(os.getenv("DATASET_DIR", "")) if os.getenv("DATASET_DIR") else (DB_PATH.parent / "datasets")
+MODEL_DIR = Path(os.getenv("MODEL_DIR", "")) if os.getenv("MODEL_DIR") else (DB_PATH.parent / "models")
 UPDATE_SERVICE_URL = os.getenv("UPDATE_SERVICE_URL", "").rstrip("/")
+# Catalog of ready-to-download pretrained models (real public weights).
+# Each entry has a real, checked download URL. These are COCO-pretrained
+# detectors, so they serve as a starting base for fine-tuning / preview, not
+# as production safety models (their class labels don't include the custom
+# safety classes, so no events fire until you train on your own labels).
+# metrics are intentionally null: they are not validated on safety data.
+MODEL_PRESETS = [
+    {
+        "id":"yolo11n","name":"yolo11n","format":"PyTorch","url":"https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt",
+        "size_bytes":5613764,"classes":80,"category":"starter","description":"Компактная базовая модель (5.4 МБ) — быстрый старт, подходит как отправная точка для дообучения на своих данных.",
+        "hint":"Скачается и зарегистрируется в реестре. Метрики не заданы — для активации обучите на своих данных или укажите метрики валидации.",
+    },
+    {
+        "id":"yolov8n","name":"yolov8n","format":"PyTorch","url":"https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.pt",
+        "size_bytes":6549796,"classes":80,"category":"base","description":"Базовая YOLOv8-nano (6.5 МБ) — классический старт для детекции объектов.",
+        "hint":"Скачается и зарегистрируется в реестре. Метрики не заданы — требуется валидация перед активацией.",
+    },
+    {
+        "id":"yolo11s","name":"yolo11s","format":"PyTorch","url":"https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11s.pt",
+        "size_bytes":19313732,"classes":80,"category":"quality","description":"Более точная модель (19 МБ) — выше качество детекции, больше ресурсов.",
+        "hint":"Скачается и зарегистрируется в реестре. Метрики не заданы — требуется валидация перед активацией.",
+    },
+]
+# Allow overriding/extending the catalog via env (JSON array), for self-hosted
+# model sources.
+_ZMK = os.getenv("ZMK_MODEL_PRESETS_JSON", "").strip()
+try:
+    if _ZMK:
+        MODEL_PRESETS = json.loads(_ZMK)
+except (ValueError, TypeError):
+    pass
 UPDATE_TOKEN = os.getenv("ZMK_UPDATE_TOKEN", "").strip()
 SEED_TEST_DATA = os.getenv("ZMK_SEED_TEST_DATA", "false").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -610,6 +643,49 @@ def register_model(payload:ModelIn):
     try: con.execute("INSERT INTO model_registry(name,format,status,precision,recall,trained_at,source,artifact_uri,checksum) VALUES(?,?,?,?,?,?,?,?,?)",(payload.name,payload.format,"ready",payload.precision,payload.recall,now_iso(),payload.source,payload.artifact_uri,payload.checksum)); con.commit()
     except sqlite3.IntegrityError: con.close(); raise HTTPException(409,"Модель с таким именем уже существует")
     con.close(); return {"name":payload.name,"status":"ready","registered":True}
+
+def _preset_view(preset:dict) -> dict:
+    name=preset["name"]
+    existing=rows("SELECT name,status,precision,recall,source FROM model_registry WHERE name=?",(name,))
+    return {**{k:v for k,v in preset.items() if k!="url"},"downloaded":bool(existing),"registered":bool(existing),"source":existing[0]["source"] if existing else None}
+
+@app.get("/api/models/presets")
+def model_presets():
+    return {"presets":[_preset_view(p) for p in MODEL_PRESETS]}
+
+@app.post("/api/models/presets/{preset_id}/download",status_code=200)
+def download_model_preset(preset_id:str):
+    preset=next((p for p in MODEL_PRESETS if p["id"]==preset_id),None)
+    if not preset: raise HTTPException(404,"Такой пресет не найден")
+    name=preset["name"]
+    existing=rows("SELECT name,source,status FROM model_registry WHERE name=?",(name,))
+    if existing: return {"downloaded":False,"already":True,"model":name,"source":existing[0]["source"],"message":f"Модель {name} уже в реестре. Если файл отсутствует на диске, активация покажет ошибку."}
+    if not re.fullmatch(r"[A-Za-z0-9._-]{2,120}",name): raise HTTPException(422,"Недопустимое имя модели")
+    MODEL_DIR.mkdir(parents=True,exist_ok=True)
+    ext=".pt"
+    dest=MODEL_DIR/f"{name}{ext}"
+    tmp=dest.with_suffix(ext+".tmp")
+    try:
+        with httpx.stream("GET",preset["url"],timeout=600,follow_redirects=True) as resp:
+            resp.raise_for_status()
+            total=0
+            with tmp.open("wb") as fh:
+                for chunk in resp.iter_bytes():
+                    fh.write(chunk); total+=len(chunk)
+                    if total>200_000_000: raise HTTPException(413,"Модель слишком большая")
+        tmp.replace(dest)
+    except httpx.HTTPError as exc:
+        tmp.unlink(missing_ok=True)
+        raise HTTPException(502,f"Не удалось скачать модель: {type(exc).__name__}") from exc
+    digest=hashlib.sha256(dest.read_bytes()).hexdigest()
+    con=db()
+    try:
+        con.execute("INSERT INTO model_registry(name,format,status,precision,recall,trained_at,source,artifact_uri,checksum) VALUES(?,?,?,?,?,?,?,?,?)",(name,preset["format"],"ready",None,None,now_iso(),f"preset:{preset['id']}",f"file://{dest}",digest)); con.commit()
+    except sqlite3.IntegrityError:
+        con.close(); dest.unlink(missing_ok=True); raise HTTPException(409,"Модель с таким именем уже существует")
+    con.close()
+    return {"downloaded":True,"model":name,"artifact_uri":f"file://{dest}","size_bytes":total,"sha256":digest,"requires_validation":True,"message":f"Модель {name} скачана и зарегистрирована. Метрики не заданы — обучите на своих данных или укажите метрики валидации, затем активируйте."}
+
 @app.get("/api/models/active/health")
 def active_model_health():
     con=db(); active=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone(); model=con.execute("SELECT name,format,status,precision,recall,trained_at,source FROM model_registry WHERE name=?",(active[0],)).fetchone() if active else None

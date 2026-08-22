@@ -6,9 +6,11 @@ services:
     volumes:
     - ./data:/app/data
     - dataset-data:/datasets
+    - model-data:/models
     environment:
       VIDEOANALYTICS_DB: /app/data/videoanalytics.db
       DATASET_DIR: /datasets
+      MODEL_DIR: /models
       ZMK_API_KEY: ${ZMK_API_KEY:-}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}

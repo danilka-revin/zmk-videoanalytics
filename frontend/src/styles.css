@@ -49,3 +49,19 @@ html[data-theme=dark] .trainer-head select,html[data-theme=dark] .error-report s
 .preview-grid figure{margin:0;border:1px solid var(--line);border-radius:8px;overflow:hidden;background:var(--surface-2)}
 .preview-grid img{width:100%;height:auto;display:block}
 .preview-grid figcaption{font-size:8px;color:var(--muted);padding:7px 9px;border-top:1px solid var(--line)}
+
+.preset-block{border-top:1px solid var(--line);margin-top:20px;padding-top:16px}
+.preset-head h3{margin:0 0 3px;font-size:13px}
+.preset-head p{margin:0 0 12px;font-size:9px;color:var(--muted)}
+.preset-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:10px}
+.preset-card{border:1px solid var(--line);border-radius:9px;padding:13px;background:var(--surface-2);display:flex;flex-direction:column;gap:8px}
+.preset-card.done{border-color:#4d8b5d}
+.preset-card-head{display:flex;justify-content:space-between;align-items:center}
+.preset-card-head b{font-size:12px}
+.preset-cat{font-size:8px;border-radius:10px;padding:3px 8px;background:#e9f6ed;color:#49865a}
+.preset-cat.quality{background:#eaf3ff;color:#497dbc}
+.preset-card p{font-size:9px;color:var(--muted);margin:0;line-height:1.4}
+.preset-meta{display:flex;gap:10px;font-size:8px;color:var(--muted)}
+.preset-dl{margin-top:auto;border:1px solid var(--line);background:var(--surface);color:var(--text);border-radius:7px;padding:8px;display:flex;align-items:center;justify-content:center;gap:6px;font-size:9px;cursor:pointer}
+.preset-dl:disabled{opacity:.6;cursor:default}
+.preset-note{font-size:8px;color:#b58b3a;background:#332a19;border:1px solid #584b27;border-radius:7px;padding:9px 11px;margin-top:12px;line-height:1.45}
