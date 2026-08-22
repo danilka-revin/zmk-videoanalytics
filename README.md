@@ -6,7 +6,7 @@
 
 > Впервые работаете с Docker и серверными приложениями? Откройте **[подробную инструкцию для начинающих](docs/BEGINNER_GUIDE_RU.md)** — в ней пошагово разобраны Windows, Linux, Telegram, MAX, камеры, безопасность, обновление и типовые ошибки.
 
-![Version](https://img.shields.io/badge/version-2.2.4-25332d)
+![Version](https://img.shields.io/badge/version-2.3.0-25332d)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688)
 ![React](https://img.shields.io/badge/React-TypeScript-61dafb)
@@ -104,6 +104,38 @@ bash installers/install-linux.sh
 ```
 
 Скрипт проверит Docker и Compose, установит недостающие компоненты и запустит проект.
+
+### Автообновление
+
+Начиная с `v2.3.0` программа сама обновляет себя при запуске:
+
+```bash
+# Linux — одна команда: проверка версии + обновление + запуск
+./start.sh
+```
+
+```powershell
+# Windows
+.\start.ps1
+```
+
+Лаунчеры и установщики выполняют проверку так:
+
+1. Считывают текущую версию из файла `VERSION`.
+2. Запрашивают последний релиз `danilka-revin/zmk-videoanalytics` на GitHub.
+3. Если версия новее — скачивают архив, сверяют контрольную сумму **SHA256** и распаковывают.
+4. Применяют обновление на место (сохраняя `.env`, `./data`, Docker volumes и базы данных) и сами перезапускаются.
+5. Если новая версия не найдена или нет соединения с GitHub — просто запускают систему как обычно.
+
+Отключить автообновление (например, полностью автономный контур):
+
+```bash
+ZMK_NO_AUTO_UPDATE=1 ./start.sh
+```
+
+```powershell
+$env:ZMK_NO_AUTO_UPDATE = "1"; .\start.ps1
+```
 
 ## Запуск с Telegram-ботом
 
@@ -288,7 +320,7 @@ docker-compose.yml       Локальная и production-конфигураци
 
 ## Статус
 
-Версия `2.2.4` является рабочим интеграционным контуром без витринных данных. Web-панель, REST API, camera CRUD, диагностика, поиск, отчёты, Telegram/MAX и внешний inference gateway работают локально. Для распознавания подключите RTSP ingestion worker и зарегистрируйте реальный артефакт модели. Обучение включается Compose-профилем `training` и требует NVIDIA Driver/Container Toolkit; без доступной CUDA кнопка запуска остаётся недоступной.
+Версия `2.3.0` является рабочим интеграционным контуром без витринных данных. Web-панель, REST API, camera CRUD, диагностика, поиск, отчёты, Telegram/MAX и внешний inference gateway работают локально. Для распознавания подключите RTSP ingestion worker и зарегистрируйте реальный артефакт модели. Обучение включается Compose-профилем `training` и требует NVIDIA Driver/Container Toolkit; без доступной CUDA кнопка запуска остаётся недоступной.
 
 ## Защита API и эксплуатационная безопасность
 

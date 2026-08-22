@@ -33,6 +33,13 @@ Write-Host "`n=== ZMK Vision installer for Windows 10/11 ===" -ForegroundColor G
 Assert-ProjectFiles
 if ($CheckOnly) {
   Write-Host "Project files: OK"
+  $psScripts = @('installers/install-windows.ps1', 'installers/auto-update.ps1', 'installers/uninstall-windows.ps1', 'start.ps1')
+  foreach ($s in $psScripts) {
+    $tokens = $null; $errs = $null
+    [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $Root $s), [ref]$tokens, [ref]$errs) | Out-Null
+    if ($errs.Count -gt 0) { Write-Host "Syntax errors in $s : $($errs -join '; ')"; throw "PowerShell syntax check failed for $s" }
+  }
+  Write-Host "PowerShell scripts: OK"
   if (Get-Command docker -ErrorAction SilentlyContinue) {
     docker compose version
     if ($LASTEXITCODE -ne 0) { throw "Docker Compose plugin is unavailable" }
@@ -41,6 +48,16 @@ if ($CheckOnly) {
     Write-Host "Docker Compose configuration: OK" -ForegroundColor Green
   } else { Write-Warning "Docker is not installed; project file validation only." }
   exit 0
+}
+
+# --- Auto-update on startup: pull the latest GitHub release, verify it,
+#     unpack it and re-run this installer with the new build ---
+if ($env:ZMK_NO_AUTO_UPDATE -eq '1') {
+  Write-Host "Auto-update disabled via ZMK_NO_AUTO_UPDATE=1." -ForegroundColor Yellow
+} elseif ($env:ZMK_RELAUNCHED_AFTER_UPDATE -eq '1') {
+  : # already running the freshly updated build
+} elseif (Test-Path (Join-Path $Root 'installers\auto-update.ps1')) {
+  & (Join-Path $Root 'installers\auto-update.ps1') -Relaunch install-windows.ps1
 }
 
 if (-not (Get-Command docker -ErrorAction SilentlyContinue)) {
@@ -105,6 +122,9 @@ if ($inference -match '^(y|Y|true|1)$') {
   Set-DotEnvValue "ZMK_WORKER_TOKEN" $workerToken
   $ComposeProfile += @("--profile", "inference")
 }
+# Remember chosen profiles so start.ps1 can restart identically.
+[IO.File]::WriteAllLines((Join-Path $Root '.zmk-profiles'), [string[]]$ComposeProfile, ([Text.UTF8Encoding]::new($false)))
+
 $runtimes = docker info --format '{{json .Runtimes}}' 2>$null
 if ($runtimes -match 'nvidia') {
   $env:COMPOSE_FILE = "docker-compose.yml;docker-compose.gpu.yml"
@@ -121,5 +141,6 @@ if (-not (Wait-Http "http://localhost:5173" 120)) { docker compose @ComposeProfi
 Write-Host "`nZMK Vision installed and verified successfully." -ForegroundColor Green
 Write-Host "Dashboard: http://localhost:5173"
 Write-Host "API docs:  http://localhost:8000/docs"
+Write-Host "Next starts: .\start.ps1  (checks for updates automatically)"
 Start-Process "http://localhost:5173"
 if (-not $NonInteractive) { Read-Host "Press Enter to close" }

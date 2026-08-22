@@ -1,7 +1,10 @@
-# ZMK Vision v2.2.4 — Final Worker Race Fixes
+# ZMK Vision v2.3.0 — In-App Auto-Update System
 
-- Исправлено смешивание tracker state между разными камерами: inference использует независимый spatial person ID по camera/class/position.
-- Устранена гонка multiprocessing Queue: training worker ждёт terminal message после завершения child process и не оставляет задачу в running.
-- Исправлена реальная cancellation и cleanup process/queue.
-- Camera preview больше не обновляет React state после unmount и освобождает Object URL при позднем ответе.
-- Повторно проверены snapshot upload/get/delete, camera delete, CPU fallback, inference и training lifecycle.
+- Новая система автообновления: при запуске программа сама проверяет последний релиз на GitHub.
+- Если найдена новая версия: скачивается архив, проверяется контрольная сумма SHA256, распаковывается и перезапускается без ручных действий.
+- Пользовательские данные и настройки сохраняются при обновлении (`.env`, `./data`, Docker volumes, базы данных).
+- Добавлены лаунчеры `start.sh` (Linux) и `start.ps1` (Windows): проверка обновлений + запуск стека одной командой.
+- Автообновление встроено и в установщики: `install-linux.sh` / `install-windows.ps1` при запуске сами подтягивают свежую версию.
+- Если сети/исправного соединения с GitHub нет — проверка тихо пропускается и приложение запускается как обычно (без поломки).
+- Отключить автообновление можно переменной `ZMK_NO_AUTO_UPDATE=1`.
+- Обновление использует те же подписанные архивные артефакты релизов с проверкой SHA256 (защита от подмены).

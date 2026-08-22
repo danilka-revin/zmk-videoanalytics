@@ -9,10 +9,20 @@ for file in "${required[@]}"; do [[ -f "$file" ]] || fail "Missing $file. Downlo
 
 if [[ "${1:-}" == "--check" ]]; then
   echo "Project files: OK"
-  bash -n installers/install-linux.sh installers/uninstall-linux.sh
+  bash -n installers/install-linux.sh installers/uninstall-linux.sh installers/auto-update.sh start.sh
   if command -v docker >/dev/null 2>&1; then docker compose version && docker compose config --quiet || fail "Docker Compose validation failed"; else echo "WARNING: Docker is not installed; project file validation only."; fi
   echo "Installer validation: OK"
   exit 0
+fi
+
+# --- Auto-update on startup: pull the latest GitHub release, verify it,
+#     unpack it and re-run this installer with the new build ---
+if [[ -n "${ZMK_NO_AUTO_UPDATE:-}" && "${ZMK_NO_AUTO_UPDATE}" == "1" ]]; then
+  echo "Auto-update disabled via ZMK_NO_AUTO_UPDATE=1."
+elif [[ "${ZMK_RELAUNCHED_AFTER_UPDATE:-}" == "1" ]]; then
+  : # already running the freshly updated build
+elif [[ -f installers/auto-update.sh ]]; then
+  bash installers/auto-update.sh installers/install-linux.sh || echo "[install] auto-update check skipped."
 fi
 
 echo -e "\n=== ZMK Vision installer for Ubuntu/Debian ==="
@@ -99,6 +109,9 @@ else
   echo "NVIDIA Container Runtime не найден: workers запустятся в CPU fallback без ошибки"
 fi
 
+# Remember chosen profiles so start.sh can restart identically.
+printf '%s\n' "${PROFILE[@]}" > .zmk-profiles
+
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml or .env validation failed"
 if ! "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose startup failed"; fi
 if ! wait_http http://localhost:8000/api/health 120; then "${DC[@]}" logs --tail=100 api; fail "API health check failed"; fi
@@ -107,3 +120,4 @@ if ! wait_http http://localhost:5173 120; then "${DC[@]}" logs --tail=100 web; f
 echo "ZMK Vision installed and verified successfully."
 echo "Dashboard: http://localhost:5173"
 echo "API docs:  http://localhost:8000/docs"
+echo "Next starts: ./start.sh  (checks for updates automatically)"

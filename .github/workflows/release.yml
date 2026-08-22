@@ -27,6 +27,10 @@ jobs:
       - run: PYTHONPATH=services/telegram_bot pytest services/telegram_bot/test_helpers.py -q
       - run: PYTHONPATH=services/max_bot pytest services/max_bot/test_helpers.py -q
       - run: pytest tests -q
+      - name: Shell scripts syntax + installer dry check
+        run: |
+          bash -n installers/*.sh installers/auto-update.sh start.sh
+          bash installers/install-linux.sh --check
       - uses: actions/setup-node@v5
         with: {node-version: '24'}
       - run: npm ci && npm audit --omit=dev --audit-level=high && npm run lint && npm run build

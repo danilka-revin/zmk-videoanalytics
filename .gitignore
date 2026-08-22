@@ -13,3 +13,4 @@ data/
 .coverage
 htmlcov/
 *.log
+.zmk-profiles
