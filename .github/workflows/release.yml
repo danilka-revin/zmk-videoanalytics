@@ -40,7 +40,7 @@ jobs:
       - name: Build release archives
         run: |
           mkdir -p release-stage/zmk-videoanalytics
-          tar --exclude='./.git' --exclude='*/node_modules' --exclude='*/dist' --exclude='*.db' --exclude='./release-stage' --exclude='zmk-videoanalytics-*.zip' --exclude='zmk-videoanalytics-*.tar.gz' -cf - . | tar -xf - -C release-stage/zmk-videoanalytics
+          tar --exclude='./.git' --exclude='*/node_modules' --exclude='*/dist' --exclude='*/__pycache__' --exclude='*/.pytest_cache' --exclude='*.db' --exclude='./release-stage' --exclude='zmk-videoanalytics-*.zip' --exclude='zmk-videoanalytics-*.tar.gz' -cf - . | tar -xf - -C release-stage/zmk-videoanalytics
           cd release-stage
           zip -qr ../zmk-videoanalytics-${GITHUB_REF_NAME}.zip zmk-videoanalytics
           tar -czf ../zmk-videoanalytics-${GITHUB_REF_NAME}.tar.gz zmk-videoanalytics
