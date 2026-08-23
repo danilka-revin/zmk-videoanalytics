@@ -125,6 +125,9 @@ class Runtime:
         self.next_frame: dict[str, float] = {}
         self.transport: dict[str, str] = {}
         self.open_attempts: dict[str, int] = {}
+        self.last_camera_ids: tuple[str, ...] = ()
+        self.last_no_camera_log = 0.0
+        self.no_model_announced = False
 
     async def get(self, path: str, internal: bool = False):
         if internal:
@@ -148,6 +151,12 @@ class Runtime:
     async def load_model(self) -> None:
         info = await self.get("/api/internal/active-model", internal=True)
         if not info:
+            if not self.no_model_announced:
+                print(
+                    "inference: no active model; camera preview and telemetry remain enabled",
+                    flush=True,
+                )
+                self.no_model_announced = True
             self.model = None
             self.model_name = ""
             return
@@ -164,6 +173,8 @@ class Runtime:
                 raise RuntimeError("Model checksum mismatch")
         self.model = await asyncio.to_thread(YOLO, str(path))
         self.model_name = info["name"]
+        self.no_model_announced = False
+        print(f"inference: active model loaded: {self.model_name}", flush=True)
 
     def _next_transport(self, camera_id: str) -> str:
         """Return TCP on the first auto attempt, then rotate on reconnect."""
@@ -475,6 +486,10 @@ class Runtime:
     async def run(self) -> None:
         cameras: list[dict] = []
         next_control_poll = 0.0
+        print(
+            f"inference: started (api={API}, device={DEVICE}, transport={RTSP_TRANSPORT})",
+            flush=True,
+        )
         try:
             while True:
                 # The API owns provisioning of the shared secret. Wait for it
@@ -492,7 +507,22 @@ class Runtime:
                         # by the number of configured cameras.
                         await self.load_model()
                         cameras = await self.get("/api/internal/cameras", internal=True)
-                        self._drop_stale_cameras({camera["id"] for camera in cameras})
+                        camera_ids = tuple(camera["id"] for camera in cameras)
+                        self._drop_stale_cameras(set(camera_ids))
+                        if camera_ids != self.last_camera_ids:
+                            if camera_ids:
+                                print(
+                                    f"inference: monitoring {len(camera_ids)} camera(s): {', '.join(camera_ids)}",
+                                    flush=True,
+                                )
+                            self.last_camera_ids = camera_ids
+                        if not camera_ids and now - self.last_no_camera_log >= 30:
+                            print(
+                                "inference: no enabled RTSP cameras returned by API; "
+                                "set RTSP_CAM_01 or add and enable a camera in the web panel",
+                                flush=True,
+                            )
+                            self.last_no_camera_log = now
                         next_control_poll = time.time() + CONTROL_POLL_INTERVAL_SECONDS
 
                     if not cameras:

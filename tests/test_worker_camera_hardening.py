@@ -221,6 +221,8 @@ def test_compose_forwards_all_rtsp_settings():
 
     compose = yaml.safe_load((WORKER.parents[2] / "docker-compose.yml").read_text(encoding="utf-8"))
     env = compose["services"]["inference-worker"]["environment"]
+    api_env = compose["services"]["api"]["environment"]
+    assert "ZMK_WORKER_TOKEN_FILE" in api_env
     for variable in (
         "ZMK_WORKER_TOKEN_FILE",
         "RTSP_TRANSPORT",

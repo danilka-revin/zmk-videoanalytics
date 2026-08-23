@@ -10,6 +10,7 @@ def isolated_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     """Every test gets a fresh DB; fixtures never exist in production code or preview."""
     monkeypatch.setattr(main, "DB_PATH", tmp_path / "videoanalytics-test.db")
     monkeypatch.setattr(main, "SEED_TEST_DATA", True)
+    monkeypatch.delenv("RTSP_CAM_01", raising=False)
     main._rate_buckets.clear()
     original_init = main.init_db
 

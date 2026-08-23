@@ -20,6 +20,23 @@ def test_production_starts_without_fake_entities(monkeypatch):
         assert c.post('/api/training/jobs',json={'camera_id':'missing'}).status_code==503
 
 
+def test_bootstraps_first_camera_from_rtsp_environment(monkeypatch):
+    monkeypatch.setattr(main, "SEED_TEST_DATA", False)
+    monkeypatch.setenv("RTSP_CAM_01", "rtsp://user:password@camera.internal:554/stream")
+    with TestClient(main.app) as c:
+        cameras = c.get('/api/cameras').json()
+        assert len(cameras) == 1
+        camera = cameras[0]
+        assert camera['id'] == 'cam_env_01'
+        assert camera['configured'] == 1 and camera['enabled'] == 1
+        assert 'rtsp_url' not in camera
+        assert c.get('/api/dashboard').json()['cameras'] == {'total': 1, 'online': 0}
+
+    # Re-entering lifespan must not duplicate or overwrite the configured URL.
+    with TestClient(main.app) as c:
+        assert len(c.get('/api/cameras').json()) == 1
+
+
 def test_camera_full_crud_search_telemetry_and_diagnostics(monkeypatch):
     monkeypatch.setattr(main, "SEED_TEST_DATA", False)
     with TestClient(main.app) as c:

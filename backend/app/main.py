@@ -196,6 +196,7 @@ def init_db():
         value=fallback[0] if fallback else ""
         con.execute("INSERT INTO settings(key,value) VALUES('active_model',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(value,))
         if fallback: con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"Active model repaired to {fallback[0]}"))
+    bootstrap_env_camera(con)
     apply_retention(con)
     con.commit(); con.close()
 
@@ -312,6 +313,51 @@ def normalize_rtsp_url(value: str | None) -> str | None:
     if port is not None and not 1 <= port <= 65535:
         raise ValueError("Порт RTSP URL должен быть в диапазоне 1–65535")
     return value
+
+
+def bootstrap_env_camera(con: sqlite3.Connection) -> None:
+    """Create the first camera from RTSP_CAM_01 when the DB has none.
+
+    Docker Compose already passed RTSP_CAM_01 into the API but it was never
+    consumed, so a user could configure a valid URL in .env and the worker
+    would silently receive an empty camera list. The URL remains secret: it is
+    stored only in SQLite and never written to logs or camera-list responses.
+    """
+    raw_url = os.getenv("RTSP_CAM_01", "").strip()
+    if not raw_url:
+        return
+    if con.execute("SELECT 1 FROM cameras WHERE rtsp_url!='' LIMIT 1").fetchone():
+        return
+    try:
+        rtsp_url = normalize_rtsp_url(raw_url)
+    except ValueError:
+        con.execute(
+            "INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",
+            (now_iso(), "WARNING", "camera_manager", "RTSP_CAM_01 ignored: invalid RTSP URL"),
+        )
+        return
+
+    timestamp = now_iso()
+    camera_id = "cam_env_01"
+    existing = con.execute("SELECT rtsp_url FROM cameras WHERE id=?", (camera_id,)).fetchone()
+    if existing:
+        # Never overwrite an already configured camera. A legacy empty
+        # bootstrap row can safely receive the newly supplied environment URL.
+        if existing[0]:
+            return
+        con.execute(
+            "UPDATE cameras SET rtsp_url=?,enabled=1,status='unknown',fps=0,latency_ms=0,updated_at=?,telemetry_at='' WHERE id=?",
+            (rtsp_url, timestamp, camera_id),
+        )
+    else:
+        con.execute(
+            "INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (camera_id, "Камера 01", "Без зоны", "Добавлена из RTSP_CAM_01", rtsp_url, 8, "unknown", 0, 0, 1, timestamp, timestamp, ""),
+        )
+    con.execute(
+        "INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",
+        (timestamp, "INFO", "camera_manager", "Camera created from RTSP_CAM_01", camera_id),
+    )
 
 
 class CameraIn(BaseModel):
