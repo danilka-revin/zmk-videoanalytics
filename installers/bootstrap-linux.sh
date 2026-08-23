@@ -90,8 +90,16 @@ info "Repeat command installed: ${ZMK_BIN_DIR}/zmk-vision"
 if [[ "$needs_setup" == true ]]; then
   echo
   echo "First camera setup. The RTSP URL input is hidden and is stored only in .env."
-  read -r -s -p "RTSP URL (rtsp://...): " ZMK_RTSP_URL
-  echo
+  # This launcher is normally invoked as `curl ... | bash`, so stdin contains
+  # the script itself rather than the user's keyboard. Read credentials from
+  # the controlling terminal explicitly; otherwise read returns EOF instantly.
+  ZMK_RTSP_URL="${ZMK_RTSP_URL:-}"
+  if [[ -z "$ZMK_RTSP_URL" ]]; then
+    [[ -r /dev/tty ]] || fail "No interactive terminal detected. Set ZMK_RTSP_URL securely and rerun."
+    printf 'RTSP URL (rtsp://...): ' > /dev/tty
+    IFS= read -r -s ZMK_RTSP_URL < /dev/tty
+    printf '\n' > /dev/tty
+  fi
   [[ "$ZMK_RTSP_URL" =~ ^rtsps?://[^[:space:]]+$ ]] || fail "A non-empty rtsp:// or rtsps:// URL is required"
   info "Installing Docker if necessary, configuring the camera and starting ZMK Vision..."
   exec env \

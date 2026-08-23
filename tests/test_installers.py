@@ -29,7 +29,7 @@ def test_linux_installers_pass_shell_parser_and_dry_check():
 
 def test_bootstrap_launcher_and_rtsp_wizard_escape_credentials(tmp_path):
     bootstrap = (ROOT/'installers/bootstrap-linux.sh').read_text()
-    for required in ['git clone', 'ZMK_REF', 'ZMK_INSTALL_DIR', 'zmk-vision', 'NONINTERACTIVE=1', 'ENABLE_INFERENCE=true']:
+    for required in ['git clone', 'ZMK_REF', 'ZMK_INSTALL_DIR', 'zmk-vision', '/dev/tty', 'NONINTERACTIVE=1', 'ENABLE_INFERENCE=true']:
         assert required in bootstrap
 
     # An RTSP password may include & or |. The wizard must preserve it rather
