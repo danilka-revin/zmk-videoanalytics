@@ -40,6 +40,9 @@ APP_VERSION = "2.12.0"
 TZ = timezone(timedelta(hours=7))
 CAMERA_TELEMETRY_STALE_SECONDS = 30
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
+# Event evidence is persisted beside the SQLite database by default. It is
+# populated only by the internal inference worker after a real event is accepted.
+EVENT_FRAME_DIR = Path(os.getenv("EVENT_FRAME_DIR", "")) if os.getenv("EVENT_FRAME_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
 STARTED = time.time()
 API_KEY = os.getenv("ZMK_API_KEY", "").strip()
@@ -156,6 +159,21 @@ def db():
     con.execute("PRAGMA busy_timeout=10000")
     return con
 
+def event_frame_path_for(event_id:int) -> Path:
+    """Return the single safe evidence JPEG location for an event."""
+    if event_id < 1:
+        raise HTTPException(404,"Событие не найдено")
+    base=EVENT_FRAME_DIR or (DB_PATH.parent/"event_frames")
+    target=(base/f"{event_id}.jpg").resolve()
+    if target.parent != base.resolve():
+        raise HTTPException(400,"Недопустимый путь кадра события")
+    return target
+
+def remove_event_frames(event_ids:list[int]) -> None:
+    for event_id in event_ids:
+        try: event_frame_path_for(int(event_id)).unlink(missing_ok=True)
+        except (OSError,ValueError): pass
+
 def apply_retention(con:sqlite3.Connection|None=None):
     own=con is None; connection=con or db()
     row=connection.execute("SELECT value FROM settings WHERE key='retention_days'").fetchone()
@@ -163,7 +181,9 @@ def apply_retention(con:sqlite3.Connection|None=None):
         try: days=max(1,min(3650,int(float(row[0]))))
         except ValueError: days=90
         cutoff=(datetime.now(TZ)-timedelta(days=days)).isoformat()
+        expired_ids=[int(row[0]) for row in connection.execute("SELECT id FROM events WHERE timestamp<?",(cutoff,)).fetchall()]
         connection.execute("DELETE FROM events WHERE timestamp<?",(cutoff,))
+        remove_event_frames(expired_ids)
         connection.execute("DELETE FROM logs WHERE timestamp<?",(cutoff,))
     if own: connection.commit(); connection.close()
 
@@ -673,12 +693,15 @@ def update_camera(camera_id:str,payload:CameraUpdate):
 def delete_camera(camera_id:str,delete_events:bool=False):
     con=db(); camera=con.execute("SELECT name FROM cameras WHERE id=?",(camera_id,)).fetchone()
     if not camera: con.close(); raise HTTPException(404,"Камера не найдена")
-    event_count=con.execute("SELECT COUNT(*) FROM events WHERE camera_id=?",(camera_id,)).fetchone()[0]
+    event_rows=con.execute("SELECT id FROM events WHERE camera_id=?",(camera_id,)).fetchall()
+    event_ids=[int(row[0]) for row in event_rows]
+    event_count=len(event_ids)
     if event_count and not delete_events: con.close(); raise HTTPException(409,f"У камеры есть события: {event_count}. Подтвердите delete_events=true")
     con.execute("BEGIN IMMEDIATE")
     if delete_events: con.execute("DELETE FROM events WHERE camera_id=?",(camera_id,))
     con.execute("DELETE FROM cameras WHERE id=?",(camera_id,)); con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(now_iso(),"WARNING","camera_manager",f"Camera deleted: {camera[0]}",camera_id)); con.commit(); con.close()
     snapshot=snapshot_path_for(camera_id); snapshot.unlink(missing_ok=True); clear_live_frame(camera_id)
+    if delete_events: remove_event_frames(event_ids)
     return {"id":camera_id,"deleted":True,"deleted_events":event_count if delete_events else 0}
 
 @app.patch("/api/cameras/{camera_id}/toggle")
@@ -749,6 +772,18 @@ async def internal_live_frame(camera_id:str,request:Request):
         _live_frame_sequence+=1
         _live_frames[camera_id]=(_live_frame_sequence,time.time(),image)
 
+@app.post("/api/internal/events/{event_id}/frame",status_code=204)
+async def internal_event_frame(event_id:int,request:Request):
+    """Persist the annotated frame that produced an accepted event."""
+    con=db(); row=con.execute("SELECT id FROM events WHERE id=?",(event_id,)).fetchone(); con.close()
+    if not row: raise HTTPException(404,"Событие не найдено")
+    image=await request.body()
+    if len(image)>1_300_000 or not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"):
+        raise HTTPException(422,"Некорректный или слишком большой JPEG кадра события")
+    target=event_frame_path_for(event_id); target.parent.mkdir(parents=True,exist_ok=True)
+    temp=target.with_name(f".{target.stem}-{uuid.uuid4().hex}.tmp")
+    temp.write_bytes(image); temp.replace(target)
+
 @app.get("/api/cameras/{camera_id}/mjpeg")
 def camera_mjpeg(camera_id:str):
     con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
@@ -805,9 +840,20 @@ def diagnostics():
 @app.get("/api/events")
 def events(limit:int=Query(50,ge=1,le=500),severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None):
     ack=int(acknowledged) if acknowledged is not None else None
-    return rows("""SELECT e.*,c.name camera_name,c.zone FROM events e JOIN cameras c ON c.id=e.camera_id
+    data=rows("""SELECT e.*,c.name camera_name,c.zone FROM events e JOIN cameras c ON c.id=e.camera_id
         WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?)
         ORDER BY e.timestamp DESC LIMIT ?""",(severity,severity,event_type,event_type,ack,ack,limit))
+    for item in data: item["has_frame"]=event_frame_path_for(int(item["id"])).is_file()
+    return data
+
+@app.get("/api/events/{event_id}/frame")
+def event_frame(event_id:int):
+    con=db(); row=con.execute("SELECT id FROM events WHERE id=?",(event_id,)).fetchone(); con.close()
+    if not row: raise HTTPException(404,"Событие не найдено")
+    target=event_frame_path_for(event_id)
+    if not target.is_file(): raise HTTPException(404,"Кадр события ещё не сохранён")
+    return FileResponse(target,media_type="image/jpeg",headers={"Cache-Control":"no-store"})
+
 @app.post("/api/events/{event_id}/ack")
 def ack(event_id:int,payload:AckIn):
     con=db(); cur=con.execute("UPDATE events SET acknowledged=1,note=? WHERE id=?",(payload.note,event_id)); con.commit(); con.close()

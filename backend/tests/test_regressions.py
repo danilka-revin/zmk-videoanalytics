@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 
-from app.main import app, csv_safe, db
+from app.main import app, csv_safe, db, event_frame_path_for
 from fastapi.testclient import TestClient
 
 
@@ -51,12 +51,15 @@ def test_retention_setting_removes_expired_events_and_logs_immediately():
     with TestClient(app) as c:
         old=(datetime.now(timezone.utc)-timedelta(days=3)).isoformat()
         con=db()
-        con.execute("INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id) VALUES(?,?,?,?,?,?)",(old,'cam_01','no_helmet','high',.99,'OLD-EVENT'))
+        cur=con.execute("INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id) VALUES(?,?,?,?,?,?)",(old,'cam_01','no_helmet','high',.99,'OLD-EVENT'))
+        event_id=cur.lastrowid
         con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(old,'INFO','test','OLD-LOG'))
         con.commit(); con.close()
+        evidence=event_frame_path_for(event_id); evidence.parent.mkdir(parents=True,exist_ok=True); evidence.write_bytes(b'old-evidence')
         changed=c.put('/api/admin/config',json={'values':{'retention_days':1}})
         assert changed.status_code==200
         con=db()
         assert con.execute("SELECT COUNT(*) FROM events WHERE person_id='OLD-EVENT'").fetchone()[0]==0
         assert con.execute("SELECT COUNT(*) FROM logs WHERE message='OLD-LOG'").fetchone()[0]==0
         con.close()
+        assert not evidence.exists()

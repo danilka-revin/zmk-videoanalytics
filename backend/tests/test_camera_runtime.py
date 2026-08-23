@@ -110,3 +110,33 @@ def test_internal_heartbeat_exposes_worker_liveness(monkeypatch):
         assert diagnostics["worker"]["connected"] is True
         assert diagnostics["worker"]["camera_count"] == 1
         assert diagnostics["system"]["worker"]["status"] == "running"
+
+
+def test_event_evidence_frame_is_saved_listed_and_cleaned_with_camera(monkeypatch):
+    monkeypatch.setattr(main, "WORKER_TOKEN", "worker-test-token")
+    monkeypatch.setattr(main, "SEED_TEST_DATA", False)
+    with TestClient(main.app) as client:
+        camera_id = _camera(client)
+        con = main.db()
+        cur = con.execute(
+            "INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id) VALUES(?,?,?,?,?,?)",
+            (main.now_iso(), camera_id, "no_helmet", "high", .96, "P-1"),
+        )
+        con.commit(); event_id = cur.lastrowid; con.close()
+        jpeg = b"\xff\xd8" + b"annotated-evidence" * 10 + b"\xff\xd9"
+
+        stored = client.post(
+            f"/api/internal/events/{event_id}/frame",
+            content=jpeg,
+            headers={"X-Worker-Token": "worker-test-token", "Content-Type": "image/jpeg"},
+        )
+        assert stored.status_code == 204, stored.text
+        event = next(item for item in client.get("/api/events?limit=100").json() if item["id"] == event_id)
+        assert event["has_frame"] is True
+        evidence = client.get(f"/api/events/{event_id}/frame")
+        assert evidence.status_code == 200 and evidence.content == jpeg
+
+        deleted = client.delete(f"/api/cameras/{camera_id}?delete_events=true")
+        assert deleted.status_code == 200, deleted.text
+        assert not main.event_frame_path_for(event_id).exists()
+        assert client.get(f"/api/events/{event_id}/frame").status_code == 404

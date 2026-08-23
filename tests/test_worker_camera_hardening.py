@@ -182,6 +182,40 @@ def test_ppe_inference_posts_no_helmet_event_for_the_matching_person(worker_mod)
     assert detection["person_id"].startswith("cam_01-person-")
 
 
+def test_accepted_event_gets_an_annotated_evidence_frame(worker_mod):
+    class Tensor:
+        def __init__(self, value): self.value = value
+        def cpu(self): return self
+        def tolist(self): return self.value
+
+    result = types.SimpleNamespace(
+        boxes=types.SimpleNamespace(
+            xyxy=Tensor([[0, 0, 100, 200], [35, 12, 65, 55]]),
+            cls=Tensor([0, 2]),
+            conf=Tensor([.96, .92]),
+        )
+    )
+
+    class PpeModel:
+        def __init__(self): self.names = {0: "Human", 1: "Helmet", 2: "No-Helmet", 3: "Vest"}
+        def predict(self, *_args, **_kwargs): return [result]
+
+    runtime = worker_mod.Runtime()
+    runtime.model = PpeModel()
+    runtime.model_name = "ppe-person-helmet-yolo11"
+    evidence = []
+
+    async def post(*_args, **_kwargs): return {"accepted": [{"index": 0, "event_id": 42}]}
+    async def post_internal_jpeg(path, image): evidence.append((path, image))
+
+    runtime.post = post
+    runtime.post_internal_jpeg = post_internal_jpeg
+    session = worker_mod.CameraSession(config=worker_mod.CameraConfig.from_api(_camera()))
+    asyncio.run(runtime._infer(session, _FakeImage()))
+
+    assert evidence == [("/api/internal/events/42/frame", b"\xff\xd8frame\xff\xd9")]
+
+
 def test_ppe_boxes_are_drawn_into_the_published_camera_preview(worker_mod):
     class Tensor:
         def __init__(self, value): self.value = value

@@ -999,6 +999,22 @@ class Runtime:
         except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
             self._log(f"live preview upload failed for {session.config.camera_id}: {redact_error(exc)}")
 
+    async def _publish_event_evidence(self, session: CameraSession, result: Any, image: Any) -> None:
+        """Attach the annotated source frame to newly accepted events."""
+        if not isinstance(result, dict):
+            return
+        event_ids={item.get("event_id") for item in result.get("accepted",[]) if isinstance(item,dict) and isinstance(item.get("event_id"),int)}
+        if not event_ids:
+            return
+        try:
+            encoded=await asyncio.to_thread(self._encode_snapshot,image)
+            if not encoded:
+                return
+            for event_id in sorted(event_ids):
+                await self.post_internal_jpeg(f"/api/internal/events/{event_id}/frame",encoded)
+        except (httpx.HTTPError,OSError,RuntimeError,TypeError,ValueError) as exc:
+            self._log(f"event evidence upload failed for {session.config.camera_id}: {redact_error(exc)}")
+
     async def _infer(self, session: CameraSession, image: Any) -> Any | None:
         if self.model is None or not self.model_name:
             return
@@ -1076,19 +1092,21 @@ class Runtime:
         for evidence, person, inferred in helmet_violations:
             append_event("no_helmet", evidence, person, inferred=inferred)
 
-        if detections:
-            try:
-                await self.post("/api/inference/detections", {"detections": detections})
-            except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
-                self._log(f"detections rejected: {redact_error(exc)}")
-
-        # The browser receives this annotated JPEG, not a CSS imitation. It is
+        # The browser and the evidence archive receive this annotated JPEG,
         # created from exactly the same YOLO result used for event creation.
         try:
-            return await asyncio.to_thread(draw_detection_overlay, image, raw, helmet_violations)
-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            annotated=await asyncio.to_thread(draw_detection_overlay,image,raw,helmet_violations)
+        except (OSError,RuntimeError,TypeError,ValueError) as exc:
             self._log(f"overlay render failed; raw preview continues: {redact_error(exc)}")
-            return None
+            annotated=None
+
+        if detections:
+            try:
+                receipt=await self.post("/api/inference/detections", {"detections": detections})
+                await self._publish_event_evidence(session,receipt,annotated if annotated is not None else image)
+            except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
+                self._log(f"detections rejected: {redact_error(exc)}")
+        return annotated
 
     async def frame(self, camera: dict[str, Any] | CameraConfig) -> None:
         """Read one frame. Scheduling is performed by run(), so tests and
