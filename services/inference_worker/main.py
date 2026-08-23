@@ -10,13 +10,44 @@ from pathlib import Path
 
 import cv2
 import httpx
-import torch
-from ultralytics import YOLO
 
 API = os.getenv("ZMK_API_URL", "http://api:8000").rstrip("/")
 API_KEY = os.getenv("ZMK_API_KEY", "")
 DEVICE_SETTING = os.getenv("INFERENCE_DEVICE", "auto")
-DEVICE = ("0" if torch.cuda.is_available() else "cpu") if DEVICE_SETTING == "auto" else DEVICE_SETTING
+_YOLO_CLASS = None
+
+
+def resolve_device() -> str:
+    """Resolve CUDA only when a model actually needs to be loaded.
+
+    Importing Ultralytics/PyTorch at process start made camera preview depend on
+    ML initialisation. On a host with a broken NVIDIA runtime the worker could
+    stop after Ultralytics' settings banner and never even try RTSP. A camera
+    without an active model must still be able to publish snapshots.
+    """
+    if DEVICE_SETTING != "auto":
+        return DEVICE_SETTING
+    try:
+        import torch
+
+        return "0" if torch.cuda.is_available() else "cpu"
+    except (ImportError, OSError, RuntimeError):
+        return "cpu"
+
+
+def yolo_class():
+    """Lazy-load Ultralytics only for an active model."""
+    global _YOLO_CLASS
+    if _YOLO_CLASS is None:
+        from ultralytics import YOLO
+
+        _YOLO_CLASS = YOLO
+    return _YOLO_CLASS
+
+
+def load_yolo_model(path: str):
+    """Load weights in a worker thread so the RTSP event loop stays usable."""
+    return yolo_class()(path)
 
 
 def _bounded_float(name: str, default: float, minimum: float, maximum: float) -> float:
@@ -114,6 +145,8 @@ class Runtime:
     def __init__(self) -> None:
         self.model = None
         self.model_name = ""
+        self.device = DEVICE_SETTING
+        self.last_model_error = 0.0
         self.captures: dict[str, object] = {}
         self.last_telemetry: dict[str, float] = {}
         self.last_status: dict[str, str] = {}
@@ -171,10 +204,11 @@ class Runtime:
             digest = await asyncio.to_thread(file_sha256, path)
             if digest.lower() != info["checksum"].lower():
                 raise RuntimeError("Model checksum mismatch")
-        self.model = await asyncio.to_thread(YOLO, str(path))
+        self.device = await asyncio.to_thread(resolve_device)
+        self.model = await asyncio.to_thread(load_yolo_model, str(path))
         self.model_name = info["name"]
         self.no_model_announced = False
-        print(f"inference: active model loaded: {self.model_name}", flush=True)
+        print(f"inference: active model loaded: {self.model_name} (device={self.device})", flush=True)
 
     def _next_transport(self, camera_id: str) -> str:
         """Return TCP on the first auto attempt, then rotate on reconnect."""
@@ -430,7 +464,7 @@ class Runtime:
                 self.model.predict,
                 image,
                 conf=CONF,
-                device=DEVICE,
+                device=self.device,
                 verbose=False,
             )
         )[0]
@@ -487,7 +521,7 @@ class Runtime:
         cameras: list[dict] = []
         next_control_poll = 0.0
         print(
-            f"inference: started (api={API}, device={DEVICE}, transport={RTSP_TRANSPORT})",
+            f"inference: started (api={API}, device={DEVICE_SETTING}, transport={RTSP_TRANSPORT})",
             flush=True,
         )
         try:
@@ -505,7 +539,17 @@ class Runtime:
                         # camera schedules independently. The old `sleep` in a
                         # per-camera loop divided each camera's effective FPS
                         # by the number of configured cameras.
-                        await self.load_model()
+                        try:
+                            await self.load_model()
+                        except Exception as exc:  # noqa: BLE001 - preview must survive model failures.
+                            self.model = None
+                            self.model_name = ""
+                            if now - self.last_model_error > 15:
+                                print(
+                                    f"inference: active model unavailable; continuing camera preview: {exc}",
+                                    flush=True,
+                                )
+                                self.last_model_error = now
                         cameras = await self.get("/api/internal/cameras", internal=True)
                         camera_ids = tuple(camera["id"] for camera in cameras)
                         self._drop_stale_cameras(set(camera_ids))

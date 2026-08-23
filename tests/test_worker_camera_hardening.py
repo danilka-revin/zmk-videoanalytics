@@ -63,19 +63,9 @@ def worker_mod(monkeypatch):
     cv2.resize = lambda image, size: image
     cv2.imencode = lambda suffix, image, params: (True, b"\xff\xd8frame\xff\xd9")
 
-    class _StubYOLO:
-        names: ClassVar[dict] = {0: "no_helmet"}
-
-        def __init__(self, *args, **kwargs):
-            pass
-
-    torch = types.ModuleType("torch")
-    torch.cuda = types.SimpleNamespace(is_available=lambda: False)
-    ultralytics = types.ModuleType("ultralytics")
-    ultralytics.YOLO = _StubYOLO
+    # Do not stub or install torch/ultralytics here. Importing the worker must
+    # work without either ML package until an active model is actually loaded.
     monkeypatch.setitem(sys.modules, "cv2", cv2)
-    monkeypatch.setitem(sys.modules, "torch", torch)
-    monkeypatch.setitem(sys.modules, "ultralytics", ultralytics)
 
     module_name = "zmk_inference_worker_under_test"
     sys.modules.pop(module_name, None)
@@ -174,6 +164,19 @@ def test_reconnect_backoff_does_not_block_the_worker_loop(worker_mod):
     asyncio.run(runtime.frame(_camera()))
 
     assert time.monotonic() - started < 0.1
+
+
+def test_no_active_model_does_not_import_ml_dependencies(worker_mod):
+    runtime = worker_mod.Runtime()
+
+    async def get(path, internal=False):
+        assert path == "/api/internal/active-model" and internal is True
+
+    runtime.get = get
+    asyncio.run(runtime.load_model())
+
+    assert worker_mod._YOLO_CLASS is None
+    assert runtime.model is None
 
 
 def test_live_preview_is_uploaded_without_an_active_model(worker_mod):
