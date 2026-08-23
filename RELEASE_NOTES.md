@@ -1,45 +1,45 @@
-# ZMK Vision v2.11.4 — Accept "recovering" status + explicit RTSP socket timeout
+# ZMK Vision v2.12.0 — новый надёжный контур RTSP-камер
 
-## Что исправлено
+## Главное
 
-### 1. Телеметрия отклонялась с 422 (главное)
-Воркер после временного сбоя потока шлёт статус **`recovering`**, но модель телеметрии на API принимала только `online/offline/error/unknown`. В результате POST `/api/cameras/{id}/telemetry` возвращал **`422 Unprocessable Entity`**, статус камеры не обновлялся, и в логе висело:
-```
-Client error '422 Unprocessable Entity' for url '/api/cameras/.../telemetry'
-```
-**Решение:** в `CameraTelemetry.status` добавлен `recovering`. Теперь камера корректно показывает «Восстановление», а панель уже умеет его отображать.
+Камеры и AI-модели теперь независимы. `inference-worker` сначала запускает RTSP-превью, телеметрию и reconnect-машину, а Ultralytics/PyTorch загружаются лениво и в фоне только при наличии активной модели. Ошибка CUDA, отсутствующая модель или повреждённый артефакт больше не должны останавливать просмотр камеры.
 
-### 2. Зависание потока (~30 сек) в контейнере
-В логе было `Stream timeout triggered after 30002 ms` — это таймаут RTSP-сокета FFmpeg **по умолчанию ~30 секунд**, а не сеть.
-**Решение:** теперь воркер передаёт явный сокетный таймаут `stimeout` через **правильный** синтаксис `OPENCV_FFMPEG_CAPTURE_OPTIONS`:
-```
-rtsp_transport;tcp|stimeout;5000000[|buffer_size;N]
-```
-(параметры разделяются `|`, а НЕ запятой — запятая ломала парсинг `rtsp_transport`, как в v2.11.3). Опция `stimeout` устраняет зависание и ускоряет переподключение при сбое.
+## Камеры
 
-### Подтверждено на реальном потоке
-- Поток открывается и **читается стабильно 45 секунд подряд** через `rtsp_transport;tcp|stimeout;5000000` (826 кадров, 0 таймаутов). Камера, сеть и ссылка полностью исправны.
-- Воркер логирует `OPENED via tcp`, затем инференс и снапшоты.
+- новая машина состояний: `connecting → online / recovering / offline`;
+- отдельная сессия и расписание на каждую камеру: сбой одной камеры не блокирует остальные;
+- TCP-first / UDP fallback в `RTSP_TRANSPORT=auto`;
+- таймауты открытия и чтения RTSP (`RTSP_OPEN_TIMEOUT_MS`, `RTSP_READ_TIMEOUT_MS`);
+- безопасная публикация превью без AI-модели;
+- реальный FPS по окну телеметрии, без стартовых всплесков;
+- worker heartbeat в API и понятные диагностические данные;
+- хранение безопасной последней причины ошибки без RTSP-логина и пароля;
+- кнопка «Перезапустить» в карточке камеры: worker получает новый token конфигурации и заново открывает поток;
+- `RTSP_CAM_01` автоматически создаёт первую камеру на пустой базе данных.
 
-## Параметры (.env)
-```env
-RTSP_TRANSPORT=auto      # auto | tcp | udp
-RTSP_STIMEOUT=5000000    # сокет-таймаут FFmpeg, мс
-RTSP_BUFFER_SIZE=        # опционально
-```
+## Эксплуатация
 
-## Проверки
-- Backend **61/61** (добавлен тест: телеметрия принимает `recovering`, камера отображает его), установщики/updater/worker **28/28**, Telegram 3/3, MAX 3/3.
-- Ruff, Bandit (прод+updater), tsc/lint, `npm audit` (0), pip-audit (0), `git diff --check` — чисто.
-- Реальный поток прочитан без таймаутов; синтаксис опции проверен.
-
-## Как применить
+После обновления:
 
 ```bash
-# пересобрать и поднять воркер инференса
-docker compose --profile inference up -d --build --remove-orphans
-# смотреть логи
-docker compose --profile inference logs --tail=100 inference-worker
+docker compose --profile inference up -d --build --force-recreate api inference-worker
+docker compose --profile inference logs -f --tail=150 inference-worker
 ```
 
-После пересборки камера должна перейти в `online` (или `recovering` при кратком сбое) и показывать кадры.
+Нормальный запуск начинается так:
+
+```text
+inference: camera runtime started (...)
+inference: no active model; camera preview and telemetry remain enabled
+inference: camera cam_... opened via TCP
+```
+
+Не публикуйте RTSP URL или пароль в логах и обращениях в поддержку.
+
+## Проверки
+
+- backend API tests;
+- worker camera state-machine tests без GPU/OpenCV runtime;
+- TypeScript lint/build;
+- Ruff, Bandit, pip-audit, npm audit;
+- Docker Compose/image build в GitHub Actions.

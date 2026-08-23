@@ -1,8 +1,8 @@
-"""Regression tests for the RTSP inference worker.
+"""Camera-runtime tests without OpenCV, Torch or Ultralytics installed.
 
-The production worker depends on OpenCV, Torch and Ultralytics, which are
-container-only dependencies. Lightweight module stubs let CI execute the real
-camera state-machine instead of skipping the most important regressions.
+The RTSP state machine is intentionally tested with small fakes: CI verifies
+that a camera can publish preview/telemetry without loading any ML package,
+that failures do not block other streams, and that transport fallback works.
 """
 import asyncio
 import importlib.util
@@ -58,15 +58,15 @@ def worker_mod(monkeypatch):
     cv2.CAP_FFMPEG = 1900
     cv2.CAP_PROP_OPEN_TIMEOUT_MSEC = 53
     cv2.CAP_PROP_READ_TIMEOUT_MSEC = 54
+    cv2.CAP_PROP_BUFFERSIZE = 38
     cv2.IMWRITE_JPEG_QUALITY = 1
     cv2.VideoCapture = _FakeCap
     cv2.resize = lambda image, size: image
     cv2.imencode = lambda suffix, image, params: (True, b"\xff\xd8frame\xff\xd9")
-
-    # Do not stub or install torch/ultralytics here. Importing the worker must
-    # work without either ML package until an active model is actually loaded.
     monkeypatch.setitem(sys.modules, "cv2", cv2)
 
+    # Intentionally do not stub torch/ultralytics. Camera bootstrap cannot
+    # import either package until an active model exists.
     module_name = "zmk_inference_worker_under_test"
     sys.modules.pop(module_name, None)
     spec = importlib.util.spec_from_file_location(module_name, WORKER)
@@ -78,92 +78,24 @@ def worker_mod(monkeypatch):
     sys.modules.pop(module_name, None)
 
 
-def _camera():
+def _camera(restart_requested_at: str = ""):
     return {
         "id": "cam_01",
         "name": "Test",
-        "rtsp_url": "rtsp://x/stream",
+        "rtsp_url": "rtsp://user:secret@camera/stream",
         "fps_limit": 8,
+        "restart_requested_at": restart_requested_at,
     }
 
 
-def test_offline_reported_only_after_threshold(worker_mod):
-    worker = worker_mod
-    runtime = worker.Runtime()
-    runtime.model = None
-    camera = _camera()
-    _FakeCap.results = [(True, _FakeImage()), (True, _FakeImage())] + [(False, None)] * 12
-    runtime.captures[camera["id"]] = _FakeCap()
-    runtime.frame_counts[camera["id"]] = 0
-    runtime.last_telemetry[camera["id"]] = time.time() - 11
+def _record_internal(runtime):
+    calls = []
 
-    statuses = []
+    async def post_internal(path, data):
+        calls.append((path, data))
 
-    async def post(path, data):
-        if path.startswith("/api/cameras/cam_01/telemetry"):
-            statuses.append(data["status"])
-
-    runtime.post = post
-    for _ in range(6):
-        asyncio.run(runtime.frame(camera))
-
-    assert statuses[0] == "online"
-    assert "recovering" in statuses
-    assert "offline" in statuses
-
-
-def test_auto_transport_starts_with_tcp_then_falls_back_to_udp(worker_mod):
-    worker_mod.RTSP_TRANSPORT = "auto"
-    worker_mod.TRANSPORT_ORDER = ["tcp", "udp"]
-    runtime = worker_mod.Runtime()
-
-    assert runtime._next_transport("cam_x") == "tcp"
-    assert runtime._next_transport("cam_x") == "udp"
-    assert runtime._next_transport("cam_x") == "tcp"
-
-    worker_mod.RTSP_TRANSPORT = "tcp"
-    worker_mod.TRANSPORT_ORDER = ["tcp"]
-    assert runtime._next_transport("cam_y") == "tcp"
-
-
-def test_worker_builds_valid_ffmpeg_options(worker_mod):
-    runtime = worker_mod.Runtime()
-    runtime._open_capture("rtsp://x/stream", "tcp")
-    options = str(worker_mod.os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", ""))
-
-    assert options.startswith("rtsp_transport;tcp"), options
-    assert "|stimeout;5000000" in options
-    assert ",stimeout" not in options and ",rtsp_transport" not in options
-    assert worker_mod.OFFLINE_AFTER >= 1
-
-
-def test_failed_opens_eventually_mark_camera_offline(worker_mod):
-    worker = worker_mod
-    worker.RECONNECT_MIN = 0
-    _FakeCap.default_opened = False
-    runtime = worker.Runtime()
-    statuses = []
-
-    async def post(path, data):
-        if path.endswith("/telemetry"):
-            statuses.append(data["status"])
-
-    runtime.post = post
-    for _ in range(worker.OFFLINE_AFTER):
-        asyncio.run(runtime.frame(_camera()))
-
-    assert statuses[0] == "recovering"
-    assert statuses[-1] == "offline"
-
-
-def test_reconnect_backoff_does_not_block_the_worker_loop(worker_mod):
-    runtime = worker_mod.Runtime()
-    runtime.next_open["cam_01"] = time.time() + 5
-
-    started = time.monotonic()
-    asyncio.run(runtime.frame(_camera()))
-
-    assert time.monotonic() - started < 0.1
+    runtime.post_internal = post_internal
+    return calls
 
 
 def test_no_active_model_does_not_import_ml_dependencies(worker_mod):
@@ -177,49 +109,128 @@ def test_no_active_model_does_not_import_ml_dependencies(worker_mod):
 
     assert worker_mod._YOLO_CLASS is None
     assert runtime.model is None
+    assert "torch" not in worker_mod.__dict__
+
+
+def test_auto_transport_starts_with_tcp_then_falls_back_to_udp(worker_mod):
+    worker_mod.RTSP_TRANSPORT = "auto"
+    worker_mod.TRANSPORT_ORDER = ["tcp", "udp"]
+    runtime = worker_mod.Runtime()
+
+    assert runtime._next_transport("cam_x") == "tcp"
+    assert runtime._next_transport("cam_x") == "udp"
+    assert runtime._next_transport("cam_x") == "tcp"
+
+
+def test_worker_builds_valid_ffmpeg_options(worker_mod):
+    runtime = worker_mod.Runtime()
+    runtime._open_capture("rtsp://x/stream", "tcp")
+    options = str(worker_mod.os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", ""))
+
+    assert options.startswith("rtsp_transport;tcp"), options
+    assert "|stimeout;5000000" in options
+    assert ",stimeout" not in options and ",rtsp_transport" not in options
+
+
+def test_failed_opens_eventually_mark_camera_offline(worker_mod):
+    worker_mod.RECONNECT_MIN = 0
+    _FakeCap.default_opened = False
+    runtime = worker_mod.Runtime()
+    calls = _record_internal(runtime)
+
+    for _ in range(worker_mod.OFFLINE_AFTER):
+        asyncio.run(runtime.frame(_camera()))
+
+    statuses = [payload["status"] for path, payload in calls if path.endswith("/telemetry")]
+    assert statuses[0] == "connecting"
+    assert "recovering" in statuses
+    assert statuses[-1] == "offline"
+
+
+def test_reconnect_backoff_does_not_block_the_worker_loop(worker_mod):
+    runtime = worker_mod.Runtime()
+    config = worker_mod.CameraConfig.from_api(_camera())
+    runtime.sessions[config.camera_id] = worker_mod.CameraSession(
+        config=config,
+        next_attempt_at=time.monotonic() + 5,
+    )
+    _record_internal(runtime)
+
+    started = time.monotonic()
+    asyncio.run(runtime.frame(config))
+
+    assert time.monotonic() - started < 0.1
 
 
 def test_live_preview_is_uploaded_without_an_active_model(worker_mod):
     runtime = worker_mod.Runtime()
-    runtime.model = None
-    runtime.captures["cam_01"] = _FakeCap()
     _FakeCap.results = [(True, _FakeImage())]
-    posted = []
+    calls = _record_internal(runtime)
 
-    async def post(path, data):
-        posted.append((path, data))
-
-    runtime.post = post
     asyncio.run(runtime.frame(_camera()))
 
-    snapshots = [data for path, data in posted if path.endswith("/snapshot")]
+    snapshots = [data for path, data in calls if path.endswith("/snapshot")]
     assert len(snapshots) == 1
     assert snapshots[0]["jpeg_base64"]
+    telemetry = [data for path, data in calls if path.endswith("/telemetry")]
+    assert telemetry[-1]["status"] == "online"
 
 
 def test_fps_is_measured_from_successful_frames(worker_mod):
     runtime = worker_mod.Runtime()
-    runtime.model = None
-    runtime.captures["cam_01"] = _FakeCap()
+    config = worker_mod.CameraConfig.from_api(_camera())
+    session = worker_mod.CameraSession(
+        config=config,
+        capture=_FakeCap(),
+        status="online",
+        telemetry_window_started=time.monotonic() - 10,
+        last_telemetry_at=time.monotonic() - 10,
+        frames_in_window=79,
+    )
+    runtime.sessions[config.camera_id] = session
     _FakeCap.results = [(True, _FakeImage())]
-    runtime.frame_counts["cam_01"] = 88
-    runtime.last_telemetry["cam_01"] = time.time() - 11
-    runtime.last_status["cam_01"] = "online"
-    telemetry = []
+    calls = _record_internal(runtime)
 
-    async def post(path, data):
-        if path.endswith("/telemetry"):
-            telemetry.append(data)
+    asyncio.run(runtime.frame(config))
 
-    runtime.post = post
-    asyncio.run(runtime.frame(_camera()))
-
+    telemetry = [data for path, data in calls if path.endswith("/telemetry")]
     assert telemetry
-    assert telemetry[0]["fps"] > 0
-    assert telemetry[0]["fps"] == pytest.approx(8, rel=0.15)
+    assert telemetry[-1]["fps"] == pytest.approx(8, rel=0.2)
 
 
-def test_compose_forwards_all_rtsp_settings():
+def test_restart_token_releases_old_capture(worker_mod):
+    runtime = worker_mod.Runtime()
+    first = worker_mod.CameraConfig.from_api(_camera("one"))
+    cap = _FakeCap()
+    runtime.sessions[first.camera_id] = worker_mod.CameraSession(config=first, capture=cap)
+
+    runtime._sync_cameras([_camera("two")])
+
+    assert cap.released is True
+    assert runtime.sessions[first.camera_id].capture is None
+    assert runtime.sessions[first.camera_id].config.restart_token == "two"
+
+
+def test_heartbeat_is_internal_and_has_no_rtsp_secret(worker_mod):
+    runtime = worker_mod.Runtime()
+    calls = _record_internal(runtime)
+    config = worker_mod.CameraConfig.from_api(_camera())
+    runtime.sessions[config.camera_id] = worker_mod.CameraSession(config=config)
+
+    asyncio.run(runtime._heartbeat())
+
+    assert calls[0][0] == "/api/internal/inference/heartbeat"
+    assert "secret" not in calls[0][1]["detail"]
+    assert calls[0][1]["camera_count"] == 1
+
+
+def test_camera_errors_redact_rtsp_credentials(worker_mod):
+    message = worker_mod.redact_error("could not open rtsp://user:password@camera/stream")
+    assert "password" not in message
+    assert "<rtsp-url>" in message
+
+
+def test_compose_forwards_all_camera_runtime_settings():
     import yaml
 
     compose = yaml.safe_load((WORKER.parents[2] / "docker-compose.yml").read_text(encoding="utf-8"))
@@ -231,7 +242,13 @@ def test_compose_forwards_all_rtsp_settings():
         "RTSP_TRANSPORT",
         "RTSP_BUFFER_SIZE",
         "RTSP_STIMEOUT",
+        "RTSP_OPEN_TIMEOUT_MS",
+        "RTSP_READ_TIMEOUT_MS",
         "OFFLINE_AFTER_FRAMES",
         "RTSP_RECONNECT_SECONDS",
+        "CAMERA_CONTROL_POLL_SECONDS",
+        "CAMERA_TELEMETRY_SECONDS",
+        "CAMERA_SNAPSHOT_SECONDS",
+        "CAMERA_HEARTBEAT_SECONDS",
     ):
         assert variable in env

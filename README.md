@@ -6,7 +6,7 @@
 
 > Впервые работаете с Docker и серверными приложениями? Откройте **[подробную инструкцию для начинающих](docs/BEGINNER_GUIDE_RU.md)** — в ней пошагово разобраны Windows, Linux, Telegram, MAX, камеры, безопасность, обновление и типовые ошибки.
 
-![Version](https://img.shields.io/badge/version-2.11.4-25332d)
+![Version](https://img.shields.io/badge/version-2.12.0-25332d)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688)
 ![React](https://img.shields.io/badge/React-TypeScript-61dafb)
@@ -199,7 +199,21 @@ docker compose --profile inference up -d --build
 
 `RTSP_CAM_01` в `.env` больше не является неиспользуемой переменной: если в базе ещё нет настроенных камер, API создаст из неё первую включённую камеру при запуске. Оставьте значение пустым, если добавляете камеры только через панель. После обновления worker сразу напишет в логи, видит ли он камеру, ожидает ли секрет или не получил ни одной включённой RTSP-камеры.
 
-Если поток открывается в VLC, но не в worker, измените в `.env` `RTSP_TRANSPORT` на `tcp` или `udp` и перезапустите inference-профиль. Настройки `RTSP_TRANSPORT`, `RTSP_BUFFER_SIZE`, `RTSP_STIMEOUT`, `OFFLINE_AFTER_FRAMES` и `RTSP_RECONNECT_SECONDS` передаются в контейнер worker при запуске Compose.
+Если поток открывается в VLC, но не в worker, измените в `.env` `RTSP_TRANSPORT` на `tcp` или `udp` и перезапустите inference-профиль. Настройки `RTSP_TRANSPORT`, `RTSP_BUFFER_SIZE`, `RTSP_STIMEOUT`, `RTSP_OPEN_TIMEOUT_MS`, `RTSP_READ_TIMEOUT_MS`, `OFFLINE_AFTER_FRAMES` и `RTSP_RECONNECT_SECONDS` передаются в контейнер worker при запуске Compose.
+
+### Новый контур камер
+
+`inference-worker` запускает RTSP-контур **раньше и независимо от AI-модели**: отсутствие модели, ошибка CUDA или проблемный артефакт не должны останавливать превью и телеметрию камеры. Для каждой камеры worker ведёт отдельное состояние `connecting → online / recovering / offline`, ограничивает зависшие открытия и чтения таймаутами, пробует TCP и UDP, а также не блокирует остальные камеры во время переподключения одной из них.
+
+Worker отправляет heartbeat в API. В разделе **«Диагностика»** теперь видны его состояние, возраст heartbeat, TCP-доступность RTSP, состояние кадра и безопасная причина последней ошибки без логина/пароля. В карточке камеры есть кнопка **«Перезапустить»**: она сбрасывает старый кадр и заставляет worker заново открыть поток. Первые полезные строки после запуска:
+
+```text
+inference: camera runtime started (...)
+inference: no active model; camera preview and telemetry remain enabled
+inference: camera cam_... opened via TCP
+```
+
+Если вместо них видна ошибка, пришлите строки `inference:` из `docker compose --profile inference logs --tail=150 inference-worker`; RTSP URL и пароль не публикуйте.
 
 ## Запуск с Telegram-ботом
 
@@ -400,7 +414,7 @@ docker-compose.yml       Локальная и production-конфигураци
 
 ## Статус
 
-Версия `2.11.4` является рабочим интеграционным контуром без витринных данных. Web-панель, REST API, camera CRUD, диагностика, поиск, отчёты, Telegram/MAX и внешний inference gateway работают локально. Для распознавания подключите RTSP ingestion worker и зарегистрируйте реальный артефакт модели. Обучение включается Compose-профилем `training` и требует NVIDIA Driver/Container Toolkit; без доступной CUDA кнопка запуска остаётся недоступной.
+Версия `2.12.0` является рабочим интеграционным контуром без витринных данных. Web-панель, REST API, camera CRUD, диагностика, поиск, отчёты, Telegram/MAX и внешний inference gateway работают локально. Для распознавания подключите RTSP ingestion worker и зарегистрируйте реальный артефакт модели. Обучение включается Compose-профилем `training` и требует NVIDIA Driver/Container Toolkit; без доступной CUDA кнопка запуска остаётся недоступной.
 
 ## Защита API и эксплуатационная безопасность
 

@@ -35,7 +35,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-APP_VERSION = "2.11.4"
+APP_VERSION = "2.12.0"
 TZ = timezone(timedelta(hours=7))
 CAMERA_TELEMETRY_STALE_SECONDS = 30
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
@@ -124,6 +124,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_ROLES = {**{int(x):"viewer" for x in os.getenv("TELEGRAM_VIEWER_IDS","").split(",") if x.strip().isdigit()},**{int(x):"operator" for x in os.getenv("TELEGRAM_OPERATOR_IDS","").split(",") if x.strip().isdigit()},**{int(x):"admin" for x in os.getenv("TELEGRAM_ADMIN_IDS","").split(",") if x.strip().isdigit()}}
 
 def now_iso(): return datetime.now(TZ).isoformat(timespec="seconds")
+def timestamp_age_seconds(value: str | None) -> int | None:
+    if not value: return None
+    try:
+        stamp=datetime.fromisoformat(value)
+        if stamp.tzinfo is None: stamp=stamp.replace(tzinfo=TZ)
+        return max(0,int((datetime.now(TZ)-stamp.astimezone(TZ)).total_seconds()))
+    except (TypeError,ValueError):
+        return None
 def db():
     DB_PATH.parent.mkdir(parents=True,exist_ok=True)
     con = sqlite3.connect(DB_PATH,timeout=10)
@@ -147,16 +155,17 @@ def init_db():
     con = db()
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript("""
-    CREATE TABLE IF NOT EXISTS cameras(id TEXT PRIMARY KEY, name TEXT NOT NULL, zone TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rtsp_url TEXT NOT NULL DEFAULT '', fps_limit REAL NOT NULL DEFAULT 8, status TEXT NOT NULL DEFAULT 'unknown', fps REAL NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, telemetry_at TEXT NOT NULL DEFAULT '');
+    CREATE TABLE IF NOT EXISTS cameras(id TEXT PRIMARY KEY, name TEXT NOT NULL, zone TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rtsp_url TEXT NOT NULL DEFAULT '', fps_limit REAL NOT NULL DEFAULT 8, status TEXT NOT NULL DEFAULT 'unknown', fps REAL NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, telemetry_at TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '', restart_requested_at TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, camera_id TEXT NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL, confidence REAL NOT NULL, person_id TEXT, external_id TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '', FOREIGN KEY(camera_id) REFERENCES cameras(id));
     CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, level TEXT NOT NULL, service TEXT NOT NULL, message TEXT NOT NULL, camera_id TEXT);
+    CREATE TABLE IF NOT EXISTS worker_status(name TEXT PRIMARY KEY, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', camera_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS model_registry(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, format TEXT NOT NULL, status TEXT NOT NULL, precision REAL, recall REAL, trained_at TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'external', artifact_uri TEXT NOT NULL DEFAULT '', checksum TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS training_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, camera_id TEXT NOT NULL, base_model TEXT NOT NULL, target_name TEXT NOT NULL, image_count INTEGER NOT NULL, epochs INTEGER NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL, error TEXT, batch INTEGER NOT NULL DEFAULT 8, imgsz INTEGER NOT NULL DEFAULT 640, patience INTEGER NOT NULL DEFAULT 20, confidence REAL NOT NULL DEFAULT .35, val_split REAL NOT NULL DEFAULT .2, capture_fps REAL NOT NULL DEFAULT 2, FOREIGN KEY(camera_id) REFERENCES cameras(id));
     CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, login TEXT UNIQUE NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
     """)
     camera_columns={r[1] for r in con.execute("PRAGMA table_info(cameras)").fetchall()}
-    for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''","telemetry_at":"TEXT NOT NULL DEFAULT ''"}.items():
+    for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''","telemetry_at":"TEXT NOT NULL DEFAULT ''","last_error":"TEXT NOT NULL DEFAULT ''","restart_requested_at":"TEXT NOT NULL DEFAULT ''"}.items():
         if column not in camera_columns: con.execute(f"ALTER TABLE cameras ADD COLUMN {column} {ddl}")
     con.execute("UPDATE cameras SET created_at=updated_at WHERE created_at='' OR created_at IS NULL")
     model_columns={r[1] for r in con.execute("PRAGMA table_info(model_registry)").fetchall()}
@@ -289,6 +298,10 @@ async def security_middleware(request: Request, call_next):
     if path.startswith("/api/"): response.headers["Cache-Control"]="no-store"
     return response
 
+def safe_camera_error(value: str) -> str:
+    """Keep diagnostic text useful without exposing RTSP credentials."""
+    return re.sub(r"rtsps?://[^\s'\"<>]+","<rtsp-url>",value or "",flags=re.IGNORECASE).replace("\n"," ")[:300]
+
 def normalize_rtsp_url(value: str | None) -> str | None:
     """Validate an RTSP endpoint early, without ever returning its secret.
 
@@ -346,13 +359,13 @@ def bootstrap_env_camera(con: sqlite3.Connection) -> None:
         if existing[0]:
             return
         con.execute(
-            "UPDATE cameras SET rtsp_url=?,enabled=1,status='unknown',fps=0,latency_ms=0,updated_at=?,telemetry_at='' WHERE id=?",
-            (rtsp_url, timestamp, camera_id),
+            "UPDATE cameras SET rtsp_url=?,enabled=1,status='connecting',fps=0,latency_ms=0,last_error='',updated_at=?,telemetry_at='',restart_requested_at=? WHERE id=?",
+            (rtsp_url, timestamp, timestamp, camera_id),
         )
     else:
         con.execute(
-            "INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (camera_id, "Камера 01", "Без зоны", "Добавлена из RTSP_CAM_01", rtsp_url, 8, "unknown", 0, 0, 1, timestamp, timestamp, ""),
+            "INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,restart_requested_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (camera_id, "Камера 01", "Без зоны", "Добавлена из RTSP_CAM_01", rtsp_url, 8, "connecting", 0, 0, 1, timestamp, timestamp, "", timestamp),
         )
     con.execute(
         "INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",
@@ -383,9 +396,14 @@ class CameraUpdate(BaseModel):
     def validate_rtsp(cls,value:str|None):
         return normalize_rtsp_url(value)
 class CameraTelemetry(BaseModel):
-    status:Literal["online","offline","error","unknown","recovering"]
+    status:Literal["connecting","online","offline","error","unknown","recovering"]
     fps:float=Field(default=0,ge=0,le=240)
     latency_ms:int=Field(default=0,ge=0,le=120000)
+    error:str=Field(default="",max_length=300)
+class InferenceHeartbeat(BaseModel):
+    status:Literal["starting","running","idle","degraded","stopped"]
+    detail:str=Field(default="",max_length=300)
+    camera_count:int=Field(default=0,ge=0,le=10000)
 class CameraSnapshotIn(BaseModel):
     jpeg_base64:str=Field(min_length=16,max_length=1_800_000)
     captured_at:datetime|None=None
@@ -446,6 +464,12 @@ class TrainingIn(BaseModel):
 def rows(query,args=()):
     con=db(); result=[dict(r) for r in con.execute(query,args).fetchall()]; con.close(); return result
 
+def inference_worker_state() -> dict[str,Any]:
+    con=db(); row=con.execute("SELECT status,detail,camera_count,updated_at FROM worker_status WHERE name='inference'").fetchone(); con.close()
+    if not row: return {"connected":False,"status":"absent","detail":"Нет heartbeat от inference worker","camera_count":0,"age_seconds":None}
+    age=timestamp_age_seconds(row[3]); connected=age is not None and age<=15 and row[0] in {"starting","running","idle","degraded"}
+    return {"connected":connected,"status":row[0],"detail":row[1],"camera_count":row[2],"updated_at":row[3],"age_seconds":age}
+
 def update_headers() -> dict[str,str]:
     headers = {}
     if UPDATE_TOKEN: headers["X-Update-Token"] = UPDATE_TOKEN
@@ -489,11 +513,10 @@ def capabilities():
         except httpx.HTTPError: pass
     snap_dir=SNAPSHOT_DIR or (DB_PATH.parent/"snapshots")
     fresh=sum(1 for r in snap_dir.glob("*.jpg") if (time.time()-r.stat().st_mtime)<15) if snap_dir.exists() else 0
-    # "inference_worker": whether the inference worker is actually feeding
-    # fresh snapshots. If false, the camera is offline/unblacked because the
-    # worker isn't running (profile not enabled) or the stream won't open.
-    inference_active=bool(fresh)
-    return {"demo_mode":SEED_TEST_DATA,"training_worker":worker["reachable"],"training":worker,"external_inference_gateway":True,"camera_crud":True,"diagnostics":True,"search":True,"update_service":bool(UPDATE_SERVICE_URL),"inference_worker":inference_active,"fresh_snapshots":fresh}
+    inference=inference_worker_state()
+    # A heartbeat confirms that the process is alive even before the first
+    # snapshot exists; fresh frames separately confirm that a stream is live.
+    return {"demo_mode":SEED_TEST_DATA,"training_worker":worker["reachable"],"training":worker,"external_inference_gateway":True,"camera_crud":True,"diagnostics":True,"search":True,"update_service":bool(UPDATE_SERVICE_URL),"inference_worker":inference["connected"],"inference":inference,"fresh_snapshots":fresh}
 
 @app.get("/api/health")
 def health(): return {"status":"ok","version":APP_VERSION,"uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
@@ -514,7 +537,11 @@ def dashboard():
     con.close(); gpu=gpu_metrics(); return {"cameras":{"total":total,"online":online},"events24h":events24,"critical_unacked":critical,"avg_fps":round(avg[0],1),"avg_latency_ms":round(avg[1]),"gpu_load":gpu["gpu"],"gpu_temp":gpu["gpu_temp"],"messenger_provider":MESSENGER_PROVIDER,"active_model":model[0] if model else None,"precision":model[1] if model else None,"recall":model[2] if model else None,"trend":trend}
 
 @app.get("/api/internal/cameras")
-def internal_cameras(): return rows("SELECT id,name,rtsp_url,fps_limit,enabled FROM cameras WHERE enabled=1 AND rtsp_url!='' ORDER BY id")
+def internal_cameras(): return rows("SELECT id,name,rtsp_url,fps_limit,enabled,restart_requested_at FROM cameras WHERE enabled=1 AND rtsp_url!='' ORDER BY id")
+
+@app.post("/api/internal/inference/heartbeat",status_code=204)
+def inference_heartbeat(payload:InferenceHeartbeat):
+    con=db(); con.execute("INSERT INTO worker_status(name,status,detail,camera_count,updated_at) VALUES('inference',?,?,?,?) ON CONFLICT(name) DO UPDATE SET status=excluded.status,detail=excluded.detail,camera_count=excluded.camera_count,updated_at=excluded.updated_at",(payload.status,payload.detail,payload.camera_count,now_iso())); con.commit(); con.close()
 
 @app.get("/api/internal/active-model")
 def internal_active_model():
@@ -545,14 +572,7 @@ def snapshot_age_seconds(camera_id:str) -> int|None:
 
 def telemetry_age_seconds(value: str | None) -> int | None:
     """Return age of worker telemetry; malformed legacy values are stale."""
-    if not value:
-        return None
-    try:
-        captured=datetime.fromisoformat(value)
-        if captured.tzinfo is None: captured=captured.replace(tzinfo=TZ)
-        return max(0,int((datetime.now(TZ)-captured.astimezone(TZ)).total_seconds()))
-    except (TypeError,ValueError):
-        return None
+    return timestamp_age_seconds(value)
 
 def camera_with_snapshot(row:dict|sqlite3.Row) -> dict:
     data=dict(row)
@@ -570,20 +590,20 @@ def camera_with_snapshot(row:dict|sqlite3.Row) -> dict:
 
 @app.get("/api/cameras")
 def cameras():
-    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras ORDER BY created_at,id")
+    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,last_error,restart_requested_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras ORDER BY created_at,id")
     return [camera_with_snapshot(r) for r in data]
 
 @app.get("/api/cameras/{camera_id}")
 def camera_detail(camera_id:str):
-    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras WHERE id=?",(camera_id,))
+    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,last_error,restart_requested_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras WHERE id=?",(camera_id,))
     if not data: raise HTTPException(404,"Камера не найдена")
     return camera_with_snapshot(data[0])
 
 @app.post("/api/cameras",status_code=201)
 def add_camera(payload:CameraIn):
-    cid=f"cam_{uuid.uuid4().hex[:12]}"; timestamp=now_iso(); con=db()
-    con.execute("INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(cid,payload.name,payload.zone,payload.description,payload.rtsp_url,payload.fps_limit,"unknown",0,0,int(payload.enabled),timestamp,timestamp)); con.commit(); con.close()
-    return {"id":cid,"name":payload.name,"zone":payload.zone,"description":payload.description,"fps_limit":payload.fps_limit,"enabled":payload.enabled,"configured":bool(payload.rtsp_url),"status":"unknown"}
+    cid=f"cam_{uuid.uuid4().hex[:12]}"; timestamp=now_iso(); con=db(); status="connecting" if payload.enabled and payload.rtsp_url else "unknown"
+    con.execute("INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,restart_requested_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(cid,payload.name,payload.zone,payload.description,payload.rtsp_url,payload.fps_limit,status,0,0,int(payload.enabled),timestamp,timestamp,timestamp if status=="connecting" else "")); con.commit(); con.close()
+    return {"id":cid,"name":payload.name,"zone":payload.zone,"description":payload.description,"fps_limit":payload.fps_limit,"enabled":payload.enabled,"configured":bool(payload.rtsp_url),"status":status}
 
 @app.put("/api/cameras/{camera_id}")
 def update_camera(camera_id:str,payload:CameraUpdate):
@@ -599,7 +619,7 @@ def update_camera(camera_id:str,payload:CameraUpdate):
     if stream_changed:
         # A frame and telemetry from the old endpoint must not be shown as if
         # they belonged to the newly configured camera.
-        con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,status='unknown',fps=0,latency_ms=0,updated_at=?,telemetry_at='' WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),timestamp,camera_id))
+        con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,status='connecting',fps=0,latency_ms=0,last_error='',updated_at=?,telemetry_at='',restart_requested_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),timestamp,timestamp,camera_id))
     else:
         con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,updated_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),timestamp,camera_id))
     con.commit(); con.close()
@@ -626,24 +646,38 @@ def toggle_camera(camera_id:str):
     enabled=0 if row[0] else 1
     # Do not leave a stopped stream marked online while the worker removes it
     # from its next polling cycle.
-    con.execute("UPDATE cameras SET enabled=?,status='unknown',fps=0,latency_ms=0,updated_at=?,telemetry_at='' WHERE id=?",(enabled,now_iso(),camera_id)); con.commit(); con.close()
+    timestamp=now_iso(); con.execute("UPDATE cameras SET enabled=?,status=?,fps=0,latency_ms=0,last_error='',updated_at=?,telemetry_at='',restart_requested_at=? WHERE id=?",(enabled,"connecting" if enabled else "unknown",timestamp,timestamp,camera_id)); con.commit(); con.close()
     snapshot_path_for(camera_id).unlink(missing_ok=True)
     return {"id":camera_id,"enabled":bool(enabled),"stream_reset":True}
 
-@app.post("/api/cameras/{camera_id}/telemetry")
-def camera_telemetry(camera_id:str,payload:CameraTelemetry):
+@app.post("/api/cameras/{camera_id}/restart")
+def restart_camera(camera_id:str):
+    con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone()
+    if not row: con.close(); raise HTTPException(404,"Камера не найдена")
+    if not row[0]: con.close(); raise HTTPException(409,"Сначала включите аналитику камеры")
+    timestamp=now_iso(); con.execute("UPDATE cameras SET status='connecting',fps=0,latency_ms=0,last_error='',telemetry_at='',restart_requested_at=?,updated_at=? WHERE id=?",(timestamp,timestamp,camera_id)); con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(timestamp,"INFO","camera_manager","RTSP restart requested",camera_id)); con.commit(); con.close()
+    snapshot_path_for(camera_id).unlink(missing_ok=True)
+    return {"id":camera_id,"restart_requested_at":timestamp,"status":"connecting"}
+
+def apply_camera_telemetry(camera_id:str,payload:CameraTelemetry):
     con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone()
     if not row: con.close(); raise HTTPException(404,"Камера не найдена")
     if not row[0]:
         con.close()
-        # A worker can finish one in-flight frame after an operator disables a
-        # camera. Accept the callback but never resurrect its online status.
-        return {"id":camera_id,"ignored":True,"status":"unknown","fps":0,"latency_ms":0}
-    timestamp=now_iso(); con.execute("UPDATE cameras SET status=?,fps=?,latency_ms=?,updated_at=?,telemetry_at=? WHERE id=?",(payload.status,payload.fps,payload.latency_ms,timestamp,timestamp,camera_id)); con.commit(); con.close()
+        # An in-flight worker frame must not resurrect a disabled camera.
+        return {"id":camera_id,"ignored":True,"status":"unknown","fps":0,"latency_ms":0,"error":""}
+    timestamp=now_iso(); error=safe_camera_error(payload.error); con.execute("UPDATE cameras SET status=?,fps=?,latency_ms=?,last_error=?,updated_at=?,telemetry_at=? WHERE id=?",(payload.status,payload.fps,payload.latency_ms,error,timestamp,timestamp,camera_id)); con.commit(); con.close()
     return {"id":camera_id,**payload.model_dump()}
 
-@app.post("/api/cameras/{camera_id}/snapshot",status_code=204)
-def upload_camera_snapshot(camera_id:str,payload:CameraSnapshotIn):
+@app.post("/api/cameras/{camera_id}/telemetry")
+def camera_telemetry(camera_id:str,payload:CameraTelemetry):
+    return apply_camera_telemetry(camera_id,payload)
+
+@app.post("/api/internal/cameras/{camera_id}/telemetry")
+def internal_camera_telemetry(camera_id:str,payload:CameraTelemetry):
+    return apply_camera_telemetry(camera_id,payload)
+
+def store_camera_snapshot(camera_id:str,payload:CameraSnapshotIn):
     con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
     if not row: raise HTTPException(404,"Камера не найдена")
     if not row[0]: return
@@ -652,6 +686,14 @@ def upload_camera_snapshot(camera_id:str,payload:CameraSnapshotIn):
     if len(image)>1_300_000 or not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"): raise HTTPException(422,"Некорректный или слишком большой JPEG")
     target=snapshot_path_for(camera_id); target.parent.mkdir(parents=True,exist_ok=True); temp=target.with_name(f".{target.stem}.tmp"); temp.write_bytes(image); temp.replace(target)
 
+@app.post("/api/cameras/{camera_id}/snapshot",status_code=204)
+def upload_camera_snapshot(camera_id:str,payload:CameraSnapshotIn):
+    store_camera_snapshot(camera_id,payload)
+
+@app.post("/api/internal/cameras/{camera_id}/snapshot",status_code=204)
+def internal_camera_snapshot(camera_id:str,payload:CameraSnapshotIn):
+    store_camera_snapshot(camera_id,payload)
+
 @app.get("/api/cameras/{camera_id}/snapshot")
 def camera_snapshot(camera_id:str):
     target=snapshot_path_for(camera_id)
@@ -659,21 +701,23 @@ def camera_snapshot(camera_id:str):
     return FileResponse(target,media_type="image/jpeg",headers={"Cache-Control":"no-store"})
 
 def diagnose_camera_row(camera_id:str):
-    con=db(); row=con.execute("SELECT id,name,rtsp_url,enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
+    con=db(); row=con.execute("SELECT id,name,rtsp_url,enabled,status,telemetry_at,last_error,restart_requested_at FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
     if not row: raise HTTPException(404,"Камера не найдена")
-    if not row[2]: return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"not_configured","latency_ms":None,"message":"RTSP URL не задан"}
+    runtime={"camera_status":row[4],"telemetry_age_seconds":telemetry_age_seconds(row[5]),"last_error":row[6],"restart_requested_at":row[7]}
+    if not row[3]: return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"disabled","latency_ms":None,"message":"Аналитика камеры отключена",**runtime}
+    if not row[2]: return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"not_configured","latency_ms":None,"message":"RTSP URL не задан",**runtime}
     try:
         parsed=urlparse(row[2]); host=parsed.hostname; port=parsed.port or (322 if parsed.scheme=="rtsps" else 554)
     except ValueError:
-        return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"invalid_url","latency_ms":None,"message":"Некорректный RTSP URL"}
-    if not host: return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"invalid_url","latency_ms":None,"message":"Некорректный RTSP URL"}
+        return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"invalid_url","latency_ms":None,"message":"Некорректный RTSP URL",**runtime}
+    if not host: return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"invalid_url","latency_ms":None,"message":"Некорректный RTSP URL",**runtime}
     started=time.perf_counter()
     try:
         with socket.create_connection((host,port),timeout=3): pass
         latency=round((time.perf_counter()-started)*1000)
-        return {"camera_id":camera_id,"name":row[1],"reachable":True,"status":"reachable","latency_ms":latency,"message":"TCP-подключение установлено"}
+        return {"camera_id":camera_id,"name":row[1],"reachable":True,"status":"reachable","latency_ms":latency,"message":"TCP-подключение установлено",**runtime}
     except OSError as exc:
-        return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"unreachable","latency_ms":None,"message":str(exc)[:200]}
+        return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"unreachable","latency_ms":None,"message":str(exc)[:200],**runtime}
 
 @app.post("/api/cameras/{camera_id}/diagnostics")
 def diagnose_camera(camera_id:str):
@@ -685,7 +729,7 @@ def diagnostics():
     with ThreadPoolExecutor(max_workers=min(10,max(1,len(camera_ids)))) as pool: camera_results=list(pool.map(diagnose_camera_row,camera_ids))
     for result in camera_results:
         age=snapshot_age_seconds(result["camera_id"]); result["snapshot_age_seconds"]=age; result["snapshot"]="fresh" if age is not None and age<15 else ("stale" if age is not None else "none")
-    return {"generated_at":now_iso(),"system":system_health_data(),"cameras":camera_results}
+    return {"generated_at":now_iso(),"system":system_health_data(),"worker":inference_worker_state(),"cameras":camera_results}
 
 @app.get("/api/events")
 def events(limit:int=Query(50,ge=1,le=500),severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None):
@@ -1175,8 +1219,12 @@ def system_health_data():
     gpu=gpu_metrics(); con=db(); con.execute("SELECT 1").fetchone(); camera_count=con.execute("SELECT COUNT(*) FROM cameras WHERE enabled=1").fetchone()[0]; con.close()
     snap_dir=SNAPSHOT_DIR or (DB_PATH.parent/"snapshots")
     fresh=sum(1 for r in snap_dir.glob("*.jpg") if (time.time()-r.stat().st_mtime)<10) if snap_dir.exists() else 0
-    def status(flag:bool): return "healthy" if flag else "not_configured"
-    return {"cpu":round(psutil.cpu_percent(interval=.05),1),"ram":round(psutil.virtual_memory().percent,1),"disk":round(psutil.disk_usage(str(DB_PATH.parent)).percent,1),**gpu,"messenger_provider":MESSENGER_PROVIDER,"services":[{"name":"api","status":"healthy"},{"name":"database","status":"healthy"},{"name":"ingestion","status":status(bool(camera_count))},{"name":"inference","status":status(bool(fresh))}]}
+    worker=inference_worker_state()
+    if not camera_count: inference_status="not_configured"
+    elif not worker["connected"]: inference_status="error"
+    elif fresh: inference_status="healthy"
+    else: inference_status="degraded"
+    return {"cpu":round(psutil.cpu_percent(interval=.05),1),"ram":round(psutil.virtual_memory().percent,1),"disk":round(psutil.disk_usage(str(DB_PATH.parent)).percent,1),**gpu,"messenger_provider":MESSENGER_PROVIDER,"worker":worker,"services":[{"name":"api","status":"healthy"},{"name":"database","status":"healthy"},{"name":"ingestion","status":"healthy" if camera_count else "not_configured"},{"name":"inference","status":inference_status}]}
 
 @app.get("/api/system-health")
 def system_health(): return system_health_data()

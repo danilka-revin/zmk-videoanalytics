@@ -83,3 +83,6 @@ html[data-theme=dark] .trainer-head select,html[data-theme=dark] .error-report s
 .rtsp-edit .rtsp-note{display:flex;align-items:center;gap:6px;font-size:9px;color:#4a865b;margin-top:6px;font-style:normal}
 .rtsp-edit svg{color:#4a865b}
 .camera-modal .rtsp-edit>label{font-size:9px;color:var(--muted)}
+
+/* Camera runtime states */
+.tag.connecting{background:#eaf3ff;color:#497dbc}.live.connecting{color:#78aee8}.service-dot.degraded{background:#d9a441}.service-dot.idle{background:#7f8b86}.service-dot.starting{background:#78aee8}

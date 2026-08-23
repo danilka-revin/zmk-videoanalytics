@@ -86,7 +86,7 @@ def test_camera_stream_state_resets_on_reconfigure_or_disable(monkeypatch):
         changed = c.put(f'/api/cameras/{camera_id}', json={'name':'Линия 1','zone':'Цех','description':'','rtsp_url':'rtsp://camera/two','fps_limit':8,'enabled':True})
         assert changed.status_code == 200 and changed.json()['stream_reset'] is True
         camera = c.get(f'/api/cameras/{camera_id}').json()
-        assert camera['status'] == 'unknown' and camera['fps'] == 0
+        assert camera['status'] == 'connecting' and camera['fps'] == 0
 
         toggled = c.patch(f'/api/cameras/{camera_id}/toggle')
         assert toggled.status_code == 200 and toggled.json()['enabled'] is False

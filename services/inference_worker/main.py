@@ -1,53 +1,37 @@
+"""Reliable RTSP camera runtime for ZMK Vision.
+
+This worker deliberately separates camera acquisition from ML inference:
+RTSP preview, telemetry and reconnects start immediately; Ultralytics is
+loaded lazily and asynchronously only when the API has an active model.
+A broken GPU/model can therefore never make a configured camera disappear.
+"""
 from __future__ import annotations
 
 import asyncio
 import base64
 import hashlib
 import os
+import re
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 import cv2
 import httpx
 
 API = os.getenv("ZMK_API_URL", "http://api:8000").rstrip("/")
 API_KEY = os.getenv("ZMK_API_KEY", "")
-DEVICE_SETTING = os.getenv("INFERENCE_DEVICE", "auto")
-_YOLO_CLASS = None
+DEVICE_SETTING = os.getenv("INFERENCE_DEVICE", "auto").strip() or "auto"
 
 
-def resolve_device() -> str:
-    """Resolve CUDA only when a model actually needs to be loaded.
-
-    Importing Ultralytics/PyTorch at process start made camera preview depend on
-    ML initialisation. On a host with a broken NVIDIA runtime the worker could
-    stop after Ultralytics' settings banner and never even try RTSP. A camera
-    without an active model must still be able to publish snapshots.
-    """
-    if DEVICE_SETTING != "auto":
-        return DEVICE_SETTING
+def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
     try:
-        import torch
-
-        return "0" if torch.cuda.is_available() else "cpu"
-    except (ImportError, OSError, RuntimeError):
-        return "cpu"
-
-
-def yolo_class():
-    """Lazy-load Ultralytics only for an active model."""
-    global _YOLO_CLASS
-    if _YOLO_CLASS is None:
-        from ultralytics import YOLO
-
-        _YOLO_CLASS = YOLO
-    return _YOLO_CLASS
-
-
-def load_yolo_model(path: str):
-    """Load weights in a worker thread so the RTSP event loop stays usable."""
-    return yolo_class()(path)
+        value = int(os.getenv(name, str(default)))
+    except (TypeError, ValueError):
+        value = default
+    return max(minimum, min(maximum, value))
 
 
 def _bounded_float(name: str, default: float, minimum: float, maximum: float) -> float:
@@ -58,21 +42,14 @@ def _bounded_float(name: str, default: float, minimum: float, maximum: float) ->
     return max(minimum, min(maximum, value))
 
 
-CONF = _bounded_float("INFERENCE_CONF", 0.5, 0.01, 1.0)
-
-
-def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
-    """Read an integer environment variable without making the worker crash.
-
-    Camera deployments are commonly configured through a hand-edited .env.
-    A typo in an operational timeout must fall back to a safe value rather
-    than preventing every RTSP stream from starting.
-    """
+def _buffer_size() -> str:
+    raw = os.getenv("RTSP_BUFFER_SIZE", "").strip()
+    if not raw:
+        return ""
     try:
-        value = int(os.getenv(name, str(default)))
-    except (TypeError, ValueError):
-        value = default
-    return max(minimum, min(maximum, value))
+        return str(max(1, min(1_000_000, int(raw))))
+    except ValueError:
+        return ""
 
 
 def _worker_token() -> str:
@@ -81,48 +58,29 @@ def _worker_token() -> str:
         return token
     token_file = Path(os.getenv("ZMK_WORKER_TOKEN_FILE", "/models/.worker-token"))
     try:
-        if token_file.is_file():
-            token = token_file.read_text(encoding="utf-8").strip()
-            if token:
-                return token
+        return token_file.read_text(encoding="utf-8").strip() if token_file.is_file() else ""
     except OSError:
-        pass
-    return ""
+        return ""
 
 
-# Kept as a module-level value for backwards compatibility and diagnostics;
-# internal requests deliberately call _worker_token() again to handle a token
-# provisioned by the API after this container has started.
+# Kept as an inspectable value for deployment diagnostics. Requests re-read
+# the file on every internal call so a token provisioned after startup works.
 WORKER_TOKEN = _worker_token()
-
-# "auto" tries TCP first, then alternates to UDP after a failed connection.
-# VLC often silently chooses another transport, which is why an explicit
-# fallback is important for cameras that work in VLC but not in OpenCV.
-RTSP_TRANSPORT = os.getenv("RTSP_TRANSPORT", "auto").lower()
-if RTSP_TRANSPORT not in ("auto", "tcp", "udp"):
+CONF = _bounded_float("INFERENCE_CONF", 0.5, 0.01, 1.0)
+RTSP_TRANSPORT = os.getenv("RTSP_TRANSPORT", "auto").strip().lower()
+if RTSP_TRANSPORT not in {"auto", "tcp", "udp"}:
     RTSP_TRANSPORT = "auto"
 TRANSPORT_ORDER = ["tcp", "udp"] if RTSP_TRANSPORT == "auto" else [RTSP_TRANSPORT]
-
-# OpenCV passes FFmpeg options as key;value pairs joined with |, not commas.
-def _buffer_size() -> str:
-    raw = os.getenv("RTSP_BUFFER_SIZE", "").strip()
-    if not raw:
-        return ""
-    try:
-        value = int(raw)
-    except ValueError:
-        return ""
-    return str(max(1, min(1_000_000, value)))
-
-
 _RTSP_BUFSIZE = _buffer_size()
 _RTSP_STIMEOUT = _bounded_int("RTSP_STIMEOUT", 5_000_000, 100_000, 120_000_000)
+OPEN_TIMEOUT_MS = _bounded_int("RTSP_OPEN_TIMEOUT_MS", 8_000, 1_000, 120_000)
+READ_TIMEOUT_MS = _bounded_int("RTSP_READ_TIMEOUT_MS", 8_000, 1_000, 120_000)
 OFFLINE_AFTER = _bounded_int("OFFLINE_AFTER_FRAMES", 3, 1, 100)
 RECONNECT_MIN = _bounded_int("RTSP_RECONNECT_SECONDS", 5, 0, 3_600)
-
-TELEMETRY_INTERVAL_SECONDS = 10.0
-SNAPSHOT_INTERVAL_SECONDS = 5.0
-CONTROL_POLL_INTERVAL_SECONDS = 2.0
+CONTROL_POLL_SECONDS = _bounded_float("CAMERA_CONTROL_POLL_SECONDS", 2.0, 0.2, 60.0)
+TELEMETRY_INTERVAL_SECONDS = _bounded_float("CAMERA_TELEMETRY_SECONDS", 5.0, 1.0, 60.0)
+SNAPSHOT_INTERVAL_SECONDS = _bounded_float("CAMERA_SNAPSHOT_SECONDS", 3.0, 0.5, 60.0)
+HEARTBEAT_INTERVAL_SECONDS = _bounded_float("CAMERA_HEARTBEAT_SECONDS", 5.0, 1.0, 60.0)
 EVENT_CLASSES = {
     "no_helmet",
     "no_vest",
@@ -131,481 +89,622 @@ EVENT_CLASSES = {
     "restricted_zone",
     "immobility",
 }
+_URL_SECRET = re.compile(r"rtsps?://[^\s'\"<>]+", re.IGNORECASE)
+_YOLO_CLASS: Any | None = None
+
+
+def redact_error(value: object, limit: int = 300) -> str:
+    """Return an operator-safe error: never echo an RTSP credential."""
+    text = _URL_SECRET.sub("<rtsp-url>", str(value or "")).replace("\n", " ").strip()
+    return text[:limit] or "Неизвестная ошибка потока"
 
 
 def file_sha256(path: Path) -> str:
-    hasher = hashlib.sha256()
+    digest = hashlib.sha256()
     with path.open("rb") as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def resolve_device() -> str:
+    """Resolve CUDA only while loading an actual model, never at startup."""
+    if DEVICE_SETTING != "auto":
+        return DEVICE_SETTING
+    try:
+        import torch
+
+        return "0" if torch.cuda.is_available() else "cpu"
+    except (ImportError, OSError, RuntimeError):
+        return "cpu"
+
+
+def _yolo_class():
+    global _YOLO_CLASS
+    if _YOLO_CLASS is None:
+        from ultralytics import YOLO
+
+        _YOLO_CLASS = YOLO
+    return _YOLO_CLASS
+
+
+def load_model_sync(info: dict[str, Any]) -> tuple[str, Any, str]:
+    """Blocking model work executed in a background thread."""
+    artifact = str(info["artifact_uri"]).removeprefix("file://")
+    path = Path(artifact)
+    if not path.is_file():
+        raise RuntimeError("Артефакт активной модели не найден")
+    checksum = str(info.get("checksum") or "")
+    if checksum and file_sha256(path).lower() != checksum.lower():
+        raise RuntimeError("Контрольная сумма активной модели не совпадает")
+    device = resolve_device()
+    return str(info["name"]), _yolo_class()(str(path)), device
+
+
+@dataclass(frozen=True)
+class CameraConfig:
+    camera_id: str
+    name: str
+    rtsp_url: str
+    fps_limit: float
+    restart_token: str = ""
+
+    @classmethod
+    def from_api(cls, raw: dict[str, Any]) -> CameraConfig:
+        return cls(
+            camera_id=str(raw["id"]),
+            name=str(raw.get("name") or raw["id"]),
+            rtsp_url=str(raw["rtsp_url"]),
+            fps_limit=max(0.1, float(raw.get("fps_limit") or 8)),
+            restart_token=str(raw.get("restart_requested_at") or ""),
+        )
+
+    @property
+    def signature(self) -> tuple[str, float, str]:
+        return self.rtsp_url, self.fps_limit, self.restart_token
+
+
+@dataclass
+class CameraSession:
+    config: CameraConfig
+    capture: Any | None = None
+    status: str = "connecting"
+    transport_index: int = 0
+    failures: int = 0
+    next_attempt_at: float = 0.0
+    next_frame_at: float = 0.0
+    last_telemetry_at: float = 0.0
+    telemetry_window_started: float = 0.0
+    frames_in_window: int = 0
+    last_snapshot_at: float = 0.0
+    last_error: str = ""
+    frame_task: asyncio.Task[None] | None = None
+
+    @property
+    def transport(self) -> str:
+        return TRANSPORT_ORDER[self.transport_index % len(TRANSPORT_ORDER)]
 
 
 class Runtime:
+    """Owns camera sessions, API protocol and optional model inference."""
+
     def __init__(self) -> None:
-        self.model = None
+        self.sessions: dict[str, CameraSession] = {}
+        self._transport_cursor: dict[str, int] = {}
+        self._http: httpx.AsyncClient | None = None
+        self._next_control_poll = 0.0
+        self._last_heartbeat_at = 0.0
+        self._last_no_camera_log = 0.0
+        self._last_loop_error_at = 0.0
+        self._capture_open_lock = asyncio.Lock()
+        self._inference_lock = asyncio.Lock()
+        self.model: Any | None = None
         self.model_name = ""
         self.device = DEVICE_SETTING
-        self.last_model_error = 0.0
-        self.captures: dict[str, object] = {}
-        self.last_telemetry: dict[str, float] = {}
-        self.last_status: dict[str, str] = {}
-        self.last_snapshot: dict[str, float] = {}
-        self.frame_counts: dict[str, int] = {}
-        self.last_error: dict[str, float] = {}
-        self.fail_counts: dict[str, int] = {}
-        self.next_open: dict[str, float] = {}
-        self.next_frame: dict[str, float] = {}
-        self.transport: dict[str, str] = {}
-        self.open_attempts: dict[str, int] = {}
-        self.last_camera_ids: tuple[str, ...] = ()
-        self.last_no_camera_log = 0.0
-        self.no_model_announced = False
+        self._model_task: asyncio.Task[tuple[str, Any, str]] | None = None
+        self._model_loading_name = ""
+        self._model_retry_at = 0.0
+        self._no_model_announced = False
 
-    async def get(self, path: str, internal: bool = False):
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, Any] | None = None,
+        *,
+        internal: bool = False,
+    ) -> Any:
+        if self._http is None:
+            self._http = httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0))
+        headers: dict[str, str] = {}
         if internal:
-            # Never cache this value: the API may provision or rotate the
-            # shared token after the worker process starts.
-            headers = {"X-Worker-Token": _worker_token()}
-        else:
-            headers = {"X-API-Key": API_KEY} if API_KEY else {}
-        async with httpx.AsyncClient(headers=headers, timeout=15) as client:
-            response = await client.get(API + path)
-            response.raise_for_status()
-            return response.json()
+            headers["X-Worker-Token"] = _worker_token()
+        elif API_KEY:
+            headers["X-API-Key"] = API_KEY
+        response = await self._http.request(method, API + path, json=payload, headers=headers)
+        response.raise_for_status()
+        if response.status_code == 204:
+            return None
+        return response.json()
 
-    async def post(self, path: str, data: dict):
-        headers = {"X-API-Key": API_KEY} if API_KEY else {}
-        async with httpx.AsyncClient(headers=headers, timeout=15) as client:
-            response = await client.post(API + path, json=data)
-            response.raise_for_status()
-            return response.json()
+    async def get(self, path: str, internal: bool = False) -> Any:
+        return await self._request("GET", path, internal=internal)
 
-    async def load_model(self) -> None:
-        info = await self.get("/api/internal/active-model", internal=True)
-        if not info:
-            if not self.no_model_announced:
-                print(
-                    "inference: no active model; camera preview and telemetry remain enabled",
-                    flush=True,
-                )
-                self.no_model_announced = True
-            self.model = None
-            self.model_name = ""
-            return
-        if info["name"] == self.model_name:
-            return
+    async def post(self, path: str, data: dict[str, Any]) -> Any:
+        return await self._request("POST", path, data)
 
-        artifact = info["artifact_uri"].removeprefix("file://")
-        path = Path(artifact)
-        if not path.exists():
-            raise RuntimeError(f"Model artifact not found: {artifact}")
-        if info.get("checksum"):
-            digest = await asyncio.to_thread(file_sha256, path)
-            if digest.lower() != info["checksum"].lower():
-                raise RuntimeError("Model checksum mismatch")
-        self.device = await asyncio.to_thread(resolve_device)
-        self.model = await asyncio.to_thread(load_yolo_model, str(path))
-        self.model_name = info["name"]
-        self.no_model_announced = False
-        print(f"inference: active model loaded: {self.model_name} (device={self.device})", flush=True)
+    async def post_internal(self, path: str, data: dict[str, Any]) -> Any:
+        return await self._request("POST", path, data, internal=True)
 
     def _next_transport(self, camera_id: str) -> str:
-        """Return TCP on the first auto attempt, then rotate on reconnect."""
-        current = self.transport.get(camera_id)
-        if current is None:
-            transport = TRANSPORT_ORDER[0]
-        else:
-            try:
-                index = TRANSPORT_ORDER.index(current)
-            except ValueError:
-                index = -1
-            transport = TRANSPORT_ORDER[(index + 1) % len(TRANSPORT_ORDER)]
-        self.transport[camera_id] = transport
+        """Compatibility helper: initial auto attempt is TCP, then UDP."""
+        index = self._transport_cursor.get(camera_id, 0)
+        transport = TRANSPORT_ORDER[index % len(TRANSPORT_ORDER)]
+        self._transport_cursor[camera_id] = (index + 1) % len(TRANSPORT_ORDER)
         return transport
 
     def _open_capture(self, url: str, transport: str):
-        parts = [f"rtsp_transport;{transport}", f"stimeout;{_RTSP_STIMEOUT}"]
+        # OpenCV/FFmpeg expects key;value entries separated by |. A comma makes
+        # FFmpeg reject the entire RTSP option expression.
+        options = [f"rtsp_transport;{transport}", f"stimeout;{_RTSP_STIMEOUT}"]
         if _RTSP_BUFSIZE:
-            parts.append(f"buffer_size;{_RTSP_BUFSIZE}")
-        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "|".join(parts)
-
-        capture = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-        capture.set(cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000)
-        capture.set(cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000)
+            options.append(f"buffer_size;{_RTSP_BUFSIZE}")
+        os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "|".join(options)
+        capture = cv2.VideoCapture(url, getattr(cv2, "CAP_FFMPEG", 0))
+        for name, value in (
+            ("CAP_PROP_OPEN_TIMEOUT_MSEC", OPEN_TIMEOUT_MS),
+            ("CAP_PROP_READ_TIMEOUT_MSEC", READ_TIMEOUT_MS),
+            ("CAP_PROP_BUFFERSIZE", 1),
+        ):
+            prop = getattr(cv2, name, None)
+            if prop is not None:
+                try:
+                    capture.set(prop, value)
+                except (AttributeError, RuntimeError, OSError, ValueError):
+                    pass
         return capture
 
     @staticmethod
-    def _release(capture: object | None) -> None:
+    def _is_open(capture: Any | None) -> bool:
+        try:
+            return bool(capture and capture.isOpened())
+        except (AttributeError, RuntimeError, OSError, ValueError):
+            return False
+
+    @staticmethod
+    def _release(capture: Any | None) -> None:
         if capture is None:
             return
         try:
-            capture.release()  # type: ignore[attr-defined]
+            capture.release()
         except (AttributeError, RuntimeError, OSError, ValueError):
             pass
 
-    def _release_capture(self, camera_id: str) -> None:
-        self._release(self.captures.pop(camera_id, None))
+    def _release_session(self, session: CameraSession) -> None:
+        self._release(session.capture)
+        session.capture = None
 
     @staticmethod
-    def _capture_is_open(capture: object | None) -> bool:
-        if capture is None:
-            return False
-        try:
-            return bool(capture.isOpened())  # type: ignore[attr-defined]
-        except (AttributeError, RuntimeError, OSError, ValueError):
-            return False
+    def _cancel_frame_task(session: CameraSession) -> None:
+        if session.frame_task is not None and not session.frame_task.done():
+            session.frame_task.cancel()
+        session.frame_task = None
 
-    def _log_error(self, camera_id: str, message: str, now: float) -> None:
-        if now - self.last_error.get(camera_id, 0) > 15:
-            print(message, flush=True)
-            self.last_error[camera_id] = now
+    def _log(self, message: str, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if force or now - self._last_loop_error_at >= 10:
+            print(f"inference: {message}", flush=True)
+            self._last_loop_error_at = now
 
-    async def _report_telemetry(
+    async def _report(
         self,
-        camera_id: str,
+        session: CameraSession,
         status: str,
-        latency_ms: int,
-        now: float,
+        latency_ms: int = 0,
+        error: str = "",
         *,
         force: bool = False,
     ) -> None:
-        previous_at = self.last_telemetry.get(camera_id)
-        previous_status = self.last_status.get(camera_id)
+        now = time.monotonic()
+        status_changed = session.status != status or session.last_error != error
         if (
             not force
-            and previous_at is not None
-            and previous_status == status
-            and now - previous_at < TELEMETRY_INTERVAL_SECONDS
+            and not status_changed
+            and session.last_telemetry_at
+            and now - session.last_telemetry_at < TELEMETRY_INTERVAL_SECONDS
         ):
             return
 
-        elapsed = max(0.001, now - previous_at) if previous_at is not None else 0.0
-        frames = self.frame_counts.get(camera_id, 0)
-        fps = round(frames / elapsed, 2) if elapsed else 0.0
+        if not session.telemetry_window_started:
+            session.telemetry_window_started = now
+        elapsed = max(0.001, now - session.telemetry_window_started)
+        # Do not publish a meaningless spike from the very first frame; the
+        # next telemetry window contains a real measured rate.
+        fps = round(session.frames_in_window / elapsed, 2) if session.frames_in_window and elapsed >= 1 else 0.0
         try:
-            await self.post(
-                f"/api/cameras/{camera_id}/telemetry",
-                {"status": status, "fps": fps, "latency_ms": latency_ms},
+            await self.post_internal(
+                f"/api/internal/cameras/{session.config.camera_id}/telemetry",
+                {"status": status, "fps": fps, "latency_ms": max(0, latency_ms), "error": error},
             )
-        except (httpx.HTTPError, RuntimeError, OSError, ValueError) as exc:
-            self._log_error(
-                camera_id,
-                f"inference: telemetry for {camera_id} was rejected: {exc}",
-                now,
-            )
+        except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
+            self._log(f"telemetry for {session.config.camera_id} rejected: {redact_error(exc)}")
         finally:
-            # Keep reporting bounded even when the API is briefly unavailable.
-            self.last_telemetry[camera_id] = now
-            self.last_status[camera_id] = status
-            self.frame_counts[camera_id] = 0
+            session.status = status
+            session.last_error = error
+            session.last_telemetry_at = now
+            session.telemetry_window_started = now
+            session.frames_in_window = 0
 
-    async def _publish_snapshot(self, camera: dict, image: object, now: float) -> None:
-        camera_id = camera["id"]
-        if now - self.last_snapshot.get(camera_id, 0) < SNAPSHOT_INTERVAL_SECONDS:
+    async def _heartbeat(self) -> None:
+        now = time.monotonic()
+        if now - self._last_heartbeat_at < HEARTBEAT_INTERVAL_SECONDS:
+            return
+        status = "running" if self.sessions else "idle"
+        detail = f"cameras={len(self.sessions)} model={self.model_name or 'none'}"
+        try:
+            await self.post_internal(
+                "/api/internal/inference/heartbeat",
+                {"status": status, "detail": detail, "camera_count": len(self.sessions)},
+            )
+            self._last_heartbeat_at = now
+        except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
+            self._log(f"heartbeat rejected: {redact_error(exc)}")
+
+    def _sync_cameras(self, raw_cameras: list[dict[str, Any]]) -> None:
+        desired = {config.camera_id: config for config in map(CameraConfig.from_api, raw_cameras)}
+        for camera_id in set(self.sessions) - set(desired):
+            session = self.sessions.pop(camera_id)
+            self._cancel_frame_task(session)
+            self._release_session(session)
+            self._transport_cursor.pop(camera_id, None)
+
+        for camera_id, config in desired.items():
+            session = self.sessions.get(camera_id)
+            if session is None:
+                self.sessions[camera_id] = CameraSession(config=config)
+                continue
+            if session.config.signature != config.signature:
+                self._cancel_frame_task(session)
+                self._release_session(session)
+                session.config = config
+                session.status = "connecting"
+                session.transport_index = 0
+                session.failures = 0
+                session.next_attempt_at = 0
+                session.next_frame_at = 0
+                session.last_error = ""
+            else:
+                session.config = config
+
+    async def _load_model_async(self, info: dict[str, Any]) -> tuple[str, Any, str]:
+        return await asyncio.to_thread(load_model_sync, info)
+
+    async def _refresh_model(self, info: dict[str, Any] | None) -> None:
+        now = time.monotonic()
+        if not info:
+            if self._model_task is not None and not self._model_task.done():
+                self._model_task.cancel()
+            self._model_task = None
+            self.model = None
+            self.model_name = ""
+            if not self._no_model_announced:
+                self._log("no active model; camera preview and telemetry remain enabled", force=True)
+                self._no_model_announced = True
             return
 
+        wanted_name = str(info["name"])
+        self._no_model_announced = False
+        if self.model_name == wanted_name and self.model is not None:
+            return
+
+        if self._model_task is not None:
+            if not self._model_task.done():
+                return
+            task = self._model_task
+            self._model_task = None
+            try:
+                loaded_name, model, device = task.result()
+            except (OSError, RuntimeError, ValueError, ImportError) as exc:
+                self._model_retry_at = now + 15
+                self._log(f"model unavailable; camera capture continues: {redact_error(exc)}", force=True)
+                return
+            if loaded_name == wanted_name:
+                self.model = model
+                self.model_name = loaded_name
+                self.device = device
+                self._log(f"active model loaded: {loaded_name} (device={device})", force=True)
+                return
+
+        if now < self._model_retry_at:
+            return
+        self.model = None
+        self.model_name = ""
+        self._model_loading_name = wanted_name
+        self._model_task = asyncio.create_task(self._load_model_async(dict(info)), name=f"model-load-{wanted_name}")
+        self._log(f"loading active model {wanted_name} in background", force=True)
+
+    async def load_model(self) -> None:
+        """Compatibility entry point used by unit tests and the control loop."""
+        info = await self.get("/api/internal/active-model", internal=True)
+        await self._refresh_model(info)
+
+    async def _refresh_control(self) -> None:
+        cameras = await self.get("/api/internal/cameras", internal=True)
+        self._sync_cameras(cameras)
         try:
-            height, width = image.shape[:2]  # type: ignore[attr-defined]
-            preview = image
-            # Fit the longest edge, not only width: portrait cameras otherwise
-            # create a 960×very-tall JPEG that can exceed the API size cap.
-            longest_edge = max(width, height)
-            if longest_edge > 960:
-                scale = 960 / longest_edge
-                preview = cv2.resize(image, (max(1, int(width * scale)), max(1, int(height * scale))))
-            encoded_ok, encoded = False, b""
-            # The API deliberately caps snapshots so one noisy 4K frame cannot
-            # exhaust storage or request memory. Lower quality before giving up.
-            for quality in (75, 60, 45):
-                encoded_ok, encoded = cv2.imencode(
-                    ".jpg",
-                    preview,
-                    [cv2.IMWRITE_JPEG_QUALITY, quality],
+            info = await self.get("/api/internal/active-model", internal=True)
+        except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
+            self._log(f"active-model query failed; camera capture continues: {redact_error(exc)}")
+            info = None
+        await self._refresh_model(info)
+
+        if not self.sessions and time.monotonic() - self._last_no_camera_log >= 30:
+            self._log("no enabled RTSP cameras returned by API; set RTSP_CAM_01 or add a camera", force=True)
+            self._last_no_camera_log = time.monotonic()
+
+    async def _open(self, session: CameraSession) -> bool:
+        now = time.monotonic()
+        if self._is_open(session.capture):
+            return True
+        if now < session.next_attempt_at:
+            return False
+
+        await self._report(session, "connecting", error="", force=session.status != "connecting")
+        transport = session.transport
+        started = time.perf_counter()
+        try:
+            # FFmpeg options are process-global in OpenCV, so serialise only
+            # the tiny open section; reads for other cameras remain concurrent.
+            async with self._capture_open_lock:
+                capture = await asyncio.wait_for(
+                    asyncio.to_thread(self._open_capture, session.config.rtsp_url, transport),
+                    timeout=OPEN_TIMEOUT_MS / 1000 + 2,
                 )
-                encoded_size = getattr(encoded, "nbytes", len(encoded))
-                if encoded_ok and encoded_size <= 1_250_000:
-                    break
-                encoded_ok = False
-        except (AttributeError, RuntimeError, OSError, ValueError) as exc:
-            self._log_error(camera_id, f"inference: could not encode snapshot for {camera_id}: {exc}", now)
-            return
+        except (TimeoutError, OSError, RuntimeError, ValueError) as exc:
+            await self._failed_open(session, redact_error(exc), round((time.perf_counter() - started) * 1000))
+            return False
 
-        if not encoded_ok:
-            self._log_error(camera_id, f"inference: snapshot for {camera_id} is too large", now)
+        if not self._is_open(capture):
+            self._release(capture)
+            await self._failed_open(session, f"не удалось открыть RTSP по {transport.upper()}", round((time.perf_counter() - started) * 1000))
+            return False
+
+        session.capture = capture
+        session.failures = 0
+        session.next_attempt_at = 0
+        self._log(f"camera {session.config.camera_id} opened via {transport.upper()}", force=True)
+        return True
+
+    async def _failed_open(self, session: CameraSession, reason: str, latency_ms: int) -> None:
+        session.failures += 1
+        # A connection-level failure should try the other transport immediately
+        # on the next reconnect, not after three identical TCP attempts.
+        session.transport_index = (session.transport_index + 1) % len(TRANSPORT_ORDER)
+        session.next_attempt_at = time.monotonic() + RECONNECT_MIN
+        session.next_frame_at = max(session.next_frame_at, session.next_attempt_at)
+        status = "offline" if session.failures >= OFFLINE_AFTER else "recovering"
+        await self._report(session, status, latency_ms, reason, force=True)
+        self._log(f"camera {session.config.camera_id} open failed: {reason}")
+
+    async def _failed_read(self, session: CameraSession, reason: str, latency_ms: int) -> None:
+        session.failures += 1
+        status = "offline" if session.failures >= OFFLINE_AFTER else "recovering"
+        if session.failures >= OFFLINE_AFTER:
+            self._release_session(session)
+            session.transport_index = (session.transport_index + 1) % len(TRANSPORT_ORDER)
+            session.next_attempt_at = time.monotonic() + RECONNECT_MIN
+            session.next_frame_at = max(session.next_frame_at, session.next_attempt_at)
+        await self._report(session, status, latency_ms, reason, force=True)
+        self._log(f"camera {session.config.camera_id} frame failed: {reason}")
+
+    @staticmethod
+    def _encode_snapshot(image: Any) -> bytes | None:
+        height, width = image.shape[:2]
+        preview = image
+        longest = max(width, height)
+        if longest > 960:
+            scale = 960 / longest
+            preview = cv2.resize(image, (max(1, int(width * scale)), max(1, int(height * scale))))
+        for quality in (75, 60, 45):
+            ok, encoded = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, quality])
+            size = getattr(encoded, "nbytes", len(encoded))
+            if ok and size <= 1_250_000:
+                return bytes(encoded)
+        return None
+
+    async def _publish_snapshot(self, session: CameraSession, image: Any) -> None:
+        now = time.monotonic()
+        if now - session.last_snapshot_at < SNAPSHOT_INTERVAL_SECONDS:
             return
         try:
-            await self.post(
-                f"/api/cameras/{camera_id}/snapshot",
+            encoded = await asyncio.to_thread(self._encode_snapshot, image)
+        except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+            self._log(f"snapshot encode failed for {session.config.camera_id}: {redact_error(exc)}")
+            return
+        if not encoded:
+            self._log(f"snapshot is too large for {session.config.camera_id}")
+            return
+        try:
+            await self.post_internal(
+                f"/api/internal/cameras/{session.config.camera_id}/snapshot",
                 {
                     "jpeg_base64": base64.b64encode(encoded).decode(),
                     "captured_at": datetime.now(timezone.utc).isoformat(),
                 },
             )
-        except (httpx.HTTPError, RuntimeError, OSError, ValueError) as exc:
-            # Do not advance last_snapshot: a transient API failure should be
-            # retried on the next frame rather than leaving a black card.
-            self._log_error(camera_id, f"inference: snapshot for {camera_id} was rejected: {exc}", now)
+            session.last_snapshot_at = now
+        except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
+            self._log(f"snapshot upload failed for {session.config.camera_id}: {redact_error(exc)}")
+
+    async def _infer(self, session: CameraSession, image: Any) -> None:
+        if self.model is None or not self.model_name:
             return
-        self.last_snapshot[camera_id] = now
-
-    async def _record_failure(
-        self,
-        camera: dict,
-        now: float,
-        latency_ms: int,
-        *,
-        reason: str,
-    ) -> None:
-        camera_id = camera["id"]
-        failures = self.fail_counts.get(camera_id, 0) + 1
-        self.fail_counts[camera_id] = failures
-        status = "offline" if failures >= OFFLINE_AFTER else "recovering"
-        if failures >= OFFLINE_AFTER:
-            self._release_capture(camera_id)
-            self.next_open[camera_id] = now + RECONNECT_MIN
-
-        await self._report_telemetry(
-            camera_id,
-            status,
-            latency_ms,
-            now,
-            force=status != self.last_status.get(camera_id),
-        )
-        self._log_error(
-            camera_id,
-            (
-                f"inference: camera {camera_id}: {reason} ({camera['name']}); "
-                f"failures={failures}, transport={self.transport.get(camera_id, '?')}"
-            ),
-            now,
-        )
-
-    async def frame(self, camera: dict) -> None:
-        camera_id = camera["id"]
-        now = time.time()
-        capture = self.captures.get(camera_id)
-
-        if not self._capture_is_open(capture):
-            if now < self.next_open.get(camera_id, 0):
-                # The scheduler will wake this camera once its reconnect time
-                # arrives. Never sleep here: one offline camera must not stall
-                # every other camera in the single worker loop.
-                return
-            self._release_capture(camera_id)
-            transport = self._next_transport(camera_id)
-            self.open_attempts[camera_id] = self.open_attempts.get(camera_id, 0) + 1
-            opened_at = time.perf_counter()
-            try:
-                capture = self._open_capture(camera["rtsp_url"], transport)
-            except (RuntimeError, OSError, ValueError) as exc:
-                await self._record_failure(
-                    camera,
-                    now,
-                    round((time.perf_counter() - opened_at) * 1000),
-                    reason=f"could not start capture: {exc}",
-                )
-                self.next_open[camera_id] = now + RECONNECT_MIN
-                return
-
-            if not self._capture_is_open(capture):
-                self._release(capture)
-                self.next_open[camera_id] = now + RECONNECT_MIN
-                await self._record_failure(
-                    camera,
-                    now,
-                    round((time.perf_counter() - opened_at) * 1000),
-                    reason=f"failed to open via {transport}",
-                )
-                return
-
-            self.captures[camera_id] = capture
-            print(
-                f"inference: camera {camera_id}: opened via {transport} ({camera['name']})",
-                flush=True,
-            )
-
-        started = time.perf_counter()
         try:
-            ok, image = await asyncio.to_thread(capture.read)  # type: ignore[union-attr]
-        except Exception as exc:  # noqa: BLE001 - OpenCV raises implementation-specific errors.
-            ok, image = False, None
-            read_error = str(exc)
-        else:
-            read_error = "stream read failed"
-        latency = round((time.perf_counter() - started) * 1000)
-
-        if not ok or image is None:
-            await self._record_failure(camera, now, latency, reason=read_error)
+            # GPU/Ultralytics inference is intentionally serialised; RTSP
+            # capture itself stays concurrent and does not wait for a stalled
+            # camera opening or read.
+            async with self._inference_lock:
+                result = (
+                    await asyncio.to_thread(
+                        self.model.predict,
+                        image,
+                        conf=CONF,
+                        device=self.device,
+                        verbose=False,
+                    )
+                )[0]
+        except Exception as exc:  # noqa: BLE001 - ML failures must not stop RTSP.
+            self._log(f"inference failed; camera capture continues: {redact_error(exc)}")
             return
 
-        had_failures = self.fail_counts.get(camera_id, 0) > 0
-        self.fail_counts[camera_id] = 0
-        self.next_open.pop(camera_id, None)
-        self.last_error.pop(camera_id, None)
-        self.frame_counts[camera_id] = self.frame_counts.get(camera_id, 0) + 1
-        await self._report_telemetry(
-            camera_id,
-            "online",
-            latency,
-            now,
-            force=had_failures or self.last_status.get(camera_id) != "online",
-        )
-
-        # A live preview is a camera feature, not an AI-model feature. Publish
-        # it before the model guard so operators can diagnose an RTSP stream
-        # while no active model has been registered yet.
-        await self._publish_snapshot(camera, image, now)
-        if self.model is None:
-            return
-
-        result = (
-            await asyncio.to_thread(
-                self.model.predict,
-                image,
-                conf=CONF,
-                device=self.device,
-                verbose=False,
-            )
-        )[0]
-        detections = []
+        detections: list[dict[str, Any]] = []
         stamp = datetime.now(timezone.utc).isoformat()
-        for index, (xyxy, cls, score) in enumerate(
-            zip(
+        try:
+            values = zip(
                 result.boxes.xyxy.cpu().tolist(),
                 result.boxes.cls.cpu().tolist(),
                 result.boxes.conf.cpu().tolist(),
             )
-        ):
-            label = str(self.model.names[int(cls)])
-            if label not in EVENT_CLASSES:
-                continue
-            x1, y1, x2, y2 = xyxy
-            spatial_id = (
-                f"{camera_id}-{label}-{int(((x1 + x2) / 2) // 100)}-"
-                f"{int(((y1 + y2) / 2) // 100)}"
-            )
-            detections.append(
-                {
-                    "camera_id": camera_id,
-                    "model_name": self.model_name,
-                    "timestamp": stamp,
-                    "event_type": label,
-                    "confidence": score,
-                    "person_id": spatial_id,
-                    "detection_id": f"{camera_id}:{int(time.time() * 1000)}:{index}",
-                    "bbox": [x1, y1, x2, y2],
-                }
-            )
+            for index, (xyxy, cls, score) in enumerate(values):
+                label = str(self.model.names[int(cls)])
+                if label not in EVENT_CLASSES:
+                    continue
+                x1, y1, x2, y2 = xyxy
+                detections.append(
+                    {
+                        "camera_id": session.config.camera_id,
+                        "model_name": self.model_name,
+                        "timestamp": stamp,
+                        "event_type": label,
+                        "confidence": score,
+                        "person_id": f"{session.config.camera_id}-{label}-{int(((x1 + x2) / 2) // 100)}-{int(((y1 + y2) / 2) // 100)}",
+                        "detection_id": f"{session.config.camera_id}:{int(time.time() * 1000)}:{index}",
+                        "bbox": [x1, y1, x2, y2],
+                    }
+                )
+        except (AttributeError, IndexError, TypeError, ValueError) as exc:
+            self._log(f"invalid model output ignored: {redact_error(exc)}")
+            return
+
         if detections:
             try:
                 await self.post("/api/inference/detections", {"detections": detections})
-            except (httpx.HTTPError, RuntimeError, OSError, ValueError) as exc:
-                self._log_error(camera_id, f"inference: detections were rejected: {exc}", now)
+            except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
+                self._log(f"detections rejected: {redact_error(exc)}")
 
-    def _drop_stale_cameras(self, active_ids: set[str]) -> None:
-        for camera_id in set(self.captures) - active_ids:
-            self._release_capture(camera_id)
-            self.last_telemetry.pop(camera_id, None)
-            self.last_status.pop(camera_id, None)
-            self.last_snapshot.pop(camera_id, None)
-            self.frame_counts.pop(camera_id, None)
-            self.last_error.pop(camera_id, None)
-            self.fail_counts.pop(camera_id, None)
-            self.next_open.pop(camera_id, None)
-            self.next_frame.pop(camera_id, None)
-            self.transport.pop(camera_id, None)
-            self.open_attempts.pop(camera_id, None)
+    async def frame(self, camera: dict[str, Any] | CameraConfig) -> None:
+        """Read one frame. Scheduling is performed by run(), so tests and
+        one-off calls can invoke this method repeatedly without artificial sleep.
+        """
+        config = camera if isinstance(camera, CameraConfig) else CameraConfig.from_api(camera)
+        session = self.sessions.get(config.camera_id)
+        if session is None:
+            session = CameraSession(config=config)
+            self.sessions[config.camera_id] = session
+        elif session.config.signature != config.signature:
+            self._release_session(session)
+            session.config = config
+            session.transport_index = 0
+            session.failures = 0
+            session.next_attempt_at = 0
+
+        if not await self._open(session):
+            return
+
+        started = time.perf_counter()
+        try:
+            ok, image = await asyncio.wait_for(
+                asyncio.to_thread(session.capture.read),
+                timeout=READ_TIMEOUT_MS / 1000 + 1,
+            )
+        except TimeoutError:
+            ok, image = False, None
+            error = "таймаут чтения RTSP-кадра"
+        except Exception as exc:  # noqa: BLE001 - OpenCV exception types vary by build.
+            ok, image = False, None
+            error = redact_error(exc)
+        else:
+            error = "пустой кадр от RTSP-потока"
+        latency = round((time.perf_counter() - started) * 1000)
+
+        if not ok or image is None:
+            await self._failed_read(session, error, latency)
+            return
+
+        session.failures = 0
+        session.next_attempt_at = 0
+        session.frames_in_window += 1
+        await self._report(session, "online", latency, "", force=session.status != "online")
+        await self._publish_snapshot(session, image)
+        await self._infer(session, image)
 
     async def run(self) -> None:
-        cameras: list[dict] = []
-        next_control_poll = 0.0
         print(
-            f"inference: started (api={API}, device={DEVICE_SETTING}, transport={RTSP_TRANSPORT})",
+            f"inference: camera runtime started (api={API}, device={DEVICE_SETTING}, transport={RTSP_TRANSPORT})",
             flush=True,
         )
         try:
             while True:
-                # The API owns provisioning of the shared secret. Wait for it
-                # instead of exiting permanently during a container start race.
                 if not _worker_token():
-                    print("inference: waiting for worker token", flush=True)
+                    self._log("waiting for worker token", force=True)
                     await asyncio.sleep(2)
                     continue
+
+                now = time.monotonic()
                 try:
-                    now = time.time()
-                    if now >= next_control_poll:
-                        # Poll the control plane at a bounded rate, then run
-                        # camera schedules independently. The old `sleep` in a
-                        # per-camera loop divided each camera's effective FPS
-                        # by the number of configured cameras.
-                        try:
-                            await self.load_model()
-                        except Exception as exc:  # noqa: BLE001 - preview must survive model failures.
-                            self.model = None
-                            self.model_name = ""
-                            if now - self.last_model_error > 15:
-                                print(
-                                    f"inference: active model unavailable; continuing camera preview: {exc}",
-                                    flush=True,
-                                )
-                                self.last_model_error = now
-                        cameras = await self.get("/api/internal/cameras", internal=True)
-                        camera_ids = tuple(camera["id"] for camera in cameras)
-                        self._drop_stale_cameras(set(camera_ids))
-                        if camera_ids != self.last_camera_ids:
-                            if camera_ids:
-                                print(
-                                    f"inference: monitoring {len(camera_ids)} camera(s): {', '.join(camera_ids)}",
-                                    flush=True,
-                                )
-                            self.last_camera_ids = camera_ids
-                        if not camera_ids and now - self.last_no_camera_log >= 30:
-                            print(
-                                "inference: no enabled RTSP cameras returned by API; "
-                                "set RTSP_CAM_01 or add and enable a camera in the web panel",
-                                flush=True,
-                            )
-                            self.last_no_camera_log = now
-                        next_control_poll = time.time() + CONTROL_POLL_INTERVAL_SECONDS
+                    if now >= self._next_control_poll:
+                        await self._refresh_control()
+                        self._next_control_poll = time.monotonic() + CONTROL_POLL_SECONDS
 
-                    if not cameras:
-                        await asyncio.sleep(min(1.0, max(0.05, next_control_poll - time.time())))
-                        continue
+                    for session in list(self.sessions.values()):
+                        task = session.frame_task
+                        if task is not None:
+                            if not task.done():
+                                continue
+                            try:
+                                task.result()
+                            except asyncio.CancelledError:
+                                pass
+                            except Exception as exc:  # noqa: BLE001 - isolate one camera task.
+                                self._log(f"camera {session.config.camera_id} task failed: {redact_error(exc)}")
+                            session.frame_task = None
 
-                    wake_at = next_control_poll
-                    for camera in cameras:
-                        camera_id = camera["id"]
-                        due_at = max(
-                            self.next_frame.get(camera_id, 0),
-                            self.next_open.get(camera_id, 0),
-                        )
-                        now = time.time()
-                        if now < due_at:
-                            wake_at = min(wake_at, due_at)
+                        now = time.monotonic()
+                        if now < session.next_frame_at:
                             continue
-
-                        started = now
-                        await self.frame(camera)
-                        try:
-                            interval = max(0.01, 1 / float(camera["fps_limit"]))
-                        except (TypeError, ValueError, ZeroDivisionError):
-                            interval = 0.125
-                        self.next_frame[camera_id] = max(
-                            started + interval,
-                            self.next_open.get(camera_id, 0),
+                        session.next_frame_at = now + 1 / session.config.fps_limit
+                        session.frame_task = asyncio.create_task(
+                            self.frame(session.config),
+                            name=f"camera-frame-{session.config.camera_id}",
                         )
-                        wake_at = min(wake_at, self.next_frame[camera_id])
 
-                    await asyncio.sleep(min(0.2, max(0.01, wake_at - time.time())))
-                except Exception as exc:  # noqa: BLE001 - keep a long-running worker alive.
-                    print(f"inference loop error: {exc}", flush=True)
-                    cameras = []
-                    next_control_poll = 0.0
-                    await asyncio.sleep(3)
+                    await self._heartbeat()
+                    wake_times = [self._next_control_poll, self._last_heartbeat_at + HEARTBEAT_INTERVAL_SECONDS]
+                    for session in self.sessions.values():
+                        if session.frame_task is not None and not session.frame_task.done():
+                            continue
+                        wake_times.append(session.next_frame_at)
+                        if session.next_attempt_at:
+                            wake_times.append(session.next_attempt_at)
+                    delay = min(wake_times) - time.monotonic() if wake_times else 1.0
+                    await asyncio.sleep(min(0.25, max(0.01, delay)))
+                except Exception as exc:  # noqa: BLE001 - a service worker must self-heal.
+                    self._log(f"control loop error: {redact_error(exc)}", force=True)
+                    self._next_control_poll = time.monotonic() + 2
+                    await asyncio.sleep(1)
         finally:
-            for camera_id in list(self.captures):
-                self._release_capture(camera_id)
+            pending = []
+            for session in self.sessions.values():
+                if session.frame_task is not None and not session.frame_task.done():
+                    session.frame_task.cancel()
+                    pending.append(session.frame_task)
+                self._release_session(session)
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+            if self._model_task is not None and not self._model_task.done():
+                self._model_task.cancel()
+            if self._http is not None:
+                await self._http.aclose()
 
 
 if __name__ == "__main__":
