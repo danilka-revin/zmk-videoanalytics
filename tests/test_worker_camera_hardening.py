@@ -57,6 +57,7 @@ class _FakeCap:
 def worker_mod(monkeypatch):
     monkeypatch.setenv("RTSP_TRANSPORT", "tcp")
     monkeypatch.setenv("RTSP_STIMEOUT", "5000000")
+    monkeypatch.setenv("CAMERA_DECODER", "opencv")
     _FakeCap.default_opened = True
     _FakeCap.results = []
 
@@ -256,6 +257,12 @@ def test_camera_errors_redact_rtsp_credentials(worker_mod):
     assert "<rtsp-url>" in message
 
 
+def test_ffmpeg_decoder_uses_corruption_tolerant_pipeline():
+    source = WORKER.read_text(encoding="utf-8")
+    for option in ("CAMERA_DECODER", "discardcorrupt", "ignore_err", "max_delay", "image2pipe", "ZMK_RTSP_URL"):
+        assert option in source
+
+
 def test_compose_forwards_all_camera_runtime_settings():
     import yaml
 
@@ -265,6 +272,7 @@ def test_compose_forwards_all_camera_runtime_settings():
     assert "ZMK_WORKER_TOKEN_FILE" in api_env
     for variable in (
         "ZMK_WORKER_TOKEN_FILE",
+        "CAMERA_DECODER",
         "RTSP_TRANSPORT",
         "RTSP_BUFFER_SIZE",
         "RTSP_STIMEOUT",

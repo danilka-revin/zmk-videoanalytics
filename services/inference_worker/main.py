@@ -13,7 +13,7 @@ import hashlib
 import os
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,6 +24,11 @@ import httpx
 API = os.getenv("ZMK_API_URL", "http://api:8000").rstrip("/")
 API_KEY = os.getenv("ZMK_API_KEY", "")
 DEVICE_SETTING = os.getenv("INFERENCE_DEVICE", "auto").strip() or "auto"
+# FFmpeg subprocess decoding is the default because it can discard corrupt RTP
+# packets and survive a damaged H.264 GOP much better than OpenCV VideoCapture.
+CAMERA_DECODER = os.getenv("CAMERA_DECODER", "ffmpeg").strip().lower()
+if CAMERA_DECODER not in {"ffmpeg", "opencv"}:
+    CAMERA_DECODER = "ffmpeg"
 
 
 def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -91,6 +96,7 @@ HEARTBEAT_INTERVAL_SECONDS = _bounded_float("CAMERA_HEARTBEAT_SECONDS", 5.0, 1.0
 # Give H.264 decoding time to reach the next IDR/keyframe before reconnecting.
 KEYFRAME_GRACE_SECONDS = _bounded_float("RTSP_KEYFRAME_GRACE_SECONDS", 15.0, 1.0, 120.0)
 KEYFRAME_RETRY_SECONDS = 0.2
+FFMPEG_FRAME_MAX_BYTES = _bounded_int("FFMPEG_FRAME_MAX_BYTES", 5_000_000, 100_000, 20_000_000)
 EVENT_CLASSES = {
     "no_helmet",
     "no_vest",
@@ -192,6 +198,10 @@ class CameraSession:
     received_first_frame: bool = False
     frame_task: asyncio.Task[None] | None = None
     restart_pending: bool = False
+    ffmpeg: asyncio.subprocess.Process | None = None
+    ffmpeg_buffer: bytearray = field(default_factory=bytearray)
+    ffmpeg_stderr_task: asyncio.Task[None] | None = None
+    decoder_error: str = ""
 
     @property
     def transport(self) -> str:
@@ -323,9 +333,24 @@ class Runtime:
         except (AttributeError, RuntimeError, OSError, ValueError):
             pass
 
+    @staticmethod
+    def _stop_ffmpeg(session: CameraSession) -> None:
+        process = session.ffmpeg
+        session.ffmpeg = None
+        session.ffmpeg_buffer.clear()
+        if session.ffmpeg_stderr_task is not None and not session.ffmpeg_stderr_task.done():
+            session.ffmpeg_stderr_task.cancel()
+        session.ffmpeg_stderr_task = None
+        if process is not None and process.returncode is None:
+            try:
+                process.terminate()
+            except ProcessLookupError:
+                pass
+
     def _release_session(self, session: CameraSession) -> None:
         self._release(session.capture)
         session.capture = None
+        self._stop_ffmpeg(session)
 
     @staticmethod
     def _frame_task_finished(session: CameraSession) -> bool:
@@ -539,6 +564,128 @@ class Runtime:
         self._log(f"camera {session.config.camera_id} opened via {transport.upper()}", force=True)
         return True
 
+    async def _drain_ffmpeg_stderr(self, session: CameraSession, process: asyncio.subprocess.Process) -> None:
+        if process.stderr is None:
+            return
+        try:
+            while True:
+                line = await process.stderr.readline()
+                if not line:
+                    return
+                text = redact_error(line.decode(errors="replace"))
+                if text:
+                    # Keep only the most recent decoder hint. Printing every
+                    # damaged H.264 macroblock would flood operator logs.
+                    session.decoder_error = text
+        except asyncio.CancelledError:
+            raise
+        except (OSError, RuntimeError, ValueError):
+            return
+
+    async def _start_ffmpeg(self, session: CameraSession) -> None:
+        if session.ffmpeg is not None and session.ffmpeg.returncode is None:
+            return
+        self._stop_ffmpeg(session)
+        await self._report(session, "connecting", error="", force=session.status != "connecting")
+        env = os.environ.copy()
+        env.update(
+            {
+                "ZMK_RTSP_URL": session.config.rtsp_url,
+                "ZMK_RTSP_TRANSPORT": session.transport,
+                "ZMK_RTSP_TIMEOUT_US": str(_RTSP_STIMEOUT),
+                "ZMK_CAMERA_FPS": str(min(max(session.config.fps_limit, 0.1), 30)),
+            }
+        )
+        # URL is intentionally read from an environment variable inside the
+        # container. It never appears in a process command line or log.
+        command = (
+            'exec ffmpeg -hide_banner -nostdin -loglevel warning '
+            '-rtsp_transport "$ZMK_RTSP_TRANSPORT" '
+            '-rw_timeout "$ZMK_RTSP_TIMEOUT_US" '
+            '-timeout "$ZMK_RTSP_TIMEOUT_US" '
+            '-fflags +genpts+discardcorrupt -err_detect ignore_err -flags low_delay '
+            '-max_delay 500000 -analyzeduration 0 -probesize 32768 '
+            '-i "$ZMK_RTSP_URL" -an -sn -dn '
+            '-vf "fps=${ZMK_CAMERA_FPS}" '
+            '-f image2pipe -vcodec mjpeg -q:v 5 pipe:1'
+        )
+        process = await asyncio.create_subprocess_exec(
+            "sh",
+            "-c",
+            command,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+        )
+        session.ffmpeg = process
+        session.ffmpeg_stderr_task = asyncio.create_task(
+            self._drain_ffmpeg_stderr(session, process),
+            name=f"ffmpeg-stderr-{session.config.camera_id}",
+        )
+        session.opened_at = time.monotonic()
+        session.received_first_frame = False
+        session.failures = 0
+        session.decoder_error = ""
+        self._log(f"camera {session.config.camera_id} FFmpeg decoder started via {session.transport.upper()}", force=True)
+
+    @staticmethod
+    def _decode_jpeg(payload: bytes):
+        import numpy as np
+
+        return cv2.imdecode(np.frombuffer(payload, dtype=np.uint8), cv2.IMREAD_COLOR)
+
+    async def _ffmpeg_frame(self, session: CameraSession) -> tuple[Any | None, str]:
+        await self._start_ffmpeg(session)
+        process = session.ffmpeg
+        if process is None or process.stdout is None:
+            return None, "FFmpeg decoder не запущен"
+
+        wait_seconds = READ_TIMEOUT_MS / 1000 + 1
+        if not session.received_first_frame:
+            wait_seconds = max(wait_seconds, KEYFRAME_GRACE_SECONDS)
+        deadline = time.monotonic() + wait_seconds
+        while time.monotonic() < deadline:
+            buffer = session.ffmpeg_buffer
+            start = buffer.find(b"\xff\xd8")
+            if start > 0:
+                del buffer[:start]
+            if start == -1:
+                buffer.clear()
+            else:
+                end = buffer.find(b"\xff\xd9", 2)
+                if end != -1:
+                    payload = bytes(buffer[:end + 2])
+                    del buffer[:end + 2]
+                    try:
+                        image = await asyncio.to_thread(self._decode_jpeg, payload)
+                    except (ImportError, OSError, RuntimeError, ValueError) as exc:
+                        return None, redact_error(exc)
+                    if image is not None:
+                        return image, ""
+
+            remaining = max(0.01, deadline - time.monotonic())
+            try:
+                chunk = await asyncio.wait_for(process.stdout.read(65_536), timeout=remaining)
+            except TimeoutError:
+                break
+            if not chunk:
+                detail = session.decoder_error or "FFmpeg завершил поток без кадра"
+                self._stop_ffmpeg(session)
+                return None, detail
+            buffer.extend(chunk)
+            if len(buffer) > FFMPEG_FRAME_MAX_BYTES:
+                # Retain only the tail after a possible JPEG start marker.
+                last_start = buffer.rfind(b"\xff\xd8")
+                if last_start >= 0:
+                    del buffer[:last_start]
+                else:
+                    buffer.clear()
+
+        detail = session.decoder_error or "таймаут ожидания кадра от FFmpeg"
+        self._stop_ffmpeg(session)
+        return None, detail
+
     async def _failed_open(self, session: CameraSession, reason: str, latency_ms: int) -> None:
         session.failures += 1
         # A connection-level failure should try the other transport immediately
@@ -693,20 +840,22 @@ class Runtime:
             session.failures = 0
             session.next_attempt_at = 0
 
-        if not await self._open(session):
-            return
-
         started = time.perf_counter()
-        try:
-            # CAP_PROP_READ_TIMEOUT_MSEC was supplied before open(). Await the
-            # native call instead of cancelling it mid-FFmpeg-read: cancellation
-            # is unsafe for OpenCV and caused native worker crashes (exit 139).
-            ok, image = await asyncio.to_thread(session.capture.read)
-        except Exception as exc:  # noqa: BLE001 - OpenCV exception types vary by build.
-            ok, image = False, None
-            error = redact_error(exc)
+        if CAMERA_DECODER == "ffmpeg":
+            image, error = await self._ffmpeg_frame(session)
+            ok = image is not None
         else:
-            error = "пустой кадр от RTSP-потока"
+            if not await self._open(session):
+                return
+            try:
+                # CAP_PROP_READ_TIMEOUT_MSEC was supplied before open(). Await
+                # the native call instead of cancelling it mid-FFmpeg-read.
+                ok, image = await asyncio.to_thread(session.capture.read)
+            except Exception as exc:  # noqa: BLE001 - OpenCV exception types vary by build.
+                ok, image = False, None
+                error = redact_error(exc)
+            else:
+                error = "пустой кадр от RTSP-потока"
         latency = round((time.perf_counter() - started) * 1000)
 
         if not ok or image is None:
@@ -723,7 +872,7 @@ class Runtime:
 
     async def run(self) -> None:
         print(
-            f"inference: camera runtime started (api={API}, device={DEVICE_SETTING}, transport={RTSP_TRANSPORT})",
+            f"inference: camera runtime started (api={API}, device={DEVICE_SETTING}, transport={RTSP_TRANSPORT}, decoder={CAMERA_DECODER})",
             flush=True,
         )
         try:

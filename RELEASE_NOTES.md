@@ -7,6 +7,7 @@
 ## Камеры
 
 - новая машина состояний: `connecting → online / recovering / offline`;
+- persistent FFmpeg decoder по умолчанию: `-fflags +discardcorrupt`, `-err_detect ignore_err`, error concealment и MJPEG pipe, чтобы повреждённые RTP/H.264 кадры не давали чёрное превью и не роняли worker;
 - отдельная сессия и расписание на каждую камеру: сбой одной камеры не блокирует остальные;
 - native OpenCV/FFmpeg чтение больше не отменяется из Python посередине кадра, что исключает crash worker с `exit code 139` при повреждённом потоке;
 - TCP-first / UDP fallback в `RTSP_TRANSPORT=auto`;
