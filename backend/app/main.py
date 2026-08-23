@@ -321,7 +321,7 @@ async def security_middleware(request: Request, call_next):
         admin_read=path.startswith(("/api/admin/","/api/logs","/api/settings"))
         operator_only=path.startswith("/api/reports/")
         viewer_write=telegram_role=="viewer" and request.method!="GET"
-        operator_write=telegram_role=="operator" and request.method!="GET" and not (path.startswith("/api/events/") and path.endswith("/ack"))
+        operator_write=telegram_role=="operator" and request.method!="GET" and not (path.startswith("/api/events/") and (path.endswith("/ack") or path=="/api/events/ack-bulk"))
         if (telegram_role!="admin" and (admin_write or admin_read)) or (telegram_role=="viewer" and operator_only) or viewer_write or operator_write:
             from fastapi.responses import JSONResponse
             return JSONResponse({"detail":"Insufficient Telegram role"},status_code=403)
@@ -462,6 +462,14 @@ class CameraSnapshotIn(BaseModel):
     captured_at:datetime|None=None
 class SettingIn(BaseModel): value:float=Field(ge=.1,le=1)
 class AckIn(BaseModel): note:str=Field(default="",max_length=500)
+class BulkAckIn(BaseModel):
+    event_ids:list[int]=Field(min_length=1,max_length=500)
+    note:str=Field(default="",max_length=500)
+    @field_validator("event_ids")
+    @classmethod
+    def unique_positive_ids(cls,value:list[int]):
+        if any(item<1 for item in value): raise ValueError("event_ids must be positive")
+        return list(dict.fromkeys(value))
 class DetectionIn(BaseModel):
     camera_id:str=Field(min_length=1,max_length=64)
     model_name:str=Field(min_length=1,max_length=120)
@@ -853,6 +861,26 @@ def event_frame(event_id:int):
     target=event_frame_path_for(event_id)
     if not target.is_file(): raise HTTPException(404,"Кадр события ещё не сохранён")
     return FileResponse(target,media_type="image/jpeg",headers={"Cache-Control":"no-store"})
+
+@app.post("/api/events/ack-bulk")
+def ack_events_bulk(payload:BulkAckIn):
+    """Acknowledge a reviewed batch in one atomic operator action."""
+    event_ids=payload.event_ids
+    marks=",".join("?" for _ in event_ids)
+    con=db()
+    try:
+        rows_found=con.execute(f"SELECT id,acknowledged FROM events WHERE id IN ({marks})",event_ids).fetchall()  # nosec B608 - placeholders only
+        found={int(row[0]):int(row[1]) for row in rows_found}
+        missing=[event_id for event_id in event_ids if event_id not in found]
+        pending=[event_id for event_id in event_ids if found.get(event_id)==0]
+        if pending:
+            pending_marks=",".join("?" for _ in pending)
+            con.execute(f"UPDATE events SET acknowledged=1,note=? WHERE id IN ({pending_marks})",(payload.note,*pending))  # nosec B608 - placeholders only
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","event_manager",f"Bulk acknowledged events={len(pending)} already={len(event_ids)-len(pending)-len(missing)} missing={len(missing)}"))
+        con.commit()
+        return {"acknowledged_ids":pending,"already_acknowledged_ids":[event_id for event_id in event_ids if found.get(event_id)==1],"missing_ids":missing,"note":payload.note}
+    finally:
+        con.close()
 
 @app.post("/api/events/{event_id}/ack")
 def ack(event_id:int,payload:AckIn):
@@ -1565,9 +1593,18 @@ def csv_safe(value:Any):
 def sanitize_csv_rows(data:list[dict[str,Any]]): return [{k:csv_safe(v) for k,v in row.items()} for row in data]
 
 @app.get("/api/reports/events.csv")
-def report_csv():
-    data=sanitize_csv_rows(rows("SELECT timestamp,camera_id,type,severity,confidence,person_id,acknowledged,note FROM events ORDER BY timestamp DESC"))
-    out=io.StringIO(); w=csv.DictWriter(out,fieldnames=data[0].keys() if data else []); w.writeheader(); w.writerows(data)
+def report_csv(severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,camera_id:str|None=None,q:str|None=Query(default=None,max_length=100)):
+    """Export exactly the event slice an operator is reviewing."""
+    ack=int(acknowledged) if acknowledged is not None else None
+    term=(q or "").strip()
+    like=f"%{term}%" if term else None
+    data=sanitize_csv_rows(rows("""SELECT e.timestamp,e.camera_id,e.type,e.severity,e.confidence,e.person_id,e.acknowledged,e.note FROM events e
+        LEFT JOIN cameras c ON c.id=e.camera_id
+        WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?) AND (? IS NULL OR e.camera_id=?)
+          AND (? IS NULL OR e.camera_id LIKE ? OR e.person_id LIKE ? OR e.type LIKE ? OR c.name LIKE ? OR c.zone LIKE ?)
+        ORDER BY e.timestamp DESC""",(severity,severity,event_type,event_type,ack,ack,camera_id,camera_id,like,like,like,like,like,like)))
+    fields=['timestamp','camera_id','type','severity','confidence','person_id','acknowledged','note']
+    out=io.StringIO(); w=csv.DictWriter(out,fieldnames=fields); w.writeheader(); w.writerows(data)
     return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=zmk-events.csv"})
 @app.get("/api/stream")
 async def stream():
