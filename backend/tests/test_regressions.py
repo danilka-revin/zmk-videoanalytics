@@ -25,6 +25,14 @@ def test_invalid_rtsp_and_detection_timestamp_are_rejected():
         assert bad_detection.status_code == 422
 
 
+def test_camera_fps_limit_is_capped_at_twenty():
+    with TestClient(app) as c:
+        invalid = c.post('/api/cameras', json={'name':'Fast','zone':'Test','rtsp_url':'rtsp://camera/stream','fps_limit':20.1})
+        assert invalid.status_code == 422
+        valid = c.post('/api/cameras', json={'name':'Twenty','zone':'Test','rtsp_url':'rtsp://camera/stream','fps_limit':20})
+        assert valid.status_code == 201
+
+
 def test_csv_formula_injection_is_neutralized():
     assert csv_safe('=HYPERLINK("https://evil.invalid")').startswith("'=")
     assert csv_safe('+cmd') == "'+cmd"

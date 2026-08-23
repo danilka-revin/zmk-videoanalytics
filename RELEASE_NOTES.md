@@ -19,6 +19,7 @@
 - worker heartbeat в API и понятные диагностические данные;
 - реальный MJPEG preview endpoint в панели: кадры отображаются с `CAMERA_LIVE_FPS` (до `fps_limit` камеры), а не редким snapshot polling;
 - low-latency FFmpeg/MJPEG pipeline: `nobuffer`, `avioflags=direct`, RTP max delay 100 мс, immediate packet flush и Nginx без proxy buffering;
+- карточки камеры одинакового размера с настройкой `Компакт / Обычные / Крупные`, native fullscreen по клику и честный FPS `факт / лимит` (ползунок до 20 FPS);
 - training-worker всегда запускается с базовым стеком; GPU включается автоматически при NVIDIA Container Toolkit, иначе доступен CPU fallback;
 - хранение безопасной последней причины ошибки без RTSP-логина и пароля;
 - кнопка «Перезапустить» в карточке камеры: worker получает новый token конфигурации и заново открывает поток;

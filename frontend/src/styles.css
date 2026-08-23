@@ -110,3 +110,5 @@ html[data-theme=dark] .trainer-head select,html[data-theme=dark] .error-report s
 @media(max-width:900px){.camera-card,.cards.size-compact .camera-card,.cards.size-normal .camera-card,.cards.size-large .camera-card{width:100%;flex-basis:100%}.page-actions{align-items:flex-start}.camera-page-tools{flex-wrap:wrap;justify-content:flex-end}}
 .camera-page-tools>button{border:1px solid #17251f;background:#17251f;color:var(--accent);border-radius:7px;padding:8px 11px;display:flex;align-items:center;gap:6px}
 .feed:fullscreen{aspect-ratio:auto!important}
+.camera-modal .fps-slider{accent-color:#75b482;padding:0;margin-top:8px}.camera-modal .fps-value{float:right;font-size:9px;color:var(--accent);margin-top:2px}.camera-modal label>small{display:block;font-size:8px;color:var(--muted);margin-top:4px}
+.cards.size-compact .camera-actions{display:grid;grid-template-columns:1fr 1fr}.cards.size-compact .camera-actions button{min-width:0;justify-content:center;white-space:nowrap;padding:7px 4px}.cards.size-compact .camera-actions button svg{flex-shrink:0}

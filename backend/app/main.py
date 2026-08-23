@@ -174,6 +174,9 @@ def init_db():
     for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''","telemetry_at":"TEXT NOT NULL DEFAULT ''","last_error":"TEXT NOT NULL DEFAULT ''","restart_requested_at":"TEXT NOT NULL DEFAULT ''"}.items():
         if column not in camera_columns: con.execute(f"ALTER TABLE cameras ADD COLUMN {column} {ddl}")
     con.execute("UPDATE cameras SET created_at=updated_at WHERE created_at='' OR created_at IS NULL")
+    # A live MJPEG browser stream has a deliberate upper bound: keep stored
+    # legacy values consistent with the UI/API maximum of 20 FPS.
+    con.execute("UPDATE cameras SET fps_limit=20 WHERE fps_limit>20")
     model_columns={r[1] for r in con.execute("PRAGMA table_info(model_registry)").fetchall()}
     for column,ddl in {"artifact_uri":"TEXT NOT NULL DEFAULT ''","checksum":"TEXT NOT NULL DEFAULT ''"}.items():
         if column not in model_columns: con.execute(f"ALTER TABLE model_registry ADD COLUMN {column} {ddl}")
@@ -384,7 +387,7 @@ class CameraIn(BaseModel):
     zone:str=Field(default="Без зоны",min_length=1,max_length=80)
     description:str=Field(default="",max_length=500)
     rtsp_url:str=Field(default="",max_length=2048)
-    fps_limit:float=Field(default=8,ge=.1,le=60)
+    fps_limit:float=Field(default=8,ge=.1,le=20)
     enabled:bool=True
     @field_validator("rtsp_url")
     @classmethod
@@ -395,7 +398,7 @@ class CameraUpdate(BaseModel):
     zone:str=Field(default="Без зоны",min_length=1,max_length=80)
     description:str=Field(default="",max_length=500)
     rtsp_url:str|None=Field(default=None,max_length=2048)
-    fps_limit:float=Field(default=8,ge=.1,le=60)
+    fps_limit:float=Field(default=8,ge=.1,le=20)
     enabled:bool=True
     @field_validator("rtsp_url")
     @classmethod
