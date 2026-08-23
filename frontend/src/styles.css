@@ -86,3 +86,11 @@ html[data-theme=dark] .trainer-head select,html[data-theme=dark] .error-report s
 
 /* Camera runtime states */
 .tag.connecting{background:#eaf3ff;color:#497dbc}.live.connecting{color:#78aee8}.service-dot.degraded{background:#d9a441}.service-dot.idle{background:#7f8b86}.service-dot.starting{background:#78aee8}
+
+/* Live camera card layout: keep stream labels apart and preserve 16:9 video. */
+.cards{grid-template-columns:repeat(auto-fit,minmax(420px,1fr))}
+.feed{height:auto;min-height:180px;aspect-ratio:16/9;overflow:hidden}
+.feed .live{z-index:3;left:10px;top:10px}
+.feed>b{z-index:3;right:10px;top:10px;bottom:auto;background:#0a100dcc;padding:3px 6px;border-radius:4px;color:#d7e2dc}
+.frame-age{z-index:3;left:10px;bottom:10px}
+@media(max-width:900px){.cards{grid-template-columns:1fr}.feed{min-height:160px}}
