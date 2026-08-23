@@ -1113,14 +1113,48 @@ def upload_dataset(name:str=Query(min_length=2,max_length=120),payload:bytes=Bod
         shutil.rmtree(workdir,ignore_errors=True)
 @app.delete("/api/datasets/{dataset_id}")
 def delete_dataset(dataset_id:int):
-    row=rows("SELECT id,name FROM datasets WHERE id=?",(dataset_id,))
-    if not row: raise HTTPException(404,"Датасет не найден")
-    name=row[0]["name"]
-    if rows("SELECT 1 FROM training_jobs WHERE dataset_name=? AND status IN ('queued','running')",(name,)):
-        raise HTTPException(409,"Датасет используется текущей задачей обучения")
-    con=db(); con.execute("DELETE FROM datasets WHERE id=?",(dataset_id,)); con.commit(); con.close()
-    shutil.rmtree(DATASET_DIR/name,ignore_errors=True)
-    return {"id":dataset_id,"deleted":True,"name":name}
+    """Delete a saved dataset and its files without hiding a failed removal.
+
+    A failed filesystem operation used to be ignored, so the UI could report a
+    successful deletion while the data still occupied the dataset volume.  Do
+    the filesystem step first and leave the registry entry intact on an error,
+    which gives the operator a retryable, honest result.
+    """
+    con=db()
+    try:
+        row=con.execute("SELECT id,name FROM datasets WHERE id=?",(dataset_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Датасет не найден")
+        name=row["name"]
+        training=con.execute("SELECT id,target_name FROM training_jobs WHERE dataset_name=? AND status IN ('queued','running') ORDER BY id DESC LIMIT 1",(name,)).fetchone()
+        if training:
+            raise HTTPException(409,f"Датасет используется задачей обучения «{training['target_name']}» (№{training['id']}). Сначала отмените её или дождитесь завершения.")
+        capture=con.execute("SELECT id FROM dataset_capture_jobs WHERE name=? AND status IN ('queued','running') ORDER BY id DESC LIMIT 1",(name,)).fetchone()
+        if capture:
+            raise HTTPException(409,f"Датасет сейчас собирается (задача №{capture['id']}). Сначала отмените сбор.")
+
+        # Dataset names are slugified on input, and the API always constructs
+        # the path from that name rather than trusting the database path.
+        target=DATASET_DIR/name
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            elif target.exists() or target.is_symlink():
+                # A stale file/symlink must not survive after its registry row
+                # is removed; unlinking a symlink never follows it.
+                target.unlink()
+        except OSError as exc:
+            raise HTTPException(500,f"Не удалось удалить файлы датасета: {exc.strerror or str(exc)}") from exc
+
+        con.execute("DELETE FROM datasets WHERE id=?",(dataset_id,))
+        # A deleted camera-captured dataset should be collectable again under
+        # the same name. Keep active jobs protected above, but clear terminal
+        # history records whose unique name would otherwise block it forever.
+        con.execute("DELETE FROM dataset_capture_jobs WHERE name=? AND status NOT IN ('queued','running')",(name,))
+        con.commit()
+        return {"id":dataset_id,"deleted":True,"name":name}
+    finally:
+        con.close()
 
 class DatasetCaptureIn(BaseModel):
     camera_id:str=Field(min_length=1,max_length=64)
@@ -1170,7 +1204,19 @@ async def capture_dataset_from_camera(payload:DatasetCaptureIn):
     if not camera: con.close(); raise HTTPException(404,'Камера не найдена')
     if not camera[0]: con.close(); raise HTTPException(409,'Аналитика камеры отключена')
     if con.execute("SELECT 1 FROM datasets WHERE name=?",(name,)).fetchone(): con.close(); raise HTTPException(409,'Датасет с таким именем уже существует')
-    if con.execute("SELECT 1 FROM dataset_capture_jobs WHERE name=?",(name,)).fetchone(): con.close(); raise HTTPException(409,'Это имя уже использовалось для сбора датасета; выберите новое')
+    previous_job=con.execute("SELECT id,status FROM dataset_capture_jobs WHERE name=?",(name,)).fetchone()
+    if previous_job:
+        previous_task=_dataset_capture_tasks.get(previous_job["id"])
+        if previous_job["status"] in {'queued','running'}:
+            con.close(); raise HTTPException(409,f'Сбор с таким именем уже выполняется (задача №{previous_job["id"]})')
+        # cancel_dataset_capture marks the database record first and the task
+        # removes its temporary directory moments later. Do not start another
+        # job with the same directory until that cleanup has actually ended.
+        if previous_task and not previous_task.done():
+            con.close(); raise HTTPException(409,'Предыдущий сбор ещё отменяется; повторите через несколько секунд')
+        # Terminal jobs are history, not a permanent reservation of a dataset
+        # name. This also lets an operator repeat a failed/cancelled collection.
+        con.execute("DELETE FROM dataset_capture_jobs WHERE name=?",(name,))
     cur=con.execute("INSERT INTO dataset_capture_jobs(name,camera_id,target_count,capture_fps,status,captured_count,stage,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(name,payload.camera_id,payload.image_count,payload.capture_fps,'queued',0,'В очереди',now_iso(),now_iso())); con.commit(); job_id=cur.lastrowid; con.close()
     task=asyncio.create_task(collect_camera_dataset(job_id),name=f'dataset-capture-{job_id}'); _dataset_capture_tasks[job_id]=task
     return {'id':job_id,'name':name,'camera_id':payload.camera_id,'target_count':payload.image_count,'capture_fps':payload.capture_fps,'status':'queued'}

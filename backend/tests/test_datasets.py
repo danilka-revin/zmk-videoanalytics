@@ -78,6 +78,81 @@ def test_upload_and_list_dataset(dataset_dir):
         assert any(x["name"] == "My_Dataset" and x["exists"] for x in listed)
 
 
+def test_delete_dataset_removes_files_and_releases_camera_capture_name(dataset_dir):
+    with TestClient(main.app) as c:
+        created = c.post("/api/datasets?name=Reusable", content=_make_dataset_zip(),
+                         headers={"Content-Type": "application/zip"})
+        assert created.status_code == 201, created.text
+        dataset = created.json()
+        target = dataset_dir / dataset["name"]
+        assert target.is_dir()
+
+        # A completed capture record with the same name is only history. It
+        # must not reserve the name after the corresponding dataset is gone.
+        con = main.db()
+        timestamp = main.now_iso()
+        con.execute(
+            "INSERT INTO dataset_capture_jobs(name,camera_id,target_count,capture_fps,status,captured_count,stage,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+            (dataset["name"], "cam_01", 20, 2, "completed", 20, "Датасет готов", timestamp, timestamp),
+        )
+        con.commit(); con.close()
+
+        deleted = c.delete(f"/api/datasets/{dataset['id']}")
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()["deleted"] is True
+        assert not target.exists()
+        assert all(item["id"] != dataset["id"] for item in c.get("/api/datasets").json())
+        assert not any(item["name"] == dataset["name"] for item in c.get("/api/datasets/capture/jobs").json())
+
+        # The same name can now be used for a fresh collection.
+        restarted = c.post("/api/datasets/capture", json={
+            "camera_id": "cam_01", "name": dataset["name"], "image_count": 20, "capture_fps": 2,
+        })
+        assert restarted.status_code == 202, restarted.text
+
+
+def test_delete_dataset_keeps_data_when_training_is_running(dataset_dir):
+    with TestClient(main.app) as c:
+        created = c.post("/api/datasets?name=InUse", content=_make_dataset_zip(),
+                         headers={"Content-Type": "application/zip"})
+        assert created.status_code == 201, created.text
+        dataset = created.json()
+        target = dataset_dir / dataset["name"]
+
+        con = main.db()
+        timestamp = main.now_iso()
+        con.execute(
+            "INSERT INTO training_jobs(created_at,updated_at,camera_id,base_model,target_name,image_count,epochs,status,progress,stage,source,dataset_name) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (timestamp, timestamp, "cam_01", "", "dataset-in-use", 20, 1, "running", 10, "Обучение", "dataset", dataset["name"]),
+        )
+        con.commit(); con.close()
+
+        blocked = c.delete(f"/api/datasets/{dataset['id']}")
+        assert blocked.status_code == 409, blocked.text
+        assert "задач" in blocked.json()["detail"].lower()
+        assert target.is_dir()
+        assert any(item["id"] == dataset["id"] for item in c.get("/api/datasets").json())
+
+
+def test_delete_dataset_keeps_registry_when_files_cannot_be_removed(dataset_dir, monkeypatch):
+    with TestClient(main.app) as c:
+        created = c.post("/api/datasets?name=Locked", content=_make_dataset_zip(),
+                         headers={"Content-Type": "application/zip"})
+        assert created.status_code == 201, created.text
+        dataset = created.json()
+        target = dataset_dir / dataset["name"]
+
+        def fail_removal(*_args, **_kwargs):
+            raise PermissionError("dataset volume is read-only")
+
+        monkeypatch.setattr(main.shutil, "rmtree", fail_removal)
+        failed = c.delete(f"/api/datasets/{dataset['id']}")
+        assert failed.status_code == 500, failed.text
+        assert "файлы датасета" in failed.json()["detail"].lower()
+        assert target.is_dir()
+        assert any(item["id"] == dataset["id"] for item in c.get("/api/datasets").json())
+
+
 def test_upload_rejects_non_zip(dataset_dir):
     with TestClient(main.app) as c:
         r = c.post("/api/datasets?name=Bad", content=b"notazip",
