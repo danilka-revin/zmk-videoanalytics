@@ -185,6 +185,7 @@ class CameraSession:
     last_snapshot_at: float = 0.0
     last_error: str = ""
     frame_task: asyncio.Task[None] | None = None
+    restart_pending: bool = False
 
     @property
     def transport(self) -> str:
@@ -196,6 +197,7 @@ class Runtime:
 
     def __init__(self) -> None:
         self.sessions: dict[str, CameraSession] = {}
+        self._deferred_releases: list[CameraSession] = []
         self._transport_cursor: dict[str, int] = {}
         self._http: httpx.AsyncClient | None = None
         self._next_control_poll = 0.0
@@ -320,10 +322,23 @@ class Runtime:
         session.capture = None
 
     @staticmethod
-    def _cancel_frame_task(session: CameraSession) -> None:
-        if session.frame_task is not None and not session.frame_task.done():
-            session.frame_task.cancel()
-        session.frame_task = None
+    def _frame_task_finished(session: CameraSession) -> bool:
+        return session.frame_task is None or session.frame_task.done()
+
+    def _release_when_safe(self, session: CameraSession) -> bool:
+        """Never release a VideoCapture while a native read is in progress."""
+        if not self._frame_task_finished(session):
+            if session not in self._deferred_releases:
+                self._deferred_releases.append(session)
+            return False
+        self._release_session(session)
+        return True
+
+    def _cleanup_deferred_releases(self) -> None:
+        for session in list(self._deferred_releases):
+            if self._frame_task_finished(session):
+                self._release_session(session)
+                self._deferred_releases.remove(session)
 
     def _log(self, message: str, *, force: bool = False) -> None:
         now = time.monotonic()
@@ -389,8 +404,7 @@ class Runtime:
         desired = {config.camera_id: config for config in map(CameraConfig.from_api, raw_cameras)}
         for camera_id in set(self.sessions) - set(desired):
             session = self.sessions.pop(camera_id)
-            self._cancel_frame_task(session)
-            self._release_session(session)
+            self._release_when_safe(session)
             self._transport_cursor.pop(camera_id, None)
 
         for camera_id, config in desired.items():
@@ -399,8 +413,6 @@ class Runtime:
                 self.sessions[camera_id] = CameraSession(config=config)
                 continue
             if session.config.signature != config.signature:
-                self._cancel_frame_task(session)
-                self._release_session(session)
                 session.config = config
                 session.status = "connecting"
                 session.transport_index = 0
@@ -408,6 +420,12 @@ class Runtime:
                 session.next_attempt_at = 0
                 session.next_frame_at = 0
                 session.last_error = ""
+                if self._frame_task_finished(session):
+                    self._release_session(session)
+                else:
+                    # Let the current native read return naturally, then reopen
+                    # with the new RTSP URL/restart token.
+                    session.restart_pending = True
             else:
                 session.config = config
 
@@ -491,10 +509,11 @@ class Runtime:
             # FFmpeg options are process-global in OpenCV, so serialise only
             # the tiny open section; reads for other cameras remain concurrent.
             async with self._capture_open_lock:
-                capture = await asyncio.wait_for(
-                    asyncio.to_thread(self._open_capture, session.config.rtsp_url, transport),
-                    timeout=OPEN_TIMEOUT_MS / 1000 + 2,
-                )
+                # Do not wrap native OpenCV open() in wait_for(). Cancelling
+                # the asyncio wrapper while FFmpeg is still inside C++ can
+                # leave a live native object behind and later crash Python
+                # (exit 139). The params passed to open() enforce the timeout.
+                capture = await asyncio.to_thread(self._open_capture, session.config.rtsp_url, transport)
         except (TimeoutError, OSError, RuntimeError, ValueError) as exc:
             await self._failed_open(session, redact_error(exc), round((time.perf_counter() - started) * 1000))
             return False
@@ -648,13 +667,10 @@ class Runtime:
 
         started = time.perf_counter()
         try:
-            ok, image = await asyncio.wait_for(
-                asyncio.to_thread(session.capture.read),
-                timeout=READ_TIMEOUT_MS / 1000 + 1,
-            )
-        except TimeoutError:
-            ok, image = False, None
-            error = "таймаут чтения RTSP-кадра"
+            # CAP_PROP_READ_TIMEOUT_MSEC was supplied before open(). Await the
+            # native call instead of cancelling it mid-FFmpeg-read: cancellation
+            # is unsafe for OpenCV and caused native worker crashes (exit 139).
+            ok, image = await asyncio.to_thread(session.capture.read)
         except Exception as exc:  # noqa: BLE001 - OpenCV exception types vary by build.
             ok, image = False, None
             error = redact_error(exc)
@@ -703,6 +719,9 @@ class Runtime:
                             except Exception as exc:  # noqa: BLE001 - isolate one camera task.
                                 self._log(f"camera {session.config.camera_id} task failed: {redact_error(exc)}")
                             session.frame_task = None
+                            if session.restart_pending:
+                                self._release_session(session)
+                                session.restart_pending = False
 
                         now = time.monotonic()
                         if now < session.next_frame_at:
@@ -713,6 +732,7 @@ class Runtime:
                             name=f"camera-frame-{session.config.camera_id}",
                         )
 
+                    self._cleanup_deferred_releases()
                     await self._heartbeat()
                     wake_times = [self._next_control_poll, self._last_heartbeat_at + HEARTBEAT_INTERVAL_SECONDS]
                     for session in self.sessions.values():
@@ -728,14 +748,11 @@ class Runtime:
                     self._next_control_poll = time.monotonic() + 2
                     await asyncio.sleep(1)
         finally:
-            pending = []
-            for session in self.sessions.values():
-                if session.frame_task is not None and not session.frame_task.done():
-                    session.frame_task.cancel()
-                    pending.append(session.frame_task)
-                self._release_session(session)
-            if pending:
-                await asyncio.gather(*pending, return_exceptions=True)
+            # Do not cancel/release a native OpenCV call in flight. Docker
+            # process termination is safer than racing FFmpeg from Python.
+            for session in [*self.sessions.values(), *self._deferred_releases]:
+                if self._frame_task_finished(session):
+                    self._release_session(session)
             if self._model_task is not None and not self._model_task.done():
                 self._model_task.cancel()
             if self._http is not None:

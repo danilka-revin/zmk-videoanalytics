@@ -8,6 +8,7 @@
 
 - новая машина состояний: `connecting → online / recovering / offline`;
 - отдельная сессия и расписание на каждую камеру: сбой одной камеры не блокирует остальные;
+- native OpenCV/FFmpeg чтение больше не отменяется из Python посередине кадра, что исключает crash worker с `exit code 139` при повреждённом потоке;
 - TCP-first / UDP fallback в `RTSP_TRANSPORT=auto`;
 - таймауты открытия и чтения RTSP (`RTSP_OPEN_TIMEOUT_MS`, `RTSP_READ_TIMEOUT_MS`) передаются OpenCV до `open()`, а не после него; это убирает встроенное ожидание около 30 секунд;
 - используется актуальный FFmpeg socket option `timeout` в микросекундах (`RTSP_TIMEOUT_OPTION=timeout`), с опциональным legacy-режимом `stimeout`;
