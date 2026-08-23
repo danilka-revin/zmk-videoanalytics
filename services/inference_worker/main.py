@@ -97,6 +97,9 @@ HEARTBEAT_INTERVAL_SECONDS = _bounded_float("CAMERA_HEARTBEAT_SECONDS", 5.0, 1.0
 KEYFRAME_GRACE_SECONDS = _bounded_float("RTSP_KEYFRAME_GRACE_SECONDS", 15.0, 1.0, 120.0)
 KEYFRAME_RETRY_SECONDS = 0.2
 FFMPEG_FRAME_MAX_BYTES = _bounded_int("FFMPEG_FRAME_MAX_BYTES", 5_000_000, 100_000, 20_000_000)
+# Browser MJPEG live preview rate. 0 disables the stream while keeping periodic
+# persistent snapshots; otherwise it is capped by the camera's configured FPS.
+LIVE_PREVIEW_FPS = _bounded_float("CAMERA_LIVE_FPS", 20.0, 0.0, 30.0)
 EVENT_CLASSES = {
     "no_helmet",
     "no_vest",
@@ -193,6 +196,7 @@ class CameraSession:
     telemetry_window_started: float = 0.0
     frames_in_window: int = 0
     last_snapshot_at: float = 0.0
+    last_live_at: float = 0.0
     last_error: str = ""
     opened_at: float = 0.0
     received_first_frame: bool = False
@@ -259,6 +263,16 @@ class Runtime:
 
     async def post_internal(self, path: str, data: dict[str, Any]) -> Any:
         return await self._request("POST", path, data, internal=True)
+
+    async def post_internal_jpeg(self, path: str, image: bytes) -> None:
+        if self._http is None:
+            self._http = httpx.AsyncClient(timeout=httpx.Timeout(15.0, connect=5.0))
+        response = await self._http.post(
+            API + path,
+            content=image,
+            headers={"X-Worker-Token": _worker_token(), "Content-Type": "image/jpeg"},
+        )
+        response.raise_for_status()
 
     def _next_transport(self, camera_id: str) -> str:
         """Compatibility helper: initial auto attempt is TCP, then UDP."""
@@ -451,6 +465,7 @@ class Runtime:
                 session.next_attempt_at = 0
                 session.next_frame_at = 0
                 session.last_error = ""
+                session.last_live_at = 0
                 session.opened_at = 0
                 session.received_first_frame = False
                 if self._frame_task_finished(session):
@@ -778,6 +793,22 @@ class Runtime:
         except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
             self._log(f"snapshot upload failed for {session.config.camera_id}: {redact_error(exc)}")
 
+    async def _publish_live(self, session: CameraSession, image: Any) -> None:
+        if LIVE_PREVIEW_FPS <= 0:
+            return
+        now = time.monotonic()
+        rate = min(session.config.fps_limit, LIVE_PREVIEW_FPS)
+        if rate <= 0 or now - session.last_live_at < 1 / rate:
+            return
+        try:
+            encoded = await asyncio.to_thread(self._encode_snapshot, image)
+            if not encoded:
+                return
+            await self.post_internal_jpeg(f"/api/internal/cameras/{session.config.camera_id}/live-frame", encoded)
+            session.last_live_at = now
+        except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
+            self._log(f"live preview upload failed for {session.config.camera_id}: {redact_error(exc)}")
+
     async def _infer(self, session: CameraSession, image: Any) -> None:
         if self.model is None or not self.model_name:
             return
@@ -881,6 +912,7 @@ class Runtime:
         session.received_first_frame = True
         session.frames_in_window += 1
         await self._report(session, "online", latency, "", force=session.status != "online")
+        await self._publish_live(session, image)
         await self._publish_snapshot(session, image)
         await self._infer(session, image)
 

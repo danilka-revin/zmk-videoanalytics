@@ -12,6 +12,7 @@ def isolated_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(main, "SEED_TEST_DATA", True)
     monkeypatch.delenv("RTSP_CAM_01", raising=False)
     main._rate_buckets.clear()
+    main._live_frames.clear()
     original_init = main.init_db
 
     def init_with_fixtures():

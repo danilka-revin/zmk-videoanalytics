@@ -1,4 +1,5 @@
 """Camera runtime contract: worker heartbeat, secure diagnostics and restart."""
+import asyncio
 import base64
 
 from app import main
@@ -69,6 +70,28 @@ def test_restart_requests_new_worker_session_and_clears_snapshot(monkeypatch):
         assert camera["status"] == "connecting"
         assert camera["restart_requested_at"]
         assert client.get(f"/api/cameras/{camera_id}/snapshot").status_code == 404
+
+
+def test_live_mjpeg_frame_is_accepted_and_streamed(monkeypatch):
+    monkeypatch.setattr(main, "WORKER_TOKEN", "worker-test-token")
+    monkeypatch.setattr(main, "SEED_TEST_DATA", False)
+    with TestClient(main.app) as client:
+        camera_id = _camera(client)
+        jpeg = b"\xff\xd8" + b"live-frame" * 8 + b"\xff\xd9"
+        uploaded = client.post(
+            f"/api/internal/cameras/{camera_id}/live-frame",
+            content=jpeg,
+            headers={"X-Worker-Token": "worker-test-token", "Content-Type": "image/jpeg"},
+        )
+        assert uploaded.status_code == 204, uploaded.text
+        item = client.get(f"/api/cameras/{camera_id}").json()
+        assert item["live_frame_age_seconds"] is not None
+        response = main.camera_mjpeg(camera_id)
+        assert response.media_type.startswith("multipart/x-mixed-replace")
+        first = asyncio.run(anext(response.body_iterator))
+        assert b"Content-Type: image/jpeg" in first and jpeg in first
+        with main._live_frames_lock:
+            assert main._live_frames[camera_id][2] == jpeg
 
 
 def test_internal_heartbeat_exposes_worker_liveness(monkeypatch):

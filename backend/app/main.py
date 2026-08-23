@@ -15,6 +15,7 @@ import shutil
 import socket
 import sqlite3
 import tempfile
+import threading
 import time
 import uuid
 import zipfile
@@ -46,6 +47,11 @@ try: RATE_LIMIT_PER_MINUTE = max(10,int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"
 except ValueError: RATE_LIMIT_PER_MINUTE = 120
 _rate_buckets: dict[str, list[float]] = {}
 _training_tasks: dict[int,asyncio.Task] = {}
+# Latest live JPEG per camera. Persistent snapshots remain on disk; this
+# in-memory cache exists solely for the low-latency MJPEG browser stream.
+_live_frames: dict[str, tuple[int, float, bytes]] = {}
+_live_frames_lock = threading.Lock()
+_live_frame_sequence = 0
 MESSENGER_PROVIDER = os.getenv("MESSENGER_PROVIDER", "none").lower()
 if MESSENGER_PROVIDER not in {"none", "telegram", "max"}: MESSENGER_PROVIDER = "none"
 TRAINING_WORKER_URL = os.getenv("TRAINING_WORKER_URL", "").rstrip("/")
@@ -570,6 +576,14 @@ def snapshot_age_seconds(camera_id:str) -> int|None:
     if not target.exists(): return None
     return int(time.time()-target.stat().st_mtime)
 
+def live_frame_age_seconds(camera_id:str) -> float|None:
+    with _live_frames_lock:
+        item=_live_frames.get(camera_id)
+    return None if item is None else max(0,round(time.time()-item[1],2))
+
+def clear_live_frame(camera_id:str) -> None:
+    with _live_frames_lock: _live_frames.pop(camera_id,None)
+
 def telemetry_age_seconds(value: str | None) -> int | None:
     """Return age of worker telemetry; malformed legacy values are stale."""
     return timestamp_age_seconds(value)
@@ -577,6 +591,7 @@ def telemetry_age_seconds(value: str | None) -> int | None:
 def camera_with_snapshot(row:dict|sqlite3.Row) -> dict:
     data=dict(row)
     data["snapshot_age_seconds"]=snapshot_age_seconds(row["id"])
+    data["live_frame_age_seconds"]=live_frame_age_seconds(row["id"])
     age=telemetry_age_seconds(data.get("telemetry_at"))
     stale=data.get("status") in {"online","recovering"} and (age is None or age>CAMERA_TELEMETRY_STALE_SECONDS)
     data["telemetry_age_seconds"]=age
@@ -624,7 +639,7 @@ def update_camera(camera_id:str,payload:CameraUpdate):
         con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,updated_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),timestamp,camera_id))
     con.commit(); con.close()
     if stream_changed:
-        snapshot_path_for(camera_id).unlink(missing_ok=True)
+        snapshot_path_for(camera_id).unlink(missing_ok=True); clear_live_frame(camera_id)
     return {"id":camera_id,"updated":True,"configured":bool(new_rtsp),"rtsp_updated":rtsp_updated,"stream_reset":stream_changed}
 
 @app.delete("/api/cameras/{camera_id}")
@@ -636,7 +651,7 @@ def delete_camera(camera_id:str,delete_events:bool=False):
     con.execute("BEGIN IMMEDIATE")
     if delete_events: con.execute("DELETE FROM events WHERE camera_id=?",(camera_id,))
     con.execute("DELETE FROM cameras WHERE id=?",(camera_id,)); con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(now_iso(),"WARNING","camera_manager",f"Camera deleted: {camera[0]}",camera_id)); con.commit(); con.close()
-    snapshot=snapshot_path_for(camera_id); snapshot.unlink(missing_ok=True)
+    snapshot=snapshot_path_for(camera_id); snapshot.unlink(missing_ok=True); clear_live_frame(camera_id)
     return {"id":camera_id,"deleted":True,"deleted_events":event_count if delete_events else 0}
 
 @app.patch("/api/cameras/{camera_id}/toggle")
@@ -647,7 +662,7 @@ def toggle_camera(camera_id:str):
     # Do not leave a stopped stream marked online while the worker removes it
     # from its next polling cycle.
     timestamp=now_iso(); con.execute("UPDATE cameras SET enabled=?,status=?,fps=0,latency_ms=0,last_error='',updated_at=?,telemetry_at='',restart_requested_at=? WHERE id=?",(enabled,"connecting" if enabled else "unknown",timestamp,timestamp,camera_id)); con.commit(); con.close()
-    snapshot_path_for(camera_id).unlink(missing_ok=True)
+    snapshot_path_for(camera_id).unlink(missing_ok=True); clear_live_frame(camera_id)
     return {"id":camera_id,"enabled":bool(enabled),"stream_reset":True}
 
 @app.post("/api/cameras/{camera_id}/restart")
@@ -656,7 +671,7 @@ def restart_camera(camera_id:str):
     if not row: con.close(); raise HTTPException(404,"Камера не найдена")
     if not row[0]: con.close(); raise HTTPException(409,"Сначала включите аналитику камеры")
     timestamp=now_iso(); con.execute("UPDATE cameras SET status='connecting',fps=0,latency_ms=0,last_error='',telemetry_at='',restart_requested_at=?,updated_at=? WHERE id=?",(timestamp,timestamp,camera_id)); con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(timestamp,"INFO","camera_manager","RTSP restart requested",camera_id)); con.commit(); con.close()
-    snapshot_path_for(camera_id).unlink(missing_ok=True)
+    snapshot_path_for(camera_id).unlink(missing_ok=True); clear_live_frame(camera_id)
     return {"id":camera_id,"restart_requested_at":timestamp,"status":"connecting"}
 
 def apply_camera_telemetry(camera_id:str,payload:CameraTelemetry):
@@ -694,6 +709,35 @@ def upload_camera_snapshot(camera_id:str,payload:CameraSnapshotIn):
 def internal_camera_snapshot(camera_id:str,payload:CameraSnapshotIn):
     store_camera_snapshot(camera_id,payload)
 
+@app.post("/api/internal/cameras/{camera_id}/live-frame",status_code=204)
+async def internal_live_frame(camera_id:str,request:Request):
+    con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
+    if not row: raise HTTPException(404,"Камера не найдена")
+    if not row[0]: return
+    image=await request.body()
+    if len(image)>1_300_000 or not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"):
+        raise HTTPException(422,"Некорректный или слишком большой live JPEG")
+    global _live_frame_sequence
+    with _live_frames_lock:
+        _live_frame_sequence+=1
+        _live_frames[camera_id]=(_live_frame_sequence,time.time(),image)
+
+@app.get("/api/cameras/{camera_id}/mjpeg")
+def camera_mjpeg(camera_id:str):
+    con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
+    if not row: raise HTTPException(404,"Камера не найдена")
+    if not row[0]: raise HTTPException(409,"Аналитика камеры отключена")
+    def generate():
+        sequence=-1
+        while True:
+            with _live_frames_lock:
+                item=_live_frames.get(camera_id)
+            if item and item[0]!=sequence:
+                sequence,_,image=item
+                yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "+str(len(image)).encode()+b"\r\n\r\n"+image+b"\r\n"
+            time.sleep(.02)
+    return StreamingResponse(generate(),media_type="multipart/x-mixed-replace; boundary=frame",headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
+
 @app.get("/api/cameras/{camera_id}/snapshot")
 def camera_snapshot(camera_id:str):
     target=snapshot_path_for(camera_id)
@@ -728,7 +772,7 @@ def diagnostics():
     camera_ids=[r["id"] for r in rows("SELECT id FROM cameras ORDER BY id")]
     with ThreadPoolExecutor(max_workers=min(10,max(1,len(camera_ids)))) as pool: camera_results=list(pool.map(diagnose_camera_row,camera_ids))
     for result in camera_results:
-        age=snapshot_age_seconds(result["camera_id"]); result["snapshot_age_seconds"]=age; result["snapshot"]="fresh" if age is not None and age<15 else ("stale" if age is not None else "none")
+        age=snapshot_age_seconds(result["camera_id"]); result["snapshot_age_seconds"]=age; result["snapshot"]="fresh" if age is not None and age<15 else ("stale" if age is not None else "none"); result["live_frame_age_seconds"]=live_frame_age_seconds(result["camera_id"])
     return {"generated_at":now_iso(),"system":system_health_data(),"worker":inference_worker_state(),"cameras":camera_results}
 
 @app.get("/api/events")

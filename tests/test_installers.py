@@ -83,6 +83,7 @@ def test_compose_and_environment_are_consistent():
     nginx = (ROOT/'frontend/nginx.conf').read_text()
     assert 'set $api_upstream http://api:8000' in nginx and 'proxy_pass $api_upstream' in nginx
     assert "img-src 'self' data: blob:" in nginx
+    assert '/mjpeg$' in nginx and 'proxy_buffering off' in nginx
     assert 'location ^~ /telegram' in nginx and 'https://web.telegram.org' in nginx
     lines = [x for x in (ROOT/'.env.example').read_text().splitlines() if x and not x.startswith('#')]
     keys = [x.split('=',1)[0] for x in lines]

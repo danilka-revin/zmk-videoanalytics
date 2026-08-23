@@ -58,6 +58,7 @@ def worker_mod(monkeypatch):
     monkeypatch.setenv("RTSP_TRANSPORT", "tcp")
     monkeypatch.setenv("RTSP_STIMEOUT", "5000000")
     monkeypatch.setenv("CAMERA_DECODER", "opencv")
+    monkeypatch.setenv("CAMERA_LIVE_FPS", "0")
     _FakeCap.default_opened = True
     _FakeCap.results = []
 
@@ -203,6 +204,27 @@ def test_live_preview_is_uploaded_without_an_active_model(worker_mod):
     assert telemetry[-1]["status"] == "online"
 
 
+def test_live_preview_posts_jpeg_at_configured_rate(worker_mod):
+    worker_mod.LIVE_PREVIEW_FPS = 20
+    runtime = worker_mod.Runtime()
+    _FakeCap.results = [(True, _FakeImage())]
+    posted = []
+
+    async def post_internal(path, data):
+        return None
+
+    async def post_internal_jpeg(path, image):
+        posted.append((path, image))
+
+    runtime.post_internal = post_internal
+    runtime.post_internal_jpeg = post_internal_jpeg
+    asyncio.run(runtime.frame(_camera()))
+
+    assert posted
+    assert posted[0][0].endswith("/live-frame")
+    assert posted[0][1].startswith(b"\xff\xd8")
+
+
 def test_fps_is_measured_from_successful_frames(worker_mod):
     runtime = worker_mod.Runtime()
     config = worker_mod.CameraConfig.from_api(_camera())
@@ -285,6 +307,7 @@ def test_compose_forwards_all_camera_runtime_settings():
         "CAMERA_CONTROL_POLL_SECONDS",
         "CAMERA_TELEMETRY_SECONDS",
         "CAMERA_SNAPSHOT_SECONDS",
+        "CAMERA_LIVE_FPS",
         "CAMERA_HEARTBEAT_SECONDS",
     ):
         assert variable in env
