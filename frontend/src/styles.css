@@ -95,3 +95,11 @@ html[data-theme=dark] .trainer-head select,html[data-theme=dark] .error-report s
 .frame-age{z-index:3;left:10px;bottom:10px}
 @media(max-width:900px){.cards{grid-template-columns:1fr}.feed{min-height:160px}}
 .modal-actions .danger{background:#b8443d;color:#fff;border-color:#b8443d;display:flex;align-items:center;gap:5px}
+
+/* One selected camera gets the available workspace; click its video for native fullscreen. */
+.cards.single-camera{grid-template-columns:1fr}.cards.single-camera .feed{min-height:min(62vh,640px)}
+.feed.clickable{cursor:zoom-in}.feed.clickable:focus-visible{outline:3px solid var(--accent);outline-offset:-3px}
+.feed:fullscreen{width:100vw;height:100vh;min-height:0;aspect-ratio:auto;background:#000;cursor:zoom-out;display:grid;place-items:center}
+.feed:fullscreen .camera-snapshot{width:100%;height:100%;object-fit:contain}
+.feed:fullscreen .live,.feed:fullscreen>b,.feed:fullscreen .frame-age{font-size:13px;padding:7px 10px}
+.camera-stats small{font-size:7px;color:var(--muted);margin-left:2px}
