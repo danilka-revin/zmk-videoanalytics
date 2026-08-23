@@ -103,3 +103,10 @@ html[data-theme=dark] .trainer-head select,html[data-theme=dark] .error-report s
 .feed:fullscreen .camera-snapshot{width:100%;height:100%;object-fit:contain}
 .feed:fullscreen .live,.feed:fullscreen>b,.feed:fullscreen .frame-age{font-size:13px;padding:7px 10px}
 .camera-stats small{font-size:7px;color:var(--muted);margin-left:2px}
+
+/* Camera grid preference: cards stay equal-size even when there is only one. */
+.cards{display:flex;flex-wrap:wrap;align-items:flex-start;gap:15px}.camera-card{flex:0 0 340px;width:340px}.cards.size-compact .camera-card{flex-basis:280px;width:280px}.cards.size-normal .camera-card{flex-basis:340px;width:340px}.cards.size-large .camera-card{flex-basis:460px;width:460px}.cards .feed{height:auto;min-height:0;aspect-ratio:16/9}.cards.single-camera .feed{min-height:0}
+.camera-page-tools{display:flex;align-items:center;gap:9px}.camera-size-control{display:flex;border:1px solid var(--line);border-radius:7px;overflow:hidden}.camera-size-control button{border:0;border-right:1px solid var(--line);padding:8px 9px;background:var(--surface);color:var(--muted);font-size:8px}.camera-size-control button:last-child{border-right:0}.camera-size-control button.active{background:#17251f;color:var(--accent)}
+@media(max-width:900px){.camera-card,.cards.size-compact .camera-card,.cards.size-normal .camera-card,.cards.size-large .camera-card{width:100%;flex-basis:100%}.page-actions{align-items:flex-start}.camera-page-tools{flex-wrap:wrap;justify-content:flex-end}}
+.camera-page-tools>button{border:1px solid #17251f;background:#17251f;color:var(--accent);border-radius:7px;padding:8px 11px;display:flex;align-items:center;gap:6px}
+.feed:fullscreen{aspect-ratio:auto!important}
