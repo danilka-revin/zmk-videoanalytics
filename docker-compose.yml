@@ -81,8 +81,17 @@ services:
       ZMK_API_URL: http://api:8000
       ZMK_API_KEY: ${ZMK_API_KEY:-}
       ZMK_WORKER_TOKEN: ${ZMK_WORKER_TOKEN:-}
+      # Keep this in sync with API so a custom shared-token path works too.
+      ZMK_WORKER_TOKEN_FILE: ${ZMK_WORKER_TOKEN_FILE:-/models/.worker-token}
       INFERENCE_DEVICE: ${INFERENCE_DEVICE:-auto}
       INFERENCE_CONF: ${INFERENCE_CONF:-0.5}
+      # Forward every RTSP knob declared in .env. Previously these values
+      # were documented but never reached the worker container.
+      RTSP_TRANSPORT: ${RTSP_TRANSPORT:-auto}
+      RTSP_BUFFER_SIZE: ${RTSP_BUFFER_SIZE:-}
+      RTSP_STIMEOUT: ${RTSP_STIMEOUT:-5000000}
+      OFFLINE_AFTER_FRAMES: ${OFFLINE_AFTER_FRAMES:-3}
+      RTSP_RECONNECT_SECONDS: ${RTSP_RECONNECT_SECONDS:-5}
     volumes:
     - model-data:/models
     depends_on:

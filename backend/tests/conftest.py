@@ -20,10 +20,10 @@ def isolated_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         con = main.db()
         timestamp = main.now_iso()
         cameras = [
-            (f"cam_{i:02}", f"Камера {i:02}", "Тестовая зона", "Fixture only", f"rtsp://camera-{i:02}/stream", 8, "offline" if i == 7 else "online", 8, 150, 1, timestamp, timestamp)
+            (f"cam_{i:02}", f"Камера {i:02}", "Тестовая зона", "Fixture only", f"rtsp://camera-{i:02}/stream", 8, "offline" if i == 7 else "online", 8, 150, 1, timestamp, timestamp, timestamp)
             for i in range(1, 11)
         ]
-        con.executemany("INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", cameras)
+        con.executemany("INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)", cameras)
         for i in range(24):
             con.execute("INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id,acknowledged,note) VALUES(?,?,?,?,?,?,?,?)", (timestamp, f"cam_{i % 10 + 1:02}", "no_helmet", "critical" if i % 4 == 0 else "high", .92, f"P-{i}", 0, ""))
         con.executemany("INSERT INTO users(name,login,role,active,created_at) VALUES(?,?,?,?,?)", [("Test Admin", "admin", "admin", 1, timestamp), ("Test Operator", "operator", "operator", 1, timestamp), ("Test Viewer", "viewer", "viewer", 1, timestamp)])

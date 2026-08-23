@@ -14,8 +14,9 @@ def test_camera_credentials_never_leave_list_endpoint():
 
 def test_invalid_rtsp_and_detection_timestamp_are_rejected():
     with TestClient(app) as c:
-        bad_camera = c.post('/api/cameras', json={'name':'Bad URL','zone':'Test','rtsp_url':'http://example.test/video'})
-        assert bad_camera.status_code == 422
+        for url in ('http://example.test/video', 'rtsp://:554/stream', 'rtsp://camera:not-a-port/stream', 'rtsp://camera:70000/stream'):
+            bad_camera = c.post('/api/cameras', json={'name':'Bad URL','zone':'Test','rtsp_url':url})
+            assert bad_camera.status_code == 422, url
         model = next(x['name'] for x in c.get('/api/models').json() if x['active'])
         bad_detection = c.post('/api/inference/detections', json={'detections':[{
             'camera_id':'cam_01','model_name':model,'timestamp':'not-a-date',

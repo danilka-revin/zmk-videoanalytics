@@ -45,6 +45,42 @@ def test_camera_full_crud_search_telemetry_and_diagnostics(monkeypatch):
         assert c.get('/api/cameras').json()==[]
 
 
+def test_stale_camera_telemetry_is_not_presented_as_online(monkeypatch):
+    monkeypatch.setattr(main, "SEED_TEST_DATA", False)
+    with TestClient(main.app) as c:
+        camera_id = c.post('/api/cameras', json={'name':'Старая телеметрия','zone':'Цех','rtsp_url':'rtsp://camera/stream'}).json()['id']
+        assert c.post(f'/api/cameras/{camera_id}/telemetry', json={'status':'online','fps':8,'latency_ms':20}).status_code == 200
+        con = main.db()
+        con.execute("UPDATE cameras SET telemetry_at=? WHERE id=?", ('2000-01-01T00:00:00+07:00', camera_id))
+        con.commit(); con.close()
+
+        camera = c.get(f'/api/cameras/{camera_id}').json()
+        assert camera['status'] == 'offline'
+        assert camera['telemetry_stale'] is True
+        assert c.get('/api/dashboard').json()['cameras']['online'] == 0
+
+
+def test_camera_stream_state_resets_on_reconfigure_or_disable(monkeypatch):
+    monkeypatch.setattr(main, "SEED_TEST_DATA", False)
+    with TestClient(main.app) as c:
+        created = c.post('/api/cameras', json={'name':'Линия 1','zone':'Цех','rtsp_url':'rtsp://camera/one'}).json()
+        camera_id = created['id']
+        assert c.post(f'/api/cameras/{camera_id}/telemetry', json={'status':'online','fps':5,'latency_ms':40}).status_code == 200
+        changed = c.put(f'/api/cameras/{camera_id}', json={'name':'Линия 1','zone':'Цех','description':'','rtsp_url':'rtsp://camera/two','fps_limit':8,'enabled':True})
+        assert changed.status_code == 200 and changed.json()['stream_reset'] is True
+        camera = c.get(f'/api/cameras/{camera_id}').json()
+        assert camera['status'] == 'unknown' and camera['fps'] == 0
+
+        toggled = c.patch(f'/api/cameras/{camera_id}/toggle')
+        assert toggled.status_code == 200 and toggled.json()['enabled'] is False
+        # A frame already in flight from the worker must not switch the disabled
+        # camera back to online.
+        ignored = c.post(f'/api/cameras/{camera_id}/telemetry', json={'status':'online','fps':5,'latency_ms':40})
+        assert ignored.status_code == 200 and ignored.json()['ignored'] is True
+        camera = c.get(f'/api/cameras/{camera_id}').json()
+        assert camera['status'] == 'unknown'
+
+
 def test_camera_delete_requires_explicit_event_confirmation():
     with TestClient(main.app) as c:
         assert c.delete('/api/cameras/cam_01').status_code==409

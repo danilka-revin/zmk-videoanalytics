@@ -101,6 +101,9 @@ def test_version_compare():
     assert not version_lt("2.4.0", "2.3.0")
     assert version_lt("1.9.9", "2.0.0")
     assert version_lt("v2.2.4", "2.3.0")
+    # Missing patch components are semantically zero, not shorter tuples.
+    assert not version_lt("2.3", "2.3.0")
+    assert version_lt("", "0.0.1")
 
 
 def test_plan_update_reports_newer(mirror, tmp_path):

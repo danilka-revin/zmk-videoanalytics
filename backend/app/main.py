@@ -37,6 +37,7 @@ from pydantic import BaseModel, Field, field_validator
 
 APP_VERSION = "2.11.4"
 TZ = timezone(timedelta(hours=7))
+CAMERA_TELEMETRY_STALE_SECONDS = 30
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
 STARTED = time.time()
@@ -146,7 +147,7 @@ def init_db():
     con = db()
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript("""
-    CREATE TABLE IF NOT EXISTS cameras(id TEXT PRIMARY KEY, name TEXT NOT NULL, zone TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rtsp_url TEXT NOT NULL DEFAULT '', fps_limit REAL NOT NULL DEFAULT 8, status TEXT NOT NULL DEFAULT 'unknown', fps REAL NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS cameras(id TEXT PRIMARY KEY, name TEXT NOT NULL, zone TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rtsp_url TEXT NOT NULL DEFAULT '', fps_limit REAL NOT NULL DEFAULT 8, status TEXT NOT NULL DEFAULT 'unknown', fps REAL NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, telemetry_at TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, camera_id TEXT NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL, confidence REAL NOT NULL, person_id TEXT, external_id TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '', FOREIGN KEY(camera_id) REFERENCES cameras(id));
     CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, level TEXT NOT NULL, service TEXT NOT NULL, message TEXT NOT NULL, camera_id TEXT);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -155,7 +156,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, login TEXT UNIQUE NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
     """)
     camera_columns={r[1] for r in con.execute("PRAGMA table_info(cameras)").fetchall()}
-    for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''"}.items():
+    for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''","telemetry_at":"TEXT NOT NULL DEFAULT ''"}.items():
         if column not in camera_columns: con.execute(f"ALTER TABLE cameras ADD COLUMN {column} {ddl}")
     con.execute("UPDATE cameras SET created_at=updated_at WHERE created_at='' OR created_at IS NULL")
     model_columns={r[1] for r in con.execute("PRAGMA table_info(model_registry)").fetchall()}
@@ -287,6 +288,32 @@ async def security_middleware(request: Request, call_next):
     if path.startswith("/api/"): response.headers["Cache-Control"]="no-store"
     return response
 
+def normalize_rtsp_url(value: str | None) -> str | None:
+    """Validate an RTSP endpoint early, without ever returning its secret.
+
+    A prefix-only check accepts values such as ``rtsp://host:not-a-port``.
+    They later crash diagnostics through ``urlparse(...).port`` and leave an
+    operator with a 500 instead of an actionable configuration error.
+    """
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return value
+    if any(char.isspace() or ord(char) < 32 for char in value):
+        raise ValueError("RTSP URL не должен содержать пробелы или управляющие символы")
+    parsed = urlparse(value)
+    if parsed.scheme not in {"rtsp", "rtsps"} or not parsed.hostname:
+        raise ValueError("Требуется корректный RTSP(S) URL с host")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Некорректный порт в RTSP URL") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("Порт RTSP URL должен быть в диапазоне 1–65535")
+    return value
+
+
 class CameraIn(BaseModel):
     name:str=Field(min_length=2,max_length=80)
     zone:str=Field(default="Без зоны",min_length=1,max_length=80)
@@ -297,8 +324,7 @@ class CameraIn(BaseModel):
     @field_validator("rtsp_url")
     @classmethod
     def validate_rtsp(cls,value:str):
-        if value and not value.startswith(("rtsp://","rtsps://")): raise ValueError("Требуется RTSP(S) URL")
-        return value
+        return normalize_rtsp_url(value) or ""
 class CameraUpdate(BaseModel):
     name:str=Field(min_length=2,max_length=80)
     zone:str=Field(default="Без зоны",min_length=1,max_length=80)
@@ -309,8 +335,7 @@ class CameraUpdate(BaseModel):
     @field_validator("rtsp_url")
     @classmethod
     def validate_rtsp(cls,value:str|None):
-        if value and not value.startswith(("rtsp://","rtsps://")): raise ValueError("Требуется RTSP(S) URL")
-        return value
+        return normalize_rtsp_url(value)
 class CameraTelemetry(BaseModel):
     status:Literal["online","offline","error","unknown","recovering"]
     fps:float=Field(default=0,ge=0,le=240)
@@ -429,10 +454,11 @@ def health(): return {"status":"ok","version":APP_VERSION,"uptime_seconds":int(t
 
 @app.get("/api/dashboard")
 def dashboard():
-    con=db(); total=con.execute("SELECT COUNT(*) FROM cameras").fetchone()[0]; online=con.execute("SELECT COUNT(*) FROM cameras WHERE status='online'").fetchone()[0]
+    fresh_after=(datetime.now(TZ)-timedelta(seconds=CAMERA_TELEMETRY_STALE_SECONDS)).isoformat()
+    con=db(); total=con.execute("SELECT COUNT(*) FROM cameras").fetchone()[0]; online=con.execute("SELECT COUNT(*) FROM cameras WHERE status='online' AND telemetry_at>=?",(fresh_after,)).fetchone()[0]
     events24=con.execute("SELECT COUNT(*) FROM events WHERE timestamp >= ?",((datetime.now(TZ)-timedelta(days=1)).isoformat(),)).fetchone()[0]
     critical=con.execute("SELECT COUNT(*) FROM events WHERE severity='critical' AND acknowledged=0").fetchone()[0]
-    avg=con.execute("SELECT COALESCE(AVG(fps),0), COALESCE(AVG(latency_ms),0) FROM cameras WHERE status='online'").fetchone()
+    avg=con.execute("SELECT COALESCE(AVG(fps),0), COALESCE(AVG(latency_ms),0) FROM cameras WHERE status='online' AND telemetry_at>=?",(fresh_after,)).fetchone()
     model=con.execute("SELECT m.name,m.precision,m.recall FROM model_registry m JOIN settings s ON s.key='active_model' AND s.value=m.name").fetchone()
     trend=[]
     for h in range(11,-1,-1):
@@ -471,17 +497,39 @@ def snapshot_age_seconds(camera_id:str) -> int|None:
     if not target.exists(): return None
     return int(time.time()-target.stat().st_mtime)
 
+def telemetry_age_seconds(value: str | None) -> int | None:
+    """Return age of worker telemetry; malformed legacy values are stale."""
+    if not value:
+        return None
+    try:
+        captured=datetime.fromisoformat(value)
+        if captured.tzinfo is None: captured=captured.replace(tzinfo=TZ)
+        return max(0,int((datetime.now(TZ)-captured.astimezone(TZ)).total_seconds()))
+    except (TypeError,ValueError):
+        return None
+
 def camera_with_snapshot(row:dict|sqlite3.Row) -> dict:
-    data=dict(row); data["snapshot_age_seconds"]=snapshot_age_seconds(row["id"]); return data
+    data=dict(row)
+    data["snapshot_age_seconds"]=snapshot_age_seconds(row["id"])
+    age=telemetry_age_seconds(data.get("telemetry_at"))
+    stale=data.get("status") in {"online","recovering"} and (age is None or age>CAMERA_TELEMETRY_STALE_SECONDS)
+    data["telemetry_age_seconds"]=age
+    data["telemetry_stale"]=stale
+    if stale:
+        # Never present a dead worker as a live camera solely because the last
+        # row in SQLite was online. The database remains unchanged so a new
+        # telemetry callback can recover it immediately.
+        data["status"]="offline"; data["fps"]=0
+    return data
 
 @app.get("/api/cameras")
 def cameras():
-    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras ORDER BY created_at,id")
+    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras ORDER BY created_at,id")
     return [camera_with_snapshot(r) for r in data]
 
 @app.get("/api/cameras/{camera_id}")
 def camera_detail(camera_id:str):
-    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras WHERE id=?",(camera_id,))
+    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras WHERE id=?",(camera_id,))
     if not data: raise HTTPException(404,"Камера не найдена")
     return camera_with_snapshot(data[0])
 
@@ -493,15 +541,25 @@ def add_camera(payload:CameraIn):
 
 @app.put("/api/cameras/{camera_id}")
 def update_camera(camera_id:str,payload:CameraUpdate):
-    con=db(); current=con.execute("SELECT rtsp_url FROM cameras WHERE id=?",(camera_id,)).fetchone()
+    con=db(); current=con.execute("SELECT rtsp_url,enabled FROM cameras WHERE id=?",(camera_id,)).fetchone()
     if not current: con.close(); raise HTTPException(404,"Камера не найдена")
     # The RTSP URL is a secret and is never returned by the API. It is only
     # replaced when the client supplies a non-empty value; null or "" ("leave
     # as is" from the edit form) keeps the existing URL.
     new_rtsp=payload.rtsp_url if payload.rtsp_url else current[0]
     rtsp_updated=bool(payload.rtsp_url)
-    con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,updated_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),now_iso(),camera_id)); con.commit(); con.close()
-    return {"id":camera_id,"updated":True,"configured":bool(new_rtsp),"rtsp_updated":rtsp_updated}
+    stream_changed=new_rtsp != current[0] or bool(payload.enabled) != bool(current[1])
+    timestamp=now_iso()
+    if stream_changed:
+        # A frame and telemetry from the old endpoint must not be shown as if
+        # they belonged to the newly configured camera.
+        con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,status='unknown',fps=0,latency_ms=0,updated_at=?,telemetry_at='' WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),timestamp,camera_id))
+    else:
+        con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,updated_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),timestamp,camera_id))
+    con.commit(); con.close()
+    if stream_changed:
+        snapshot_path_for(camera_id).unlink(missing_ok=True)
+    return {"id":camera_id,"updated":True,"configured":bool(new_rtsp),"rtsp_updated":rtsp_updated,"stream_reset":stream_changed}
 
 @app.delete("/api/cameras/{camera_id}")
 def delete_camera(camera_id:str,delete_events:bool=False):
@@ -519,18 +577,30 @@ def delete_camera(camera_id:str,delete_events:bool=False):
 def toggle_camera(camera_id:str):
     con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone()
     if not row: con.close(); raise HTTPException(404,"Камера не найдена")
-    enabled=0 if row[0] else 1; con.execute("UPDATE cameras SET enabled=?,updated_at=? WHERE id=?",(enabled,now_iso(),camera_id)); con.commit(); con.close(); return {"id":camera_id,"enabled":bool(enabled)}
+    enabled=0 if row[0] else 1
+    # Do not leave a stopped stream marked online while the worker removes it
+    # from its next polling cycle.
+    con.execute("UPDATE cameras SET enabled=?,status='unknown',fps=0,latency_ms=0,updated_at=?,telemetry_at='' WHERE id=?",(enabled,now_iso(),camera_id)); con.commit(); con.close()
+    snapshot_path_for(camera_id).unlink(missing_ok=True)
+    return {"id":camera_id,"enabled":bool(enabled),"stream_reset":True}
 
 @app.post("/api/cameras/{camera_id}/telemetry")
 def camera_telemetry(camera_id:str,payload:CameraTelemetry):
-    con=db(); cur=con.execute("UPDATE cameras SET status=?,fps=?,latency_ms=?,updated_at=? WHERE id=?",(payload.status,payload.fps,payload.latency_ms,now_iso(),camera_id)); con.commit(); con.close()
-    if not cur.rowcount: raise HTTPException(404,"Камера не найдена")
+    con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone()
+    if not row: con.close(); raise HTTPException(404,"Камера не найдена")
+    if not row[0]:
+        con.close()
+        # A worker can finish one in-flight frame after an operator disables a
+        # camera. Accept the callback but never resurrect its online status.
+        return {"id":camera_id,"ignored":True,"status":"unknown","fps":0,"latency_ms":0}
+    timestamp=now_iso(); con.execute("UPDATE cameras SET status=?,fps=?,latency_ms=?,updated_at=?,telemetry_at=? WHERE id=?",(payload.status,payload.fps,payload.latency_ms,timestamp,timestamp,camera_id)); con.commit(); con.close()
     return {"id":camera_id,**payload.model_dump()}
 
 @app.post("/api/cameras/{camera_id}/snapshot",status_code=204)
 def upload_camera_snapshot(camera_id:str,payload:CameraSnapshotIn):
-    con=db(); exists=con.execute("SELECT 1 FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
-    if not exists: raise HTTPException(404,"Камера не найдена")
+    con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
+    if not row: raise HTTPException(404,"Камера не найдена")
+    if not row[0]: return
     try: image=base64.b64decode(payload.jpeg_base64,validate=True)
     except (binascii.Error,ValueError): raise HTTPException(422,"Некорректный base64 JPEG")
     if len(image)>1_300_000 or not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"): raise HTTPException(422,"Некорректный или слишком большой JPEG")
@@ -546,7 +616,10 @@ def diagnose_camera_row(camera_id:str):
     con=db(); row=con.execute("SELECT id,name,rtsp_url,enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
     if not row: raise HTTPException(404,"Камера не найдена")
     if not row[2]: return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"not_configured","latency_ms":None,"message":"RTSP URL не задан"}
-    parsed=urlparse(row[2]); host=parsed.hostname; port=parsed.port or (322 if parsed.scheme=="rtsps" else 554)
+    try:
+        parsed=urlparse(row[2]); host=parsed.hostname; port=parsed.port or (322 if parsed.scheme=="rtsps" else 554)
+    except ValueError:
+        return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"invalid_url","latency_ms":None,"message":"Некорректный RTSP URL"}
     if not host: return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"invalid_url","latency_ms":None,"message":"Некорректный RTSP URL"}
     started=time.perf_counter()
     try:
@@ -589,7 +662,8 @@ def ingest_detections(payload:DetectionBatch):
     except ValueError: cooldown=30
     accepted=[]; rejected=[]
     for i,d in enumerate(payload.detections):
-        cam=con.execute("SELECT status,enabled FROM cameras WHERE id=?",(d.camera_id,)).fetchone()
+        cam=con.execute("SELECT status,enabled,telemetry_at FROM cameras WHERE id=?",(d.camera_id,)).fetchone()
+        cam_age=telemetry_age_seconds(cam[2]) if cam else None
         reason=None; normalized_timestamp=now_iso()
         if d.detection_id:
             existing=con.execute("SELECT id FROM events WHERE external_id=?",(d.detection_id,)).fetchone()
@@ -602,7 +676,7 @@ def ingest_detections(payload:DetectionBatch):
         if not reason:
             if d.model_name != active: reason=f"stale_model: active={active}"
             elif not cam: reason="unknown_camera"
-            elif cam[0] != "online" or not cam[1]: reason="camera_unavailable"
+            elif cam[0] != "online" or not cam[1] or cam_age is None or cam_age>CAMERA_TELEMETRY_STALE_SECONDS: reason="camera_unavailable"
             else:
                 key=thresholds[d.event_type]; threshold=float(con.execute("SELECT value FROM settings WHERE key=?",(key,)).fetchone()[0])
                 if d.confidence < threshold: reason=f"below_threshold:{threshold}"
