@@ -47,6 +47,7 @@ try: RATE_LIMIT_PER_MINUTE = max(10,int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"
 except ValueError: RATE_LIMIT_PER_MINUTE = 120
 _rate_buckets: dict[str, list[float]] = {}
 _training_tasks: dict[int,asyncio.Task] = {}
+_dataset_capture_tasks: dict[int,asyncio.Task] = {}
 # Latest live JPEG per camera. Persistent snapshots remain on disk; this
 # in-memory cache exists solely for the low-latency MJPEG browser stream.
 _live_frames: dict[str, tuple[int, float, bytes]] = {}
@@ -184,6 +185,7 @@ def init_db():
     for column,ddl in {"batch":"INTEGER NOT NULL DEFAULT 8","imgsz":"INTEGER NOT NULL DEFAULT 640","patience":"INTEGER NOT NULL DEFAULT 20","confidence":"REAL NOT NULL DEFAULT .35","val_split":"REAL NOT NULL DEFAULT .2","capture_fps":"REAL NOT NULL DEFAULT 2","source":"TEXT NOT NULL DEFAULT 'camera'","dataset_name":"TEXT NOT NULL DEFAULT ''"}.items():
         if column not in training_columns: con.execute(f"ALTER TABLE training_jobs ADD COLUMN {column} {ddl}")
     con.execute("CREATE TABLE IF NOT EXISTS datasets(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL, image_count INTEGER NOT NULL DEFAULT 0, class_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'yolo', media_count INTEGER NOT NULL DEFAULT 0, label_count INTEGER NOT NULL DEFAULT 0)")
+    con.execute("CREATE TABLE IF NOT EXISTS dataset_capture_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, camera_id TEXT NOT NULL, target_count INTEGER NOT NULL, capture_fps REAL NOT NULL, status TEXT NOT NULL, captured_count INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(camera_id) REFERENCES cameras(id))")
     dataset_columns={r[1] for r in con.execute("PRAGMA table_info(datasets)").fetchall()}
     for column,ddl in {"kind":"TEXT NOT NULL DEFAULT 'yolo'","media_count":"INTEGER NOT NULL DEFAULT 0","label_count":"INTEGER NOT NULL DEFAULT 0"}.items():
         if column not in dataset_columns: con.execute(f"ALTER TABLE datasets ADD COLUMN {column} {ddl}")
@@ -195,6 +197,7 @@ def init_db():
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_severity_ack ON events(severity,acknowledged)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_logs_timestamp_level ON logs(timestamp DESC,level)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_training_status ON training_jobs(status,created_at DESC)")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_capture_jobs_status ON dataset_capture_jobs(status,created_at DESC)")
     con.execute("UPDATE training_jobs SET status='failed',stage='Прервано перезапуском',error='Worker restarted before completion',updated_at=? WHERE status IN ('queued','running')",(now_iso(),))
     config_defaults={
         "active_model":"", "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
@@ -223,8 +226,9 @@ async def lifespan(app: FastAPI):
     init_db()
     try: yield
     finally:
-        for task in list(_training_tasks.values()): task.cancel()
-        if _training_tasks: await asyncio.gather(*list(_training_tasks.values()),return_exceptions=True)
+        for task in [*list(_training_tasks.values()),*list(_dataset_capture_tasks.values())]: task.cancel()
+        pending=[*list(_training_tasks.values()),*list(_dataset_capture_tasks.values())]
+        if pending: await asyncio.gather(*pending,return_exceptions=True)
 
 app=FastAPI(title="ZMK Vision API",version=APP_VERSION,description="On-premise API контура видеоаналитики",lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:5173").split(",") if x.strip()],allow_credentials=False,allow_methods=["GET","POST","PUT","PATCH","DELETE"],allow_headers=["Content-Type","X-API-Key","X-Telegram-Init-Data"])
@@ -1118,6 +1122,72 @@ def delete_dataset(dataset_id:int):
     shutil.rmtree(DATASET_DIR/name,ignore_errors=True)
     return {"id":dataset_id,"deleted":True,"name":name}
 
+class DatasetCaptureIn(BaseModel):
+    camera_id:str=Field(min_length=1,max_length=64)
+    name:str=Field(min_length=2,max_length=120)
+    image_count:int=Field(default=100,ge=20,le=5000)
+    capture_fps:float=Field(default=2,ge=.1,le=20)
+
+async def collect_camera_dataset(job_id:int) -> None:
+    target:Path|None=None
+    try:
+        con=db(); job=con.execute("SELECT name,camera_id,target_count,capture_fps FROM dataset_capture_jobs WHERE id=?",(job_id,)).fetchone()
+        if not job: con.close(); return
+        con.execute("UPDATE dataset_capture_jobs SET status='running',stage='Ожидание live-кадров',updated_at=? WHERE id=?",(now_iso(),job_id)); con.commit(); con.close()
+        name,camera_id,target_count,capture_fps=job[0],job[1],job[2],job[3]
+        target=DATASET_DIR/name; images=target/'images'; images.mkdir(parents=True,exist_ok=False)
+        last_sequence=-1; captured=0; last_progress=0.; no_frame_since=time.monotonic()
+        interval=1/max(.1,float(capture_fps))
+        while captured<target_count:
+            with _live_frames_lock: frame=_live_frames.get(camera_id)
+            if frame and frame[0]!=last_sequence:
+                started=time.monotonic(); sequence,_,jpeg=frame
+                path=images/f'frame_{captured+1:06}.jpg'; temp=path.with_suffix('.tmp'); temp.write_bytes(jpeg); temp.replace(path)
+                last_sequence=sequence; captured+=1; no_frame_since=time.monotonic()
+                if captured==target_count or time.monotonic()-last_progress>=.5:
+                    con=db(); con.execute("UPDATE dataset_capture_jobs SET captured_count=?,stage='Сбор кадров',updated_at=? WHERE id=?",(captured,now_iso(),job_id)); con.commit(); con.close(); last_progress=time.monotonic()
+                await asyncio.sleep(max(0.,interval-(time.monotonic()-started)))
+                continue
+            if time.monotonic()-no_frame_since>45: raise RuntimeError('Нет live-кадров от камеры более 45 секунд')
+            await asyncio.sleep(.05)
+        con=db(); cur=con.execute("INSERT INTO datasets(name,path,image_count,class_count,created_at,kind,media_count,label_count) VALUES(?,?,?,?,?,?,?,?)",(name,str(target),captured,0,now_iso(),'images',captured,0)); dataset_id=cur.lastrowid
+        con.execute("UPDATE dataset_capture_jobs SET status='completed',captured_count=?,stage='Датасет готов',updated_at=? WHERE id=?",(captured,now_iso(),job_id)); con.commit(); con.close()
+        _=dataset_id
+    except asyncio.CancelledError:
+        con=db(); con.execute("UPDATE dataset_capture_jobs SET status='cancelled',stage='Отменено',updated_at=? WHERE id=?",(now_iso(),job_id)); con.commit(); con.close()
+        if target: shutil.rmtree(target,ignore_errors=True)
+        raise
+    except Exception as exc:  # noqa: BLE001 - show real capture error to operator.
+        con=db(); con.execute("UPDATE dataset_capture_jobs SET status='failed',stage='Ошибка',error=?,updated_at=? WHERE id=?",(str(exc)[:500],now_iso(),job_id)); con.commit(); con.close()
+        if target: shutil.rmtree(target,ignore_errors=True)
+    finally:
+        _dataset_capture_tasks.pop(job_id,None)
+
+@app.post("/api/datasets/capture",status_code=202)
+async def capture_dataset_from_camera(payload:DatasetCaptureIn):
+    name=_slugify(payload.name)
+    con=db(); camera=con.execute("SELECT enabled FROM cameras WHERE id=?",(payload.camera_id,)).fetchone()
+    if not camera: con.close(); raise HTTPException(404,'Камера не найдена')
+    if not camera[0]: con.close(); raise HTTPException(409,'Аналитика камеры отключена')
+    if con.execute("SELECT 1 FROM datasets WHERE name=?",(name,)).fetchone(): con.close(); raise HTTPException(409,'Датасет с таким именем уже существует')
+    if con.execute("SELECT 1 FROM dataset_capture_jobs WHERE name=?",(name,)).fetchone(): con.close(); raise HTTPException(409,'Это имя уже использовалось для сбора датасета; выберите новое')
+    cur=con.execute("INSERT INTO dataset_capture_jobs(name,camera_id,target_count,capture_fps,status,captured_count,stage,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(name,payload.camera_id,payload.image_count,payload.capture_fps,'queued',0,'В очереди',now_iso(),now_iso())); con.commit(); job_id=cur.lastrowid; con.close()
+    task=asyncio.create_task(collect_camera_dataset(job_id),name=f'dataset-capture-{job_id}'); _dataset_capture_tasks[job_id]=task
+    return {'id':job_id,'name':name,'camera_id':payload.camera_id,'target_count':payload.image_count,'capture_fps':payload.capture_fps,'status':'queued'}
+
+@app.get("/api/datasets/capture/jobs")
+def dataset_capture_jobs(): return rows("SELECT * FROM dataset_capture_jobs ORDER BY id DESC LIMIT 20")
+
+@app.post("/api/datasets/capture/jobs/{job_id}/cancel")
+def cancel_dataset_capture(job_id:int):
+    con=db(); row=con.execute("SELECT status FROM dataset_capture_jobs WHERE id=?",(job_id,)).fetchone()
+    if not row: con.close(); raise HTTPException(404,'Задача сбора не найдена')
+    if row[0] not in {'queued','running'}: con.close(); raise HTTPException(409,'Задача уже завершена')
+    con.execute("UPDATE dataset_capture_jobs SET status='cancelled',stage='Отменено оператором',updated_at=? WHERE id=?",(now_iso(),job_id)); con.commit(); con.close()
+    task=_dataset_capture_tasks.get(job_id)
+    if task: task.cancel()
+    return {'id':job_id,'status':'cancelled'}
+
 class DatasetPreviewIn(BaseModel):
     confidence:float|None=Field(default=None,ge=.05,le=.95)
     limit:int=Field(default=5,ge=1,le=12)
@@ -1129,7 +1199,7 @@ def preview_dataset(dataset_name:str,payload:DatasetPreviewIn|None=None):
     ds=row[0]
     if not Path(ds["path"]).is_dir(): raise HTTPException(503,"Файлы датасета не найдены на диске")
     if not TRAINING_WORKER_URL:
-        raise HTTPException(503,"Сервис обучения не подключён. Запустите Compose profile training")
+        raise HTTPException(503,"Сервис обучения не подключён. Проверьте контейнер training-worker")
     active=con_value("active_model","")
     artifact=None
     if active:
@@ -1156,7 +1226,7 @@ async def run_training(job_id:int):
 
 @app.post("/api/training/jobs",status_code=202)
 async def start_training(payload:TrainingIn):
-    if not SEED_TEST_DATA and not TRAINING_WORKER_URL: raise HTTPException(503,"Сервис обучения не подключён. Запустите Compose profile training")
+    if not SEED_TEST_DATA and not TRAINING_WORKER_URL: raise HTTPException(503,"Сервис обучения не подключён. Проверьте контейнер training-worker")
     con=db(); cam=None; rtsp=""
     dataset_kind="yolo"
     if payload.source=="dataset":

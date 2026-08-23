@@ -50,6 +50,20 @@ def dataset_dir(tmp_path, monkeypatch):
     return d
 
 
+def test_camera_capture_dataset_job_can_be_started_and_cancelled(dataset_dir):
+    with TestClient(main.app) as c:
+        started = c.post('/api/datasets/capture', json={
+            'camera_id': 'cam_01', 'name': 'Camera Capture', 'image_count': 20, 'capture_fps': 2,
+        })
+        assert started.status_code == 202, started.text
+        job = started.json()
+        assert job['name'] == 'Camera_Capture' and job['target_count'] == 20
+        listed = c.get('/api/datasets/capture/jobs').json()
+        assert any(x['id'] == job['id'] for x in listed)
+        cancelled = c.post(f"/api/datasets/capture/jobs/{job['id']}/cancel")
+        assert cancelled.status_code == 200, cancelled.text
+
+
 def test_upload_and_list_dataset(dataset_dir):
     with TestClient(main.app) as c:
         r = c.post("/api/datasets?name=My Dataset", content=_make_dataset_zip(),
