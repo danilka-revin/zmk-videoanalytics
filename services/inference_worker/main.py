@@ -113,6 +113,121 @@ EVENT_CLASSES = {
 _URL_SECRET = re.compile(r"rtsps?://[^\s'\"<>]+", re.IGNORECASE)
 _YOLO_CLASS: Any | None = None
 
+# A PPE model may call the same concepts differently ("Human", "hat",
+# "No-Helmet", ...).  Normalising them here makes a genuine person+helmet
+# model usable without forcing its author to name classes exactly like our
+# event API.  COCO `person` alone is never enough to raise a violation.
+_PERSON_LABELS = {"person", "human", "worker", "people"}
+_HELMET_LABELS = {"helmet", "hardhat", "hard_hat", "hat", "safety_helmet"}
+_NO_HELMET_LABELS = {
+    "no_helmet", "nohelmet", "no_hat", "nohat", "no_hardhat", "nohardhat",
+    "without_helmet", "withouthelmet", "person_without_helmet", "person_no_helmet",
+}
+
+
+@dataclass(frozen=True)
+class ModelBox:
+    """One normalised YOLO detection used to build safety events."""
+
+    bbox: tuple[float, float, float, float]
+    label: str
+    semantic: str
+    confidence: float
+    index: int
+
+
+def normalise_model_label(value: object) -> str:
+    raw = re.sub(r"[^a-z0-9]+", "_", str(value or "").casefold()).strip("_")
+    if raw in _PERSON_LABELS:
+        return "person"
+    if raw in _HELMET_LABELS:
+        return "helmet"
+    if raw in _NO_HELMET_LABELS:
+        return "no_helmet"
+    return raw
+
+
+def model_semantics(names: object) -> set[str]:
+    """Return semantic classes declared by a YOLO model's names mapping."""
+
+    values = names.values() if isinstance(names, dict) else names if isinstance(names, (list, tuple)) else ()
+    return {normalise_model_label(value) for value in values}
+
+
+def _box_center(box: ModelBox) -> tuple[float, float]:
+    x1, y1, x2, y2 = box.bbox
+    return (x1 + x2) / 2, (y1 + y2) / 2
+
+
+def _person_for_box(box: ModelBox, people: list[ModelBox]) -> ModelBox | None:
+    """Associate a head/helmet/body box to the most plausible person box.
+
+    PPE datasets do not all label the missing helmet equally: some mark the
+    head and some mark the whole worker.  Center-in-expanded-person plus a
+    containment score supports both variants while preventing an unrelated
+    hardhat from being assigned to a neighbouring worker.
+    """
+
+    cx, cy = _box_center(box)
+    best: tuple[float, ModelBox] | None = None
+    for person in people:
+        x1, y1, x2, y2 = person.bbox
+        width, height = max(1.0, x2 - x1), max(1.0, y2 - y1)
+        if not (x1 - .15 * width <= cx <= x2 + .15 * width and y1 - .25 * height <= cy <= y2 + .15 * height):
+            continue
+        # Prefer a person that actually contains the child box's centre, then
+        # a closer/more confident anchor when workers overlap in the frame.
+        centrality = 1 - min(1.0, abs(cx - (x1 + x2) / 2) / width + abs(cy - (y1 + y2) / 2) / height)
+        score = person.confidence + centrality * .01
+        if best is None or score > best[0]:
+            best = (score, person)
+    return best[1] if best else None
+
+
+def ppe_no_helmet_violations(boxes: list[ModelBox], declared: set[str]) -> list[tuple[ModelBox, ModelBox | None, bool]]:
+    """Return (evidence, person, inferred) no-helmet violations.
+
+    A model with an explicit `no_helmet` label is trusted to make that
+    classification.  For a model with *only* person and helmet classes, use a
+    conservative relation: a detected person that has no matching helmet is a
+    violation.  A generic COCO model cannot enter either path because it has no
+    helmet class, so it never turns every person into a false alarm.
+    """
+
+    people = [box for box in boxes if box.semantic == "person"]
+    missing = [box for box in boxes if box.semantic == "no_helmet"]
+    if missing:
+        result: list[tuple[ModelBox, ModelBox | None, bool]] = []
+        for evidence in missing:
+            person = _person_for_box(evidence, people) if people else None
+            # A PPE model that declares people must link a bare-head detection
+            # to one; otherwise it may belong to a poster/background object.
+            if people and person is None:
+                continue
+            result.append((evidence, person, False))
+        return result
+
+    # Models trained to output `no_helmet` already made the classification. Do
+    # not second-guess an absent detection with a noisier absence heuristic.
+    if "no_helmet" in declared or not people or "helmet" not in declared:
+        return []
+    helmets = [box for box in boxes if box.semantic == "helmet"]
+    protected = {person.index for helmet in helmets if (person := _person_for_box(helmet, people)) is not None}
+    return [(person, person, True) for person in people if person.index not in protected]
+
+
+def _label_at(names: object, class_id: int) -> str:
+    if isinstance(names, dict):
+        return str(names.get(class_id, names.get(str(class_id), class_id)))
+    if isinstance(names, (list, tuple)) and 0 <= class_id < len(names):
+        return str(names[class_id])
+    return str(class_id)
+
+
+def _person_id(camera_id: str, box: ModelBox) -> str:
+    x, y = _box_center(box)
+    return f"{camera_id}-person-{int(x // 100)}-{int(y // 100)}"
+
 
 def redact_error(value: object, limit: int = 300) -> str:
     """Return an operator-safe error: never echo an RTSP credential."""
@@ -159,7 +274,15 @@ def load_model_sync(info: dict[str, Any]) -> tuple[str, Any, str]:
     if checksum and file_sha256(path).lower() != checksum.lower():
         raise RuntimeError("Контрольная сумма активной модели не совпадает")
     device = resolve_device()
-    return str(info["name"]), _yolo_class()(str(path)), device
+    model = _yolo_class()(str(path))
+    # The downloadable PPE baseline must still expose the semantic classes it
+    # promises after deserialisation; otherwise never activate a wrong/corrupt
+    # artifact and silently generate unrelated events.
+    if str(info.get("source") or "") == "preset:ppe-person-helmet-yolo11":
+        semantics = model_semantics(getattr(model, "names", {}))
+        if "person" not in semantics or not ({"helmet", "no_helmet"} & semantics):
+            raise RuntimeError("PPE-пресет имеет неожиданный список классов")
+    return str(info["name"]), model, device
 
 
 @dataclass(frozen=True)
@@ -834,34 +957,60 @@ class Runtime:
             self._log(f"inference failed; camera capture continues: {redact_error(exc)}")
             return
 
-        detections: list[dict[str, Any]] = []
         stamp = datetime.now(timezone.utc).isoformat()
         try:
+            names = getattr(result, "names", None) or getattr(self.model, "names", {})
+            declared = model_semantics(names)
+            raw: list[ModelBox] = []
             values = zip(
                 result.boxes.xyxy.cpu().tolist(),
                 result.boxes.cls.cpu().tolist(),
                 result.boxes.conf.cpu().tolist(),
             )
             for index, (xyxy, cls, score) in enumerate(values):
-                label = str(self.model.names[int(cls)])
-                if label not in EVENT_CLASSES:
+                if len(xyxy) != 4:
                     continue
-                x1, y1, x2, y2 = xyxy
-                detections.append(
-                    {
-                        "camera_id": session.config.camera_id,
-                        "model_name": self.model_name,
-                        "timestamp": stamp,
-                        "event_type": label,
-                        "confidence": score,
-                        "person_id": f"{session.config.camera_id}-{label}-{int(((x1 + x2) / 2) // 100)}-{int(((y1 + y2) / 2) // 100)}",
-                        "detection_id": f"{session.config.camera_id}:{int(time.time() * 1000)}:{index}",
-                        "bbox": [x1, y1, x2, y2],
-                    }
-                )
+                x1, y1, x2, y2 = (float(value) for value in xyxy)
+                if x2 <= x1 or y2 <= y1:
+                    continue
+                label = _label_at(names, int(cls))
+                raw.append(ModelBox((x1, y1, x2, y2), label, normalise_model_label(label), float(score), index))
         except (AttributeError, IndexError, TypeError, ValueError) as exc:
             self._log(f"invalid model output ignored: {redact_error(exc)}")
             return
+
+        detections: list[dict[str, Any]] = []
+        frame_token = int(time.time() * 1000)
+
+        def append_event(event_type: str, evidence: ModelBox, person: ModelBox | None = None, *, inferred: bool = False) -> None:
+            anchor = person or evidence
+            x1, y1, x2, y2 = anchor.bbox
+            # For an inferred absence the only measurable confidence is the
+            # confidence of the detected worker. Explicit no-helmet labels use
+            # the model's own no-helmet confidence instead.
+            confidence = evidence.confidence
+            person_id = _person_id(session.config.camera_id, anchor) if person else f"{session.config.camera_id}-{event_type}-{int(((x1 + x2) / 2) // 100)}-{int(((y1 + y2) / 2) // 100)}"
+            detections.append(
+                {
+                    "camera_id": session.config.camera_id,
+                    "model_name": self.model_name,
+                    "timestamp": stamp,
+                    "event_type": event_type,
+                    "confidence": confidence,
+                    "person_id": person_id,
+                    "detection_id": f"{session.config.camera_id}:{frame_token}:{evidence.index}:{'derived' if inferred else event_type}",
+                    "bbox": [x1, y1, x2, y2],
+                }
+            )
+
+        # Preserve the existing direct event-class contract for models trained
+        # with ZMK's native labels. `no_helmet` is handled below so a PPE model
+        # can attach the violation to the corresponding person.
+        for box in raw:
+            if box.semantic in EVENT_CLASSES and box.semantic != "no_helmet":
+                append_event(box.semantic, box)
+        for evidence, person, inferred in ppe_no_helmet_violations(raw, declared):
+            append_event("no_helmet", evidence, person, inferred=inferred)
 
         if detections:
             try:

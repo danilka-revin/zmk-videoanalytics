@@ -78,6 +78,16 @@ def test_worker_module_imports_and_gathers_media(tmp_path):
     assert {p.name for p in vids} == {"clip1.mp4", "clip2.AVI"}
 
 
+def test_training_prefers_active_pytorch_ppe_weights_when_available(tmp_path):
+    import main as worker
+
+    ppe = tmp_path / "ppe-person-helmet.pt"
+    ppe.write_bytes(b"weights")
+    assert worker._training_base_model(types.SimpleNamespace(base_artifact=f"file://{ppe}")) == str(ppe)
+    # An ONNX inference artifact is not resumable by the Ultralytics trainer.
+    assert worker._training_base_model(types.SimpleNamespace(base_artifact=f"file://{tmp_path / 'ppe.onnx'}")) == worker.BASE_MODEL
+
+
 def test_extract_frames_from_real_video(tmp_path):
     import main as worker
 

@@ -120,6 +120,76 @@ def test_no_active_model_does_not_import_ml_dependencies(worker_mod):
     assert "torch" not in worker_mod.__dict__
 
 
+def test_ppe_labels_link_no_helmet_to_the_detected_person(worker_mod):
+    person = worker_mod.ModelBox((0, 0, 100, 200), "Human", "person", .96, 0)
+    bare_head = worker_mod.ModelBox((35, 12, 65, 55), "No-Helmet", "no_helmet", .92, 1)
+    helmet = worker_mod.ModelBox((35, 12, 65, 55), "Helmet", "helmet", .92, 2)
+
+    # A direct no-helmet prediction becomes a person-level violation.
+    direct = worker_mod.ppe_no_helmet_violations([person, bare_head], {"person", "helmet", "no_helmet"})
+    assert direct == [(bare_head, person, False)]
+    # A declared no-helmet model must not turn every missed detection into an
+    # alarm merely because it saw a person without an explicit helmet box.
+    assert worker_mod.ppe_no_helmet_violations([person, helmet], {"person", "helmet", "no_helmet"}) == []
+    # A person+helmet-only model can conservatively derive a violation only
+    # when no helmet is associated with that person.
+    inferred = worker_mod.ppe_no_helmet_violations([person], {"person", "helmet"})
+    assert inferred == [(person, person, True)]
+    assert worker_mod.ppe_no_helmet_violations([person], {"person"}) == []  # COCO person-only is not PPE
+
+
+def test_ppe_inference_posts_no_helmet_event_for_the_matching_person(worker_mod):
+    class Tensor:
+        def __init__(self, value): self.value = value
+        def cpu(self): return self
+        def tolist(self): return self.value
+
+    result = types.SimpleNamespace(
+        boxes=types.SimpleNamespace(
+            xyxy=Tensor([[0, 0, 100, 200], [35, 12, 65, 55]]),
+            cls=Tensor([0, 2]),
+            conf=Tensor([.96, .92]),
+        )
+    )
+
+    class PpeModel:
+        def __init__(self): self.names = {0: "Human", 1: "Helmet", 2: "No-Helmet", 3: "Vest"}
+        def predict(self, *_args, **_kwargs): return [result]
+
+    runtime = worker_mod.Runtime()
+    runtime.model = PpeModel()
+    runtime.model_name = "ppe-person-helmet-yolo11"
+    posted = []
+
+    async def post(path, data):
+        posted.append((path, data))
+
+    runtime.post = post
+    session = worker_mod.CameraSession(config=worker_mod.CameraConfig.from_api(_camera()))
+    asyncio.run(runtime._infer(session, _FakeImage()))
+
+    assert posted and posted[0][0] == "/api/inference/detections"
+    detection = posted[0][1]["detections"][0]
+    assert detection["event_type"] == "no_helmet"
+    assert detection["bbox"] == [0.0, 0.0, 100.0, 200.0]
+    assert detection["person_id"].startswith("cam_01-person-")
+
+
+def test_ppe_preset_refuses_artifact_without_person_and_helmet_labels(worker_mod, tmp_path, monkeypatch):
+    artifact = tmp_path / "ppe.pt"
+    artifact.write_bytes(b"weights")
+
+    class WrongPpe:
+        def __init__(self, *_args): self.names = {0: "car", 1: "helmet"}
+
+    monkeypatch.setattr(worker_mod, "_yolo_class", lambda: WrongPpe)
+    with pytest.raises(RuntimeError, match="неожиданный список классов"):
+        worker_mod.load_model_sync({
+            "name": "ppe-person-helmet-yolo11", "artifact_uri": f"file://{artifact}",
+            "checksum": "", "source": "preset:ppe-person-helmet-yolo11",
+        })
+
+
 def test_auto_transport_starts_with_tcp_then_falls_back_to_udp(worker_mod):
     worker_mod.RTSP_TRANSPORT = "auto"
     worker_mod.TRANSPORT_ORDER = ["tcp", "udp"]

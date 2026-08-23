@@ -33,8 +33,18 @@ def capture(job:Job,path:Path):
 IMAGE_EXTS={'.jpg','.jpeg','.png','.bmp','.webp','.tif','.tiff'}
 VIDEO_EXTS={'.mp4','.avi','.mov','.mkv','.m4v','.webm','.mpg','.mpeg','.wmv'}
 
+def _training_base_model(job:Job) -> str:
+ """Prefer the active PyTorch PPE model when refining it on local data.
+
+ ONNX artifacts are excellent for inference but cannot be resumed by
+ Ultralytics' trainer, so in that case safely fall back to the standard base.
+ """
+ candidate=Path(job.base_artifact.removeprefix('file://')) if job.base_artifact else None
+ if candidate and candidate.is_file() and candidate.suffix.lower()=='.pt': return str(candidate)
+ return BASE_MODEL
+
 def _common_train(data_yaml, job:Job, work:Path, updates=None):
- trainer=YOLO(BASE_MODEL); updates and updates.put(('progress',60,'Обучение YOLO11n'))
+ trainer=YOLO(_training_base_model(job)); updates and updates.put(('progress',60,'Обучение YOLO'))
  result=trainer.train(data=str(data_yaml),epochs=job.epochs,imgsz=job.imgsz,batch=job.batch,patience=job.patience,device=DEVICE,project=str(work/'runs'),name='train',exist_ok=True,verbose=False)
  updates and updates.put(('progress',90,'Экспорт ONNX'))
  best=work/'runs'/'train'/'weights'/'best.pt'; MODELS.mkdir(parents=True,exist_ok=True); target=MODELS/f'{job.target_name}.pt'; shutil.copy2(best,target); exported=YOLO(str(target)).export(format='onnx',dynamic=True,simplify=True); onnx=MODELS/f'{job.target_name}.onnx'; shutil.move(str(exported),onnx)

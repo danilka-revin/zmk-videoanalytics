@@ -89,6 +89,62 @@ def test_download_and_register_preset(model_dir, preset_url, monkeypatch):
         assert r2.json()["already"] is True
 
 
+def test_ppe_preset_requires_explicit_trial_activation(model_dir, preset_url, monkeypatch):
+    ppe = next(p for p in main.MODEL_PRESETS if p["id"] == "ppe-person-helmet-yolo11")
+    monkeypatch.setattr(main, "MODEL_PRESETS", [{**ppe, "url": f"{preset_url}/yolo11n.pt", "min_bytes": 1}])
+    with TestClient(main.app) as c:
+        downloaded = c.post("/api/models/presets/ppe-person-helmet-yolo11/download")
+        assert downloaded.status_code == 200, downloaded.text
+        assert downloaded.json()["trial_activation"] is True
+
+        # The ordinary quality gate remains intact; this public baseline has no
+        # fabricated local metrics and cannot silently become production-active.
+        assert c.post("/api/models/ppe-person-helmet-yolo11/activate").status_code == 409
+        trial = c.post("/api/models/ppe-person-helmet-yolo11/activate-trial")
+        assert trial.status_code == 200, trial.text
+        assert trial.json()["trial_mode"] is True
+        model = next(x for x in c.get("/api/models").json() if x["name"] == "ppe-person-helmet-yolo11")
+        assert model["active"] is True and model["trial_mode"] is True and model["trial_eligible"] is True
+        health = c.get("/api/models/active/health").json()
+        assert health["healthy"] is False and health["trial_mode"] is True
+        stopped = c.post("/api/models/ppe-person-helmet-yolo11/deactivate-trial")
+        assert stopped.status_code == 200 and stopped.json()["stopped"] is True
+        assert stopped.json()["restored_model"] == "siz-guard-v2.1"
+        assert c.post("/api/models/ppe-person-helmet-yolo11/deactivate-trial").json()["idempotent"] is True
+        # The previous validated model is restored and no stale PPE choice can
+        # be resurrected after a service restart.
+        con = main.db()
+        state = dict(con.execute("SELECT key,value FROM settings WHERE key IN ('active_model','active_model_disabled','ppe_trial_previous_model')"))
+        con.close()
+        assert state == {"active_model": "siz-guard-v2.1", "active_model_disabled": "false", "ppe_trial_previous_model": ""}
+
+
+def test_trial_endpoint_cannot_bypass_regular_model_validation(model_dir, preset_url, monkeypatch):
+    monkeypatch.setattr(main, "MODEL_PRESETS", [{**main.MODEL_PRESETS[0], "url": f"{preset_url}/yolo11n.pt"}])
+    with TestClient(main.app) as c:
+        assert c.post("/api/models/presets/yolo11n/download").status_code == 200
+        blocked = c.post("/api/models/yolo11n/activate-trial")
+        assert blocked.status_code == 409
+
+
+def test_restart_keeps_an_empty_model_selection_inactive(monkeypatch):
+    # A downloaded baseline must never become active merely because the API
+    # container restarts before the operator presses an activation button.
+    monkeypatch.setattr(main, "SEED_TEST_DATA", False)
+    main.init_db()
+    con = main.db()
+    con.execute(
+        "INSERT INTO model_registry(name,format,status,precision,recall,trained_at,source,artifact_uri,checksum) VALUES(?,?,?,?,?,?,?,?,?)",
+        ("unselected-ppe", "PyTorch", "ready", None, None, main.now_iso(), "preset:ppe-person-helmet-yolo11", "file:///models/ppe.pt", ""),
+    )
+    con.commit(); con.close()
+    main.init_db()
+    con = main.db()
+    active = con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()[0]
+    con.close()
+    assert active == ""
+
+
 def test_download_rejects_unknown_preset(model_dir):
     with TestClient(main.app) as c:
         assert c.post("/api/models/presets/nonexistent/download").status_code == 404

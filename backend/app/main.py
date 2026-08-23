@@ -94,27 +94,36 @@ def provision_worker_token(token_file: Path, env_token: str | None = None) -> st
 
 WORKER_TOKEN = provision_worker_token(WORKER_TOKEN_FILE, os.getenv("ZMK_WORKER_TOKEN", ""))
 UPDATE_SERVICE_URL = os.getenv("UPDATE_SERVICE_URL", "").rstrip("/")
-# Catalog of ready-to-download pretrained models (real public weights).
-# Each entry has a real, checked download URL. These are COCO-pretrained
-# detectors, so they serve as a starting base for fine-tuning / preview, not
-# as production safety models (their class labels don't include the custom
-# safety classes, so no events fire until you train on your own labels).
-# metrics are intentionally null: they are not validated on safety data.
+# Catalog of ready-to-download pretrained models.  Generic COCO weights are
+# useful for fine-tuning, but COCO does not contain a safety-helmet class.  The
+# PPE entry below is an opt-in public YOLO11 baseline with person, helmet and
+# no-helmet labels.  It is deliberately marked as a *trial* model: it can be
+# explicitly enabled for an on-site check, but it never pretends to have local
+# validation metrics.
 MODEL_PRESETS = [
     {
         "id":"yolo11n","name":"yolo11n","format":"PyTorch","url":"https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt",
-        "size_bytes":5613764,"classes":80,"category":"starter","description":"Компактная базовая модель (5.4 МБ) — быстрый старт, подходит как отправная точка для дообучения на своих данных.",
-        "hint":"Скачается и зарегистрируется в реестре. Метрики не заданы — для активации обучите на своих данных или укажите метрики валидации.",
+        "size_bytes":5613764,"classes":80,"category":"starter","description":"Компактная базовая COCO-модель (5.4 МБ) — быстрый старт для дообучения на своих данных.",
+        "hint":"COCO знает класс person, но не знает защитную каску. Метрики не заданы — для активации обучите на своих данных или укажите метрики валидации.",
+    },
+    {
+        "id":"ppe-person-helmet-yolo11","name":"ppe-person-helmet-yolo11","format":"PyTorch",
+        # Pin the immutable Hugging Face revision containing the weights rather
+        # than downloading an arbitrary future revision from the `main` branch.
+        "url":"https://huggingface.co/melihuzunoglu/ppe-detection/resolve/4a4d54e425f82896f1717637603ec28553d7f91c/best.pt?download=true",
+        "source_url":"https://huggingface.co/melihuzunoglu/ppe-detection","size_bytes":5_750_000,"min_bytes":1_000_000,"classes":4,"category":"safety","trial_activation":True,
+        "description":"Готовая YOLO11 PPE-модель: человек, каска, без каски и жилет. Нарушение «без каски» привязывается к человеку.",
+        "hint":"Сторонняя стартовая модель для теста на ваших камерах. Перед промышленным использованием проверьте её на местных кадрах и дообучите на своём датасете.",
     },
     {
         "id":"yolov8n","name":"yolov8n","format":"PyTorch","url":"https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.pt",
         "size_bytes":6549796,"classes":80,"category":"base","description":"Базовая YOLOv8-nano (6.5 МБ) — классический старт для детекции объектов.",
-        "hint":"Скачается и зарегистрируется в реестре. Метрики не заданы — требуется валидация перед активацией.",
+        "hint":"COCO знает класс person, но не знает защитную каску. Метрики не заданы — требуется валидация перед активацией.",
     },
     {
         "id":"yolo11s","name":"yolo11s","format":"PyTorch","url":"https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11s.pt",
-        "size_bytes":19313732,"classes":80,"category":"quality","description":"Более точная модель (19 МБ) — выше качество детекции, больше ресурсов.",
-        "hint":"Скачается и зарегистрируется в реестре. Метрики не заданы — требуется валидация перед активацией.",
+        "size_bytes":19313732,"classes":80,"category":"quality","description":"Более точная COCO-модель (19 МБ) — выше качество детекции, больше ресурсов.",
+        "hint":"COCO знает класс person, но не знает защитную каску. Метрики не заданы — требуется валидация перед активацией.",
     },
 ]
 # Allow overriding/extending the catalog via env (JSON array), for self-hosted
@@ -200,7 +209,7 @@ def init_db():
     con.execute("CREATE INDEX IF NOT EXISTS ix_capture_jobs_status ON dataset_capture_jobs(status,created_at DESC)")
     con.execute("UPDATE training_jobs SET status='failed',stage='Прервано перезапуском',error='Worker restarted before completion',updated_at=? WHERE status IN ('queued','running')",(now_iso(),))
     config_defaults={
-        "active_model":"", "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
+        "active_model":"", "active_model_disabled":"false", "ppe_trial_previous_model":"", "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
         "retention_days":"90", "archive_quality":"90", "archive_clip_seconds":"10",
         "inference_fps":"8", "inference_device":"cuda:0", "batch_size":"4", "nms_iou":"0.45",
         "helmet_conf":"0.85", "vest_conf":"0.80", "phone_conf":"0.78", "smoking_conf":"0.80", "restricted_zone_conf":"0.82", "immobility_conf":"0.80", "min_model_precision":"90", "min_model_recall":"85",
@@ -210,13 +219,24 @@ def init_db():
         "rtsp_reconnect_seconds":"5", "event_cooldown_seconds":"30"
     }
     for key,value in config_defaults.items(): con.execute("INSERT OR IGNORE INTO settings VALUES(?,?)",(key,value))
-    active_row=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()
-    active_ok=active_row and con.execute("SELECT 1 FROM model_registry WHERE name=? AND status='ready'",(active_row[0],)).fetchone()
-    if not active_ok:
-        fallback=con.execute("SELECT name FROM model_registry WHERE status='ready' ORDER BY id DESC LIMIT 1").fetchone()
-        value=fallback[0] if fallback else ""
-        con.execute("INSERT INTO settings(key,value) VALUES('active_model',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(value,))
-        if fallback: con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"Active model repaired to {fallback[0]}"))
+    disabled_row=con.execute("SELECT value FROM settings WHERE key='active_model_disabled'").fetchone()
+    if disabled_row and disabled_row[0]=='true':
+        # No model is active after an explicitly stopped PPE trial. Do not
+        # resurrect a ready model merely because the API/container restarted.
+        con.execute("UPDATE settings SET value='' WHERE key='active_model'")
+    else:
+        active_row=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()
+        # An empty value means the operator has not selected a model. Never
+        # auto-start a newly downloaded (and possibly unvalidated) preset just
+        # because the API restarted. Only repair a *previously selected* model
+        # that disappeared or became invalid.
+        if active_row and active_row[0]:
+            active_ok=con.execute("SELECT 1 FROM model_registry WHERE name=? AND status='ready'",(active_row[0],)).fetchone()
+            if not active_ok:
+                fallback=con.execute("SELECT name FROM model_registry WHERE status='ready' ORDER BY id DESC LIMIT 1").fetchone()
+                value=fallback[0] if fallback else ""
+                con.execute("INSERT INTO settings(key,value) VALUES('active_model',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(value,))
+                if fallback: con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"Active model repaired to {fallback[0]}"))
     bootstrap_env_camera(con)
     apply_retention(con)
     con.commit(); con.close()
@@ -558,7 +578,7 @@ def inference_heartbeat(payload:InferenceHeartbeat):
 
 @app.get("/api/internal/active-model")
 def internal_active_model():
-    data=rows("SELECT m.name,m.format,m.artifact_uri,m.checksum FROM model_registry m JOIN settings s ON s.key='active_model' AND s.value=m.name WHERE m.status='ready'")
+    data=rows("SELECT m.name,m.format,m.artifact_uri,m.checksum,m.source FROM model_registry m JOIN settings s ON s.key='active_model' AND s.value=m.name WHERE m.status='ready'")
     return data[0] if data else None
 
 import re as _re
@@ -895,12 +915,35 @@ def settings(): return {r["key"]:r["value"] for r in rows("SELECT * FROM setting
 @app.put("/api/settings/{key}")
 def update_setting(key:Literal["helmet_conf","vest_conf","phone_conf","smoking_conf","restricted_zone_conf","immobility_conf"],payload:SettingIn):
     con=db(); con.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,str(payload.value))); con.commit(); con.close(); return {"key":key,"value":payload.value}
+def _trial_preset_ids() -> set[str]:
+    """IDs allowed to run only after an explicit trial-mode request."""
+    return {str(p.get("id")) for p in MODEL_PRESETS if p.get("trial_activation")}
+
+
+def _is_trial_preset_source(source: str | None) -> bool:
+    return bool(source and source.startswith("preset:") and source.removeprefix("preset:") in _trial_preset_ids())
+
+
+def _model_meets_quality(precision: float | None, recall: float | None, limits: dict[str, float]) -> bool:
+    return bool(
+        precision is not None
+        and recall is not None
+        and precision >= limits.get("min_model_precision", 90)
+        and recall >= limits.get("min_model_recall", 85)
+    )
+
+
 @app.get("/api/models")
 def models():
     active=rows("SELECT value FROM settings WHERE key='active_model'")[0]["value"]
+    limits={r["key"]:float(r["value"]) for r in rows("SELECT key,value FROM settings WHERE key IN ('min_model_precision','min_model_recall')")}
     data=rows("SELECT name,format,status,precision,recall,trained_at,source,artifact_uri,checksum FROM model_registry ORDER BY id DESC")
-    for item in data: item["active"]=item["name"]==active
+    for item in data:
+        item["active"]=item["name"]==active
+        item["trial_eligible"]=_is_trial_preset_source(item.get("source"))
+        item["trial_mode"]=bool(item["active"] and item["trial_eligible"] and not _model_meets_quality(item.get("precision"),item.get("recall"),limits))
     return data
+
 
 @app.post("/api/models",status_code=201)
 def register_model(payload:ModelIn):
@@ -909,14 +952,17 @@ def register_model(payload:ModelIn):
     except sqlite3.IntegrityError: con.close(); raise HTTPException(409,"Модель с таким именем уже существует")
     con.close(); return {"name":payload.name,"status":"ready","registered":True}
 
+
 def _preset_view(preset:dict) -> dict:
     name=preset["name"]
     existing=rows("SELECT name,status,precision,recall,source FROM model_registry WHERE name=?",(name,))
     return {**{k:v for k,v in preset.items() if k!="url"},"downloaded":bool(existing),"registered":bool(existing),"source":existing[0]["source"] if existing else None}
 
+
 @app.get("/api/models/presets")
 def model_presets():
     return {"presets":[_preset_view(p) for p in MODEL_PRESETS]}
+
 
 @app.post("/api/models/presets/{preset_id}/download",status_code=200)
 def download_model_preset(preset_id:str):
@@ -924,8 +970,10 @@ def download_model_preset(preset_id:str):
     if not preset: raise HTTPException(404,"Такой пресет не найден")
     name=preset["name"]
     existing=rows("SELECT name,source,status FROM model_registry WHERE name=?",(name,))
-    if existing: return {"downloaded":False,"already":True,"model":name,"source":existing[0]["source"],"message":f"Модель {name} уже в реестре. Если файл отсутствует на диске, активация покажет ошибку."}
+    if existing: return {"downloaded":False,"already":True,"model":name,"source":existing[0]["source"],"trial_activation":bool(preset.get("trial_activation")),"message":f"Модель {name} уже в реестре. Если файл отсутствует на диске, активация покажет ошибку."}
     if not re.fullmatch(r"[A-Za-z0-9._-]{2,120}",name): raise HTTPException(422,"Недопустимое имя модели")
+    try: minimum_bytes=max(1,int(preset.get("min_bytes",1)))
+    except (TypeError,ValueError): minimum_bytes=1
     MODEL_DIR.mkdir(parents=True,exist_ok=True)
     ext=".pt"
     dest=MODEL_DIR/f"{name}{ext}"
@@ -938,8 +986,13 @@ def download_model_preset(preset_id:str):
                 for chunk in resp.iter_bytes():
                     fh.write(chunk); total+=len(chunk)
                     if total>200_000_000: raise HTTPException(413,"Модель слишком большая")
+        if total<minimum_bytes:
+            raise HTTPException(502,"Скачанный файл модели слишком мал или повреждён")
         tmp.replace(dest)
-    except httpx.HTTPError as exc:
+    except HTTPException:
+        tmp.unlink(missing_ok=True)
+        raise
+    except (httpx.HTTPError,OSError) as exc:
         tmp.unlink(missing_ok=True)
         raise HTTPException(502,f"Не удалось скачать модель: {type(exc).__name__}") from exc
     digest=hashlib.sha256(dest.read_bytes()).hexdigest()
@@ -949,30 +1002,97 @@ def download_model_preset(preset_id:str):
     except sqlite3.IntegrityError:
         con.close(); dest.unlink(missing_ok=True); raise HTTPException(409,"Модель с таким именем уже существует")
     con.close()
-    return {"downloaded":True,"model":name,"artifact_uri":f"file://{dest}","size_bytes":total,"sha256":digest,"requires_validation":True,"message":f"Модель {name} скачана и зарегистрирована. Метрики не заданы — обучите на своих данных или укажите метрики валидации, затем активируйте."}
+    trial=bool(preset.get("trial_activation"))
+    message=("PPE-модель скачана. Нажмите «Включить PPE-тест», чтобы проверить её на своих камерах." if trial else f"Модель {name} скачана и зарегистрирована. Метрики не заданы — обучите на своих данных или укажите метрики валидации, затем активируйте.")
+    return {"downloaded":True,"model":name,"artifact_uri":f"file://{dest}","size_bytes":total,"sha256":digest,"requires_validation":True,"trial_activation":trial,"message":message}
+
 
 @app.get("/api/models/active/health")
 def active_model_health():
-    con=db(); active=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone(); model=con.execute("SELECT name,format,status,precision,recall,trained_at,source FROM model_registry WHERE name=?",(active[0],)).fetchone() if active else None
-    last=con.execute("SELECT timestamp,message FROM logs WHERE service='inference_gateway' ORDER BY id DESC LIMIT 1").fetchone(); limits={r[0]:float(r[1]) for r in con.execute("SELECT key,value FROM settings WHERE key IN ('min_model_precision','min_model_recall')").fetchall()}; con.close()
+    con=db()
+    try:
+        active=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()
+        model=con.execute("SELECT name,format,status,precision,recall,trained_at,source FROM model_registry WHERE name=?",(active[0],)).fetchone() if active else None
+        last=con.execute("SELECT timestamp,message FROM logs WHERE service='inference_gateway' ORDER BY id DESC LIMIT 1").fetchone()
+        limits={r[0]:float(r[1]) for r in con.execute("SELECT key,value FROM settings WHERE key IN ('min_model_precision','min_model_recall')").fetchall()}
+    finally:
+        con.close()
     if not model: raise HTTPException(503,"Активная модель отсутствует в реестре")
-    healthy=model[2]=="ready" and model[3] is not None and model[4] is not None and model[3]>=limits.get('min_model_precision',90) and model[4]>=limits.get('min_model_recall',85)
-    return {"healthy":healthy,"model":dict(model),"requirements":{"precision":limits.get('min_model_precision',90),"recall":limits.get('min_model_recall',85)},"last_inference":dict(last) if last else None}
+    healthy=model[2]=="ready" and _model_meets_quality(model[3],model[4],limits)
+    trial_mode=bool(not healthy and _is_trial_preset_source(model[6]))
+    return {"healthy":healthy,"trial_mode":trial_mode,"model":dict(model),"requirements":{"precision":limits.get('min_model_precision',90),"recall":limits.get('min_model_recall',85)},"last_inference":dict(last) if last else None}
+
+
+def _activate_model(name:str, *, allow_trial:bool=False):
+    started=time.perf_counter()
+    con=db()
+    try:
+        model=con.execute("SELECT status,precision,recall,source FROM model_registry WHERE name=?",(name,)).fetchone()
+        if not model: raise HTTPException(404,"Модель не найдена")
+        if model[0] != "ready": raise HTTPException(409,"Модель ещё не готова")
+        limits={r[0]:float(r[1]) for r in con.execute("SELECT key,value FROM settings WHERE key IN ('min_model_precision','min_model_recall')").fetchall()}
+        quality_ok=_model_meets_quality(model[1],model[2],limits)
+        trial_mode=not quality_ok and allow_trial and _is_trial_preset_source(model[3])
+        if not quality_ok and not trial_mode:
+            if model[1] is None or model[2] is None:
+                raise HTTPException(409,"У модели отсутствуют метрики валидации. Для PPE-пресета используйте отдельную кнопку «Включить PPE-тест».")
+            raise HTTPException(409,"Метрики модели ниже минимально допустимых")
+        con.execute("BEGIN IMMEDIATE")
+        old=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()[0]
+        if old==name:
+            con.execute("UPDATE settings SET value='false' WHERE key='active_model_disabled'")
+            con.commit()
+            return {"active_model":name,"previous_model":old,"hot_swap":False,"idempotent":True,"trial_mode":trial_mode,"control_plane_switch_ms":round((time.perf_counter()-started)*1000,2),"downtime_ms":0}
+        con.execute("UPDATE settings SET value=? WHERE key='active_model'",(name,))
+        # Keep a validated model selected before a PPE test so stopping the
+        # test restores the exact previous state instead of leaving an
+        # operator unexpectedly without analytics.
+        con.execute("UPDATE settings SET value=? WHERE key='ppe_trial_previous_model'",(old if trial_mode else "",))
+        con.execute("UPDATE settings SET value='false' WHERE key='active_model_disabled'")
+        level="WARNING" if trial_mode else "INFO"
+        mode="PPE trial" if trial_mode else "validated"
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),level,"model_manager",f"Control-plane hot-swap {old} -> {name} ({mode}) completed"))
+        con.commit()
+        return {"active_model":name,"previous_model":old,"hot_swap":True,"idempotent":False,"trial_mode":trial_mode,"control_plane_switch_ms":round((time.perf_counter()-started)*1000,2),"downtime_ms":0}
+    finally:
+        con.close()
+
 
 @app.post("/api/models/{name}/activate")
 def activate(name:str):
-    started=time.perf_counter(); con=db(); model=con.execute("SELECT status,precision,recall FROM model_registry WHERE name=?",(name,)).fetchone()
-    if not model: con.close(); raise HTTPException(404,"Модель не найдена")
-    if model[0] != "ready": con.close(); raise HTTPException(409,"Модель ещё не готова")
-    if model[1] is None or model[2] is None: con.close(); raise HTTPException(409,"У модели отсутствуют метрики валидации")
-    limits={r[0]:float(r[1]) for r in con.execute("SELECT key,value FROM settings WHERE key IN ('min_model_precision','min_model_recall')").fetchall()}
-    if model[1]<limits.get('min_model_precision',90) or model[2]<limits.get('min_model_recall',85): con.close(); raise HTTPException(409,"Метрики модели ниже минимально допустимых")
-    con.execute("BEGIN IMMEDIATE"); old=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()[0]
-    if old==name:
-        con.commit(); con.close(); return {"active_model":name,"previous_model":old,"hot_swap":False,"idempotent":True,"control_plane_switch_ms":round((time.perf_counter()-started)*1000,2),"downtime_ms":0}
-    con.execute("UPDATE settings SET value=? WHERE key='active_model'",(name,))
-    con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","model_manager",f"Control-plane hot-swap {old} -> {name} completed"))
-    con.commit(); con.close(); return {"active_model":name,"previous_model":old,"hot_swap":True,"idempotent":False,"control_plane_switch_ms":round((time.perf_counter()-started)*1000,2),"downtime_ms":0}
+    return _activate_model(name)
+
+
+@app.post("/api/models/{name}/activate-trial")
+def activate_trial_model(name:str):
+    """Explicitly enable only the selected PPE baseline for an on-site trial."""
+    return _activate_model(name,allow_trial=True)
+
+
+@app.post("/api/models/{name}/deactivate-trial")
+def deactivate_trial_model(name:str):
+    """Stop the explicit PPE trial and leave camera preview running."""
+    con=db()
+    try:
+        row=con.execute("SELECT source FROM model_registry WHERE name=?",(name,)).fetchone()
+        if not row: raise HTTPException(404,"Модель не найдена")
+        if not _is_trial_preset_source(row[0]): raise HTTPException(409,"Остановить через этот маршрут можно только PPE-тест")
+        active=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()[0]
+        if active != name:
+            return {"active_model":active,"stopped":False,"idempotent":True}
+        previous_row=con.execute("SELECT value FROM settings WHERE key='ppe_trial_previous_model'").fetchone()
+        previous=previous_row[0] if previous_row else ""
+        restored=""
+        if previous and con.execute("SELECT 1 FROM model_registry WHERE name=? AND status='ready'",(previous,)).fetchone():
+            restored=previous
+        con.execute("UPDATE settings SET value=? WHERE key='active_model'",(restored,))
+        con.execute("UPDATE settings SET value=? WHERE key='active_model_disabled'",("false" if restored else "true",))
+        con.execute("UPDATE settings SET value='' WHERE key='ppe_trial_previous_model'")
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"PPE trial stopped: {name}; restored={restored or 'none'}"))
+        con.commit()
+        return {"active_model":restored,"restored_model":restored or None,"stopped":True,"idempotent":False}
+    finally:
+        con.close()
 
 @app.delete("/api/models/{name}")
 def delete_model(name:str):

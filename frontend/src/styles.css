@@ -132,3 +132,9 @@ html[data-theme=dark] .trainer-head select,html[data-theme=dark] .error-report s
 .dataset-delete-modal>p{font-size:10px;line-height:1.55;color:var(--text);margin:8px 0}
 .dataset-delete-modal .dataset-delete-hint{color:var(--muted);font-size:9px}
 .dataset-delete-modal .capture-error{margin-top:13px}
+
+/* PPE baseline: explicit test-mode controls, never presented as a validated model. */
+.ppe-trial-note{display:flex;align-items:flex-start;gap:6px;color:#9b6a1d!important;background:#fff4dc;border:1px solid #efd29b;border-radius:7px;padding:8px 9px;line-height:1.4!important}.ppe-trial-note svg{flex:0 0 auto;margin-top:1px}.model>button.model-trial{background:#b8771f;color:#fff;border-color:#b8771f}.model>button:disabled{opacity:.52;cursor:not-allowed}.preset-card.ppe-preset{border-color:#e2c17f;background:#fffaf0}.preset-cat.safety{background:#fff0d4;color:#9c6515}.preset-trial-hint{color:#9a691e!important}.preset-card.ppe-preset .preset-dl{border-color:#dfc18a}
+html[data-theme=dark] .ppe-trial-note{background:#3b2c16;border-color:#705324;color:#f4c873!important}html[data-theme=dark] .preset-card.ppe-preset{background:#2d261b;border-color:#695228}
+.model>button.model-trial-stop{margin-top:8px;background:var(--surface);color:#9b6a1d;border:1px solid #dfc18a}
+html[data-theme=dark] .model>button.model-trial-stop{background:var(--surface-2);color:#f4c873;border-color:#705324}
