@@ -8,11 +8,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_linux_installers_pass_shell_parser_and_dry_check():
-    scripts = [ROOT/'installers/install-linux.sh', ROOT/'installers/uninstall-linux.sh', ROOT/'installers/wizard.sh', ROOT/'start.sh']
+    scripts = [ROOT/'installers/bootstrap-linux.sh', ROOT/'installers/install-linux.sh', ROOT/'installers/uninstall-linux.sh', ROOT/'installers/wizard.sh', ROOT/'start.sh']
     subprocess.run(['bash','-n',*[str(x) for x in scripts]], check=True)
-    result = subprocess.run(['bash',str(scripts[0]),'--check'], cwd=ROOT, text=True, capture_output=True, check=False)
+    result = subprocess.run(['bash',str(ROOT/'installers/install-linux.sh'),'--check'], cwd=ROOT, text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
     assert 'Installer validation: OK' in result.stdout
+    bootstrap = subprocess.run(['bash',str(ROOT/'installers/bootstrap-linux.sh'),'--check'], cwd=ROOT, text=True, capture_output=True, check=False)
+    assert bootstrap.returncode == 0, bootstrap.stderr
+    assert 'bootstrap launcher: OK' in bootstrap.stdout
     # The config wizard lives in its own shared file sourced by both the
     # installer and start.sh, so the messenger/token/profile logic is there.
     wizard = (ROOT/'installers/wizard.sh').read_text()
@@ -22,6 +25,26 @@ def test_linux_installers_pass_shell_parser_and_dry_check():
     start = (ROOT/'start.sh').read_text()
     assert 'installers/wizard.sh' in start and 'run_config' in start and '--setup' in start
     assert '.zmk-profiles' in start
+
+
+def test_bootstrap_launcher_and_rtsp_wizard_escape_credentials(tmp_path):
+    bootstrap = (ROOT/'installers/bootstrap-linux.sh').read_text()
+    for required in ['git clone', 'ZMK_REF', 'ZMK_INSTALL_DIR', 'zmk-vision', 'NONINTERACTIVE=1', 'ENABLE_INFERENCE=true']:
+        assert required in bootstrap
+
+    # An RTSP password may include & or |. The wizard must preserve it rather
+    # than interpreting it as a sed replacement expression.
+    (tmp_path/'.env').write_text((ROOT/'.env.example').read_text())
+    value = 'rtsp://admin:p&ss|word!@192.0.2.10:554/stream'
+    result = subprocess.run(
+        ['bash', '-c', 'source "$1"; set_env RTSP_CAM_01 "$VALUE"; grep "^RTSP_CAM_01=" .env', '_', str(ROOT/'installers/wizard.sh')],
+        cwd=tmp_path,
+        env={**__import__('os').environ, 'VALUE': value},
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert result.stdout.strip() == f'RTSP_CAM_01={value}'
 
 
 def test_windows_wrapper_and_powershell_structure():

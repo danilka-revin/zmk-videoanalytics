@@ -24,6 +24,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }
+run_privileged(){
+  if [[ "${EUID}" -eq 0 ]]; then "$@"; else command -v sudo >/dev/null 2>&1 || fail "sudo is required to start Docker"; sudo "$@"; fi
+}
 
 # --- auto-update (optional) ---
 if [[ "${1:-}" != "--no-update" && -f installers/auto-update.sh ]]; then
@@ -70,8 +73,10 @@ if [[ -f .zmk-profiles ]]; then mapfile -t PROFILE < .zmk-profiles; fi
 
 DC=(docker compose)
 if ! docker info >/dev/null 2>&1; then
-  if command -v sudo >/dev/null 2>&1; then sudo systemctl start docker 2>/dev/null || true; fi
-  if ! docker info >/dev/null 2>&1; then DC=(sudo docker compose); fi
+  run_privileged systemctl start docker 2>/dev/null || true
+  if ! docker info >/dev/null 2>&1; then
+    if [[ "${EUID}" -eq 0 ]]; then DC=(docker compose); else DC=(sudo docker compose); fi
+  fi
 fi
 "${DC[@]}" version >/dev/null 2>&1 || fail "Docker Compose plugin is unavailable."
 

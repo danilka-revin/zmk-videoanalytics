@@ -98,6 +98,16 @@ cp .env.example .env
 docker compose up --build
 ```
 
+### Linux — одна команда для установки, обновления и запуска
+
+Команда ниже сама скачивает проект из GitHub в `~/zmk-vision` (или обновляет уже скачанную копию), один раз скрыто спросит RTSP URL, установит Docker при необходимости и запустит камеру. Повторный запуск той же команды скачивает свежий Git ref, сохраняет `.env` и `data`, затем поднимает стек снова:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/danilka-revin/zmk-videoanalytics/main/installers/bootstrap-linux.sh | bash
+```
+
+Bootstrap также создаёт короткую команду `~/.local/bin/zmk-vision`: она скачивает свежий Git ref и запускает проект повторно. После первого запуска для обычного старта достаточно `~/zmk-vision/start.sh`: он проверяет GitHub Releases, сохраняет конфигурацию и запускает Docker. Не вставляйте RTSP URL в командную строку или чат — bootstrap спрашивает его скрыто.
+
 ### Windows 10/11
 
 Скачайте ZIP из [GitHub Releases](https://github.com/danilka-revin/zmk-videoanalytics/releases), распакуйте его и запустите:

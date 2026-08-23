@@ -9,8 +9,12 @@
 # =====================================================================
 
 set_env(){
+  # Escape sed replacement metacharacters so an RTSP password containing
+  # &, | or a backslash is stored literally rather than corrupting .env.
   local key="$1" value="$2" escaped
-  escaped="${value//|/\\|}"
+  escaped="${value//\\/\\\\}"
+  escaped="${escaped//&/\\&}"
+  escaped="${escaped//|/\\|}"
   if grep -q "^${key}=" .env; then sed -i "s|^${key}=.*|${key}=${escaped}|" .env; else printf '%s=%s\n' "$key" "$value" >> .env; fi
 }
 
@@ -74,8 +78,32 @@ run_config(){
   if [[ -n "${NONINTERACTIVE:-}" ]]; then INFERENCE="${ENABLE_INFERENCE:-false}"; else read -r -p "Включить реальный RTSP YOLO inference worker? [y/N]: " INFERENCE; fi
   if [[ "$INFERENCE" =~ ^([yY]|true|1)$ ]]; then
     PROFILE+=(--profile inference)
-    # Worker token is auto-provisioned by the backend on the shared volume, so
-    # we don't need to set it here; but if set explicitly, keep it.
+    # Camera configuration is collected once here and saved into .env. The
+    # input is hidden so credentials are not echoed into terminal scrollback.
+    if [[ -n "${NONINTERACTIVE:-}" ]]; then
+      CAMERA_RTSP="${RTSP_CAM_01:-}"
+      CAMERA_DEVICE="${INFERENCE_DEVICE:-cpu}"
+      CAMERA_TRANSPORT="${RTSP_TRANSPORT:-tcp}"
+    else
+      echo ""
+      echo "Настройка RTSP-камеры (можно оставить пустым и добавить через панель):"
+      read -r -s -p "RTSP URL камеры: " CAMERA_RTSP; echo
+      read -r -p "Устройство inference [cpu/auto/0, по умолчанию cpu]: " CAMERA_DEVICE
+      read -r -p "RTSP transport [tcp/udp/auto, по умолчанию tcp]: " CAMERA_TRANSPORT
+      CAMERA_DEVICE="${CAMERA_DEVICE:-cpu}"
+      CAMERA_TRANSPORT="${CAMERA_TRANSPORT:-tcp}"
+    fi
+    if [[ -n "$CAMERA_RTSP" && ! "$CAMERA_RTSP" =~ ^rtsps?://[^[:space:]]+$ ]]; then
+      echo "Ошибка: RTSP URL должен начинаться с rtsp:// или rtsps:// и не содержать пробелов"
+      return 1
+    fi
+    case "$CAMERA_DEVICE" in cpu|auto|0|[0-9]) ;; *) echo "Ошибка: INFERENCE_DEVICE должен быть cpu, auto или номер GPU"; return 1;; esac
+    case "$CAMERA_TRANSPORT" in tcp|udp|auto) ;; *) echo "Ошибка: RTSP transport должен быть tcp, udp или auto"; return 1;; esac
+    [[ -n "$CAMERA_RTSP" ]] && set_env RTSP_CAM_01 "$CAMERA_RTSP"
+    set_env INFERENCE_DEVICE "$CAMERA_DEVICE"
+    set_env RTSP_TRANSPORT "$CAMERA_TRANSPORT"
+    set_env RTSP_TIMEOUT_OPTION "${RTSP_TIMEOUT_OPTION:-timeout}"
+    # Worker token is auto-provisioned by the backend on the shared volume.
   fi
 
   if [[ -z "${ZMK_UPDATE_TOKEN:-}" ]]; then
