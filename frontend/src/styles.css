@@ -120,3 +120,4 @@ html[data-theme=dark] .trainer-head select,html[data-theme=dark] .error-report s
 
 /* Camera actions always occupy the full card width. */
 .camera-actions{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));width:100%}.camera-actions button{width:100%;min-width:0;justify-content:center;white-space:nowrap}.cards.size-compact .camera-actions{grid-template-columns:repeat(2,minmax(0,1fr))}.cards.size-compact .camera-actions button:last-child{grid-column:1/-1}
+.capture-modal{width:min(520px,100%)}.capture-modal p{font-size:10px;color:var(--muted);line-height:1.45;margin:0 0 12px}.capture-error{margin-top:10px;border:1px solid #bc554d;background:#fbecea;color:#a53f38;border-radius:7px;padding:8px 10px;font-size:9px}
