@@ -601,8 +601,9 @@ class Runtime:
         command = (
             'exec ffmpeg -hide_banner -nostdin -loglevel warning '
             '-rtsp_transport "$ZMK_RTSP_TRANSPORT" '
-            '-rw_timeout "$ZMK_RTSP_TIMEOUT_US" '
-            '-timeout "$ZMK_RTSP_TIMEOUT_US" '
+            # Worker-owned asyncio timeout safely terminates this subprocess;
+            # avoid version-specific FFmpeg timeout flags that make some
+            # packaged builds exit immediately with status 255.
             '-fflags +genpts+discardcorrupt -err_detect ignore_err -flags low_delay '
             '-max_delay 500000 -analyzeduration 0 -probesize 32768 '
             '-i "$ZMK_RTSP_URL" -an -sn -dn '
@@ -670,7 +671,15 @@ class Runtime:
             except TimeoutError:
                 break
             if not chunk:
+                code = process.returncode
                 detail = session.decoder_error or "FFmpeg завершил поток без кадра"
+                session.opened_at = 0
+                session.next_attempt_at = time.monotonic() + RECONNECT_MIN
+                session.next_frame_at = max(session.next_frame_at, session.next_attempt_at)
+                self._log(
+                    f"camera {session.config.camera_id} FFmpeg exited (code {code if code is not None else '?'}): {detail}",
+                    force=True,
+                )
                 self._stop_ffmpeg(session)
                 return None, detail
             buffer.extend(chunk)
@@ -683,6 +692,10 @@ class Runtime:
                     buffer.clear()
 
         detail = session.decoder_error or "таймаут ожидания кадра от FFmpeg"
+        session.opened_at = 0
+        session.next_attempt_at = time.monotonic() + RECONNECT_MIN
+        session.next_frame_at = max(session.next_frame_at, session.next_attempt_at)
+        self._log(f"camera {session.config.camera_id} FFmpeg timeout: {detail}", force=True)
         self._stop_ffmpeg(session)
         return None, detail
 
@@ -842,6 +855,8 @@ class Runtime:
 
         started = time.perf_counter()
         if CAMERA_DECODER == "ffmpeg":
+            if time.monotonic() < session.next_attempt_at:
+                return
             image, error = await self._ffmpeg_frame(session)
             ok = image is not None
         else:
