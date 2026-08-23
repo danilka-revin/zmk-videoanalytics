@@ -592,8 +592,6 @@ class Runtime:
             {
                 "ZMK_RTSP_URL": session.config.rtsp_url,
                 "ZMK_RTSP_TRANSPORT": session.transport,
-                "ZMK_RTSP_TIMEOUT_US": str(_RTSP_STIMEOUT),
-                "ZMK_CAMERA_FPS": str(min(max(session.config.fps_limit, 0.1), 30)),
             }
         )
         # URL is intentionally read from an environment variable inside the
@@ -606,8 +604,7 @@ class Runtime:
             # packaged builds exit immediately with status 255.
             '-fflags +genpts+discardcorrupt -err_detect ignore_err -flags low_delay '
             '-max_delay 500000 -analyzeduration 0 -probesize 32768 '
-            '-i "$ZMK_RTSP_URL" -an -sn -dn '
-            '-vf "fps=${ZMK_CAMERA_FPS}" '
+            '-i "$ZMK_RTSP_URL" -an -sn -dn -vsync 0 '
             '-f image2pipe -vcodec mjpeg -q:v 5 pipe:1'
         )
         process = await asyncio.create_subprocess_exec(
@@ -879,6 +876,8 @@ class Runtime:
 
         session.failures = 0
         session.next_attempt_at = 0
+        if not session.received_first_frame:
+            self._log(f"camera {session.config.camera_id} received first decoded frame", force=True)
         session.received_first_frame = True
         session.frames_in_window += 1
         await self._report(session, "online", latency, "", force=session.status != "online")
