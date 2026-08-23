@@ -71,6 +71,12 @@ RTSP_TRANSPORT = os.getenv("RTSP_TRANSPORT", "auto").strip().lower()
 if RTSP_TRANSPORT not in {"auto", "tcp", "udp"}:
     RTSP_TRANSPORT = "auto"
 TRANSPORT_ORDER = ["tcp", "udp"] if RTSP_TRANSPORT == "auto" else [RTSP_TRANSPORT]
+# Modern FFmpeg RTSP builds use `timeout` (microseconds). Some legacy builds
+# retain `stimeout`, so the operator can explicitly switch it without a code
+# change when using a custom OpenCV/FFmpeg image.
+RTSP_TIMEOUT_OPTION = os.getenv("RTSP_TIMEOUT_OPTION", "timeout").strip().lower()
+if RTSP_TIMEOUT_OPTION not in {"timeout", "stimeout"}:
+    RTSP_TIMEOUT_OPTION = "timeout"
 _RTSP_BUFSIZE = _buffer_size()
 _RTSP_STIMEOUT = _bounded_int("RTSP_STIMEOUT", 5_000_000, 100_000, 120_000_000)
 OPEN_TIMEOUT_MS = _bounded_int("RTSP_OPEN_TIMEOUT_MS", 8_000, 1_000, 120_000)
@@ -244,18 +250,47 @@ class Runtime:
         return transport
 
     def _open_capture(self, url: str, transport: str):
-        # OpenCV/FFmpeg expects key;value entries separated by |. A comma makes
-        # FFmpeg reject the entire RTSP option expression.
-        options = [f"rtsp_transport;{transport}", f"stimeout;{_RTSP_STIMEOUT}"]
+        """Open RTSP with timeouts supplied *before* FFmpeg connects.
+
+        Calling CAP_PROP_OPEN_TIMEOUT_MSEC after VideoCapture(url, ...) is too
+        late: OpenCV has already entered its 30-second default connection path.
+        The empty-capture + open(params=...) form is supported by modern OpenCV
+        and is the reason unreachable streams now fail in ~OPEN_TIMEOUT_MS.
+        """
+        options = [
+            f"rtsp_transport;{transport}",
+            f"{RTSP_TIMEOUT_OPTION};{_RTSP_STIMEOUT}",
+        ]
         if _RTSP_BUFSIZE:
             options.append(f"buffer_size;{_RTSP_BUFSIZE}")
         os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "|".join(options)
-        capture = cv2.VideoCapture(url, getattr(cv2, "CAP_FFMPEG", 0))
+
+        backend = getattr(cv2, "CAP_FFMPEG", 0)
+        params: list[int] = []
         for name, value in (
             ("CAP_PROP_OPEN_TIMEOUT_MSEC", OPEN_TIMEOUT_MS),
             ("CAP_PROP_READ_TIMEOUT_MSEC", READ_TIMEOUT_MS),
-            ("CAP_PROP_BUFFERSIZE", 1),
         ):
+            prop = getattr(cv2, name, None)
+            if prop is not None:
+                params.extend([prop, value])
+
+        capture = cv2.VideoCapture()
+        try:
+            # Python OpenCV >= 4.5 accepts (filename, apiPreference, params).
+            capture.open(url, backend, params)
+        except (TypeError, AttributeError):
+            # Compatibility fallback for bindings that do not expose params.
+            # Modern builds must not reach this path: constructing with a URL
+            # first would reintroduce the built-in 30-second timeout.
+            self._release(capture)
+            capture = cv2.VideoCapture(url, backend)
+        except Exception:  # noqa: BLE001 - fail fast instead of falling back to 30 seconds.
+            self._release(capture)
+
+        # These are still useful for read buffering; unlike the open params,
+        # they are not relied upon to control connection timeout.
+        for name, value in (("CAP_PROP_BUFFERSIZE", 1),):
             prop = getattr(cv2, name, None)
             if prop is not None:
                 try:

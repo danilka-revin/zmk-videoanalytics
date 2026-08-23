@@ -199,7 +199,7 @@ docker compose --profile inference up -d --build
 
 `RTSP_CAM_01` в `.env` больше не является неиспользуемой переменной: если в базе ещё нет настроенных камер, API создаст из неё первую включённую камеру при запуске. Оставьте значение пустым, если добавляете камеры только через панель. После обновления worker сразу напишет в логи, видит ли он камеру, ожидает ли секрет или не получил ни одной включённой RTSP-камеры.
 
-Если поток открывается в VLC, но не в worker, измените в `.env` `RTSP_TRANSPORT` на `tcp` или `udp` и перезапустите inference-профиль. Настройки `RTSP_TRANSPORT`, `RTSP_BUFFER_SIZE`, `RTSP_STIMEOUT`, `RTSP_OPEN_TIMEOUT_MS`, `RTSP_READ_TIMEOUT_MS`, `OFFLINE_AFTER_FRAMES` и `RTSP_RECONNECT_SECONDS` передаются в контейнер worker при запуске Compose.
+Если поток открывается в VLC, но не в worker, измените в `.env` `RTSP_TRANSPORT` на `tcp` или `udp` и перезапустите inference-профиль. Настройки `RTSP_TRANSPORT`, `RTSP_BUFFER_SIZE`, `RTSP_STIMEOUT`, `RTSP_TIMEOUT_OPTION`, `RTSP_OPEN_TIMEOUT_MS`, `RTSP_READ_TIMEOUT_MS`, `OFFLINE_AFTER_FRAMES` и `RTSP_RECONNECT_SECONDS` передаются в контейнер worker при запуске Compose. Таймауты открытия/чтения передаются OpenCV **до** вызова `open()`, поэтому старое сообщение `Stream timeout triggered after 30000 ms` после обновления не должно повторяться: попытка оборвётся примерно через `RTSP_OPEN_TIMEOUT_MS`.
 
 ### Новый контур камер
 

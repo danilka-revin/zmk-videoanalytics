@@ -28,7 +28,13 @@ class _FakeCap:
     def __init__(self, *args, **kwargs):
         self._opened = type(self).default_opened
         self.options: list[tuple[object, object]] = []
+        self.open_args: tuple[object, object, object] | None = None
         self.released = False
+
+    def open(self, url, backend, params):
+        self.open_args = (url, backend, params)
+        self._opened = type(self).default_opened
+        return self._opened
 
     def isOpened(self):
         return self._opened
@@ -124,12 +130,13 @@ def test_auto_transport_starts_with_tcp_then_falls_back_to_udp(worker_mod):
 
 def test_worker_builds_valid_ffmpeg_options(worker_mod):
     runtime = worker_mod.Runtime()
-    runtime._open_capture("rtsp://x/stream", "tcp")
+    capture = runtime._open_capture("rtsp://x/stream", "tcp")
     options = str(worker_mod.os.environ.get("OPENCV_FFMPEG_CAPTURE_OPTIONS", ""))
 
     assert options.startswith("rtsp_transport;tcp"), options
-    assert "|stimeout;5000000" in options
-    assert ",stimeout" not in options and ",rtsp_transport" not in options
+    assert "|timeout;5000000" in options
+    assert ",timeout" not in options and ",rtsp_transport" not in options
+    assert capture.open_args == ("rtsp://x/stream", worker_mod.cv2.CAP_FFMPEG, [worker_mod.cv2.CAP_PROP_OPEN_TIMEOUT_MSEC, 8000, worker_mod.cv2.CAP_PROP_READ_TIMEOUT_MSEC, 8000])
 
 
 def test_failed_opens_eventually_mark_camera_offline(worker_mod):
@@ -242,6 +249,7 @@ def test_compose_forwards_all_camera_runtime_settings():
         "RTSP_TRANSPORT",
         "RTSP_BUFFER_SIZE",
         "RTSP_STIMEOUT",
+        "RTSP_TIMEOUT_OPTION",
         "RTSP_OPEN_TIMEOUT_MS",
         "RTSP_READ_TIMEOUT_MS",
         "OFFLINE_AFTER_FRAMES",
