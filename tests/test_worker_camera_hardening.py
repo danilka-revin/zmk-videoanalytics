@@ -154,6 +154,25 @@ def test_failed_opens_eventually_mark_camera_offline(worker_mod):
     assert statuses[-1] == "offline"
 
 
+def test_waits_for_h264_keyframe_before_reconnecting(worker_mod):
+    runtime = worker_mod.Runtime()
+    _FakeCap.results = [(False, None), (False, None), (False, None), (True, _FakeImage())]
+    calls = _record_internal(runtime)
+
+    for _ in range(3):
+        asyncio.run(runtime.frame(_camera()))
+
+    session = runtime.sessions["cam_01"]
+    assert session.capture is not None and session.capture.isOpened()
+    assert session.failures == 0
+    statuses = [payload["status"] for path, payload in calls if path.endswith("/telemetry")]
+    assert "offline" not in statuses
+    assert statuses[0] == "connecting"
+
+    asyncio.run(runtime.frame(_camera()))
+    assert runtime.sessions["cam_01"].received_first_frame is True
+
+
 def test_reconnect_backoff_does_not_block_the_worker_loop(worker_mod):
     runtime = worker_mod.Runtime()
     config = worker_mod.CameraConfig.from_api(_camera())
@@ -252,6 +271,7 @@ def test_compose_forwards_all_camera_runtime_settings():
         "RTSP_TIMEOUT_OPTION",
         "RTSP_OPEN_TIMEOUT_MS",
         "RTSP_READ_TIMEOUT_MS",
+        "RTSP_KEYFRAME_GRACE_SECONDS",
         "OFFLINE_AFTER_FRAMES",
         "RTSP_RECONNECT_SECONDS",
         "CAMERA_CONTROL_POLL_SECONDS",

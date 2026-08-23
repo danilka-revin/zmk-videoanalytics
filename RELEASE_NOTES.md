@@ -11,6 +11,7 @@
 - native OpenCV/FFmpeg чтение больше не отменяется из Python посередине кадра, что исключает crash worker с `exit code 139` при повреждённом потоке;
 - TCP-first / UDP fallback в `RTSP_TRANSPORT=auto`;
 - таймауты открытия и чтения RTSP (`RTSP_OPEN_TIMEOUT_MS`, `RTSP_READ_TIMEOUT_MS`) передаются OpenCV до `open()`, а не после него; это убирает встроенное ожидание около 30 секунд;
+- после RTSP-подключения worker ждёт H.264 keyframe (`RTSP_KEYFRAME_GRACE_SECONDS=15`) и не сбрасывает поток на первых повреждённых delta-кадрах;
 - используется актуальный FFmpeg socket option `timeout` в микросекундах (`RTSP_TIMEOUT_OPTION=timeout`), с опциональным legacy-режимом `stimeout`;
 - безопасная публикация превью без AI-модели;
 - реальный FPS по окну телеметрии, без стартовых всплесков;

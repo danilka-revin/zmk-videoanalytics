@@ -87,6 +87,10 @@ CONTROL_POLL_SECONDS = _bounded_float("CAMERA_CONTROL_POLL_SECONDS", 2.0, 0.2, 6
 TELEMETRY_INTERVAL_SECONDS = _bounded_float("CAMERA_TELEMETRY_SECONDS", 5.0, 1.0, 60.0)
 SNAPSHOT_INTERVAL_SECONDS = _bounded_float("CAMERA_SNAPSHOT_SECONDS", 3.0, 0.5, 60.0)
 HEARTBEAT_INTERVAL_SECONDS = _bounded_float("CAMERA_HEARTBEAT_SECONDS", 5.0, 1.0, 60.0)
+# RTSP servers often begin a newly attached client in the middle of a GOP.
+# Give H.264 decoding time to reach the next IDR/keyframe before reconnecting.
+KEYFRAME_GRACE_SECONDS = _bounded_float("RTSP_KEYFRAME_GRACE_SECONDS", 15.0, 1.0, 120.0)
+KEYFRAME_RETRY_SECONDS = 0.2
 EVENT_CLASSES = {
     "no_helmet",
     "no_vest",
@@ -184,6 +188,8 @@ class CameraSession:
     frames_in_window: int = 0
     last_snapshot_at: float = 0.0
     last_error: str = ""
+    opened_at: float = 0.0
+    received_first_frame: bool = False
     frame_task: asyncio.Task[None] | None = None
     restart_pending: bool = False
 
@@ -420,6 +426,8 @@ class Runtime:
                 session.next_attempt_at = 0
                 session.next_frame_at = 0
                 session.last_error = ""
+                session.opened_at = 0
+                session.received_first_frame = False
                 if self._frame_task_finished(session):
                     self._release_session(session)
                 else:
@@ -526,6 +534,8 @@ class Runtime:
         session.capture = capture
         session.failures = 0
         session.next_attempt_at = 0
+        session.opened_at = time.monotonic()
+        session.received_first_frame = False
         self._log(f"camera {session.config.camera_id} opened via {transport.upper()}", force=True)
         return True
 
@@ -541,12 +551,33 @@ class Runtime:
         self._log(f"camera {session.config.camera_id} open failed: {reason}")
 
     async def _failed_read(self, session: CameraSession, reason: str, latency_ms: int) -> None:
+        now = time.monotonic()
+        waiting_for_keyframe = (
+            not session.received_first_frame
+            and session.opened_at
+            and now - session.opened_at < KEYFRAME_GRACE_SECONDS
+        )
+        if waiting_for_keyframe:
+            # H.264 decoding errors immediately after RTSP open are expected
+            # when the server starts at a delta frame. Reopening here loses the
+            # upcoming IDR frame and creates a permanent black-preview loop.
+            session.next_frame_at = max(session.next_frame_at, now + KEYFRAME_RETRY_SECONDS)
+            await self._report(
+                session,
+                "connecting",
+                latency_ms,
+                "Ожидание первого H.264 keyframe",
+                force=session.status != "connecting",
+            )
+            self._log(f"camera {session.config.camera_id} waiting for first H.264 keyframe")
+            return
+
         session.failures += 1
         status = "offline" if session.failures >= OFFLINE_AFTER else "recovering"
         if session.failures >= OFFLINE_AFTER:
             self._release_session(session)
             session.transport_index = (session.transport_index + 1) % len(TRANSPORT_ORDER)
-            session.next_attempt_at = time.monotonic() + RECONNECT_MIN
+            session.next_attempt_at = now + RECONNECT_MIN
             session.next_frame_at = max(session.next_frame_at, session.next_attempt_at)
         await self._report(session, status, latency_ms, reason, force=True)
         self._log(f"camera {session.config.camera_id} frame failed: {reason}")
@@ -684,6 +715,7 @@ class Runtime:
 
         session.failures = 0
         session.next_attempt_at = 0
+        session.received_first_frame = True
         session.frames_in_window += 1
         await self._report(session, "online", latency, "", force=session.status != "online")
         await self._publish_snapshot(session, image)
