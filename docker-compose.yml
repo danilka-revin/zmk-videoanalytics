@@ -15,7 +15,9 @@ services:
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
       MESSENGER_PROVIDER: ${MESSENGER_PROVIDER:-none}
-      TRAINING_WORKER_URL: ${TRAINING_WORKER_URL:-}
+      # Training worker is part of the default stack and remains available in
+      # CPU mode when NVIDIA is absent; docker-compose.gpu.yml adds GPUs.
+      TRAINING_WORKER_URL: ${TRAINING_WORKER_URL:-http://training-worker:8010}
       ZMK_WORKER_TOKEN: ${ZMK_WORKER_TOKEN:-}
       ZMK_WORKER_TOKEN_FILE: ${ZMK_WORKER_TOKEN_FILE:-/models/.worker-token}
       UPDATE_SERVICE_URL: ${UPDATE_SERVICE_URL:-http://updater:8020}
@@ -99,6 +101,8 @@ services:
       RTSP_OPEN_TIMEOUT_MS: ${RTSP_OPEN_TIMEOUT_MS:-8000}
       RTSP_READ_TIMEOUT_MS: ${RTSP_READ_TIMEOUT_MS:-8000}
       RTSP_KEYFRAME_GRACE_SECONDS: ${RTSP_KEYFRAME_GRACE_SECONDS:-15}
+      # Keep only a small RTP jitter buffer for near-live MJPEG preview.
+      RTSP_MAX_DELAY_US: ${RTSP_MAX_DELAY_US:-100000}
       OFFLINE_AFTER_FRAMES: ${OFFLINE_AFTER_FRAMES:-3}
       RTSP_RECONNECT_SECONDS: ${RTSP_RECONNECT_SECONDS:-5}
       CAMERA_CONTROL_POLL_SECONDS: ${CAMERA_CONTROL_POLL_SECONDS:-2}
@@ -115,8 +119,8 @@ services:
     restart: unless-stopped
   training-worker:
     build: ./services/training_worker
-    profiles:
-    - training
+    # Always-on: reports CPU/GPU availability through /health and accepts jobs
+    # whenever an operator starts training.
     environment:
       ZMK_API_URL: http://api:8000
       ZMK_API_KEY: ${ZMK_API_KEY:-}
@@ -131,6 +135,15 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    healthcheck:
+      test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://localhost:8010/health')
+      interval: 15s
+      timeout: 5s
+      retries: 3
     restart: unless-stopped
   updater:
     build: ./services/updater

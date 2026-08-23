@@ -96,6 +96,8 @@ HEARTBEAT_INTERVAL_SECONDS = _bounded_float("CAMERA_HEARTBEAT_SECONDS", 5.0, 1.0
 # Give H.264 decoding time to reach the next IDR/keyframe before reconnecting.
 KEYFRAME_GRACE_SECONDS = _bounded_float("RTSP_KEYFRAME_GRACE_SECONDS", 15.0, 1.0, 120.0)
 KEYFRAME_RETRY_SECONDS = 0.2
+# Small RTP jitter buffer for a near-live stream without reordering seconds of video.
+RTSP_MAX_DELAY_US = _bounded_int("RTSP_MAX_DELAY_US", 100_000, 0, 2_000_000)
 FFMPEG_FRAME_MAX_BYTES = _bounded_int("FFMPEG_FRAME_MAX_BYTES", 5_000_000, 100_000, 20_000_000)
 # Browser MJPEG live preview rate. 0 disables the stream while keeping periodic
 # persistent snapshots; otherwise it is capped by the camera's configured FPS.
@@ -607,6 +609,7 @@ class Runtime:
             {
                 "ZMK_RTSP_URL": session.config.rtsp_url,
                 "ZMK_RTSP_TRANSPORT": session.transport,
+                "ZMK_RTSP_MAX_DELAY_US": str(RTSP_MAX_DELAY_US),
             }
         )
         # URL is intentionally read from an environment variable inside the
@@ -617,10 +620,11 @@ class Runtime:
             # Worker-owned asyncio timeout safely terminates this subprocess;
             # avoid version-specific FFmpeg timeout flags that make some
             # packaged builds exit immediately with status 255.
-            '-fflags +genpts+discardcorrupt -err_detect ignore_err -flags low_delay '
-            '-max_delay 500000 -analyzeduration 0 -probesize 32768 '
+            '-fflags +nobuffer+genpts+discardcorrupt -avioflags direct '
+            '-err_detect ignore_err -flags low_delay '
+            '-max_delay "${ZMK_RTSP_MAX_DELAY_US}" -analyzeduration 0 -probesize 32768 '
             '-i "$ZMK_RTSP_URL" -an -sn -dn -vsync 0 '
-            '-f image2pipe -vcodec mjpeg -q:v 5 pipe:1'
+            '-flush_packets 1 -f image2pipe -vcodec mjpeg -q:v 5 pipe:1'
         )
         process = await asyncio.create_subprocess_exec(
             "sh",

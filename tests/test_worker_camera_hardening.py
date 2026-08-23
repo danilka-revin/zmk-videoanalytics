@@ -302,6 +302,7 @@ def test_compose_forwards_all_camera_runtime_settings():
         "RTSP_OPEN_TIMEOUT_MS",
         "RTSP_READ_TIMEOUT_MS",
         "RTSP_KEYFRAME_GRACE_SECONDS",
+        "RTSP_MAX_DELAY_US",
         "OFFLINE_AFTER_FRAMES",
         "RTSP_RECONNECT_SECONDS",
         "CAMERA_CONTROL_POLL_SECONDS",

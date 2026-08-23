@@ -215,7 +215,7 @@ docker compose --profile inference up -d --build
 
 `inference-worker` запускает RTSP-контур **раньше и независимо от AI-модели**: отсутствие модели, ошибка CUDA или проблемный артефакт не должны останавливать превью и телеметрию камеры. По умолчанию используется persistent **FFmpeg decoder** (`CAMERA_DECODER=ffmpeg`): он отбрасывает повреждённые RTP пакеты, использует error concealment и отдаёт worker только декодированные JPEG-кадры — это ближе к устойчивому поведению VLC, чем прямой `cv2.VideoCapture`. Для каждой камеры worker ведёт отдельное состояние `connecting → online / recovering / offline`, ограничивает зависшие открытия и чтения таймаутами, пробует TCP и UDP, а также не блокирует остальные камеры во время переподключения одной из них. После открытия worker ждёт первый H.264 keyframe до `RTSP_KEYFRAME_GRACE_SECONDS` (по умолчанию 15 секунд), поэтому NVR не будет попадать в цикл «открыл поток → получил delta-кадр → сразу переподключился».
 
-Worker отправляет heartbeat в API. В разделе **«Диагностика»** теперь видны его состояние, возраст heartbeat, TCP-доступность RTSP, состояние кадра и безопасная причина последней ошибки без логина/пароля. Панель получает живой MJPEG-поток по `/api/cameras/{id}/mjpeg`; его частота задаётся `CAMERA_LIVE_FPS` и ограничивается `fps_limit` камеры, поэтому карточка показывает реальные кадры, а не снимок раз в несколько секунд. В карточке камеры есть кнопка **«Перезапустить»**: она сбрасывает старый кадр и заставляет worker заново открыть поток. Первые полезные строки после запуска:
+Worker отправляет heartbeat в API. В разделе **«Диагностика»** теперь видны его состояние, возраст heartbeat, TCP-доступность RTSP, состояние кадра и безопасная причина последней ошибки без логина/пароля. Панель получает живой MJPEG-поток по `/api/cameras/{id}/mjpeg`; его частота задаётся `CAMERA_LIVE_FPS` и ограничивается `fps_limit` камеры, поэтому карточка показывает реальные кадры, а не снимок раз в несколько секунд. FFmpeg запускается с low-latency флагами (`nobuffer`, `avioflags=direct`, `max_delay=100 мс`, immediate MJPEG flush), а Nginx не буферизует MJPEG-ответ. В карточке камеры есть кнопка **«Перезапустить»**: она сбрасывает старый кадр и заставляет worker заново открыть поток. Первые полезные строки после запуска:
 
 ```text
 inference: camera runtime started (...)
@@ -339,18 +339,17 @@ Web Admin ── Telegram/MAX Bot ── Mini App ── СКУД Webhook
 
 ## Реальное обучение на NVIDIA GPU
 
-Установите NVIDIA Driver и NVIDIA Container Toolkit, затем запустите:
+`training-worker` теперь запускается всегда вместе с базовым Compose и сразу доступен в панели обучения:
 
 ```bash
-# в .env: TRAINING_WORKER_URL=http://training-worker:8010
-# CPU fallback (запускается везде)
-docker compose --profile training up -d --build
+# CPU fallback — запускается везде
+docker compose up -d --build
 
 # NVIDIA Container Toolkit установлен
-docker compose -f docker-compose.yml -f docker-compose.gpu.yml --profile training up -d --build
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 ```
 
-Базовый Compose больше не требует NVIDIA runtime и не падает на компьютерах без GPU. Установщик сам подключает `docker-compose.gpu.yml`, только если Docker сообщает о runtime `nvidia`.
+Базовый Compose не требует NVIDIA runtime и не падает на компьютерах без GPU: worker остаётся доступен в CPU fallback. При наличии NVIDIA Container Toolkit лаунчер сам подключает `docker-compose.gpu.yml`, и тот же постоянный worker получает GPU. Панель честно показывает режим `GPU` или `CPU fallback`; реальная GPU-скорость требует физическую NVIDIA-карту, driver и Container Toolkit.
 
 При ручном запуске из панели worker захватывает кадры выбранной RTSP-камеры, создаёт псевдоразметку активной моделью (или YOLO11n), обучает YOLO11n, экспортирует ONNX в persistent `model-data` и регистрирует модель через API. Если получено меньше 10 размеченных кадров, задача завершается ошибкой — пустые метрики не генерируются.
 

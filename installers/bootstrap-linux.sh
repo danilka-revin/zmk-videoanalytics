@@ -105,7 +105,6 @@ if [[ "$needs_setup" == true ]]; then
   exec env \
     NONINTERACTIVE=1 \
     MESSENGER_PROVIDER=none \
-    ENABLE_TRAINING=false \
     ENABLE_INFERENCE=true \
     INFERENCE_DEVICE=cpu \
     RTSP_TRANSPORT=tcp \

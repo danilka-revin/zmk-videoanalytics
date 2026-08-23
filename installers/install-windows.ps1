@@ -111,11 +111,9 @@ switch ($messenger.ToLowerInvariant()) {
   default { throw "MESSENGER_PROVIDER must be telegram, max or none" }
 }
 docker compose --profile telegram --profile max stop telegram-bot max-bot 2>$null | Out-Null
-$training = if ($NonInteractive) { $env:ENABLE_TRAINING } else { Read-Host "Enable real YOLO auto-training on NVIDIA GPU? [y/N]" }
-if ($training -match '^(y|Y|true|1)$') {
-  Set-DotEnvValue "TRAINING_WORKER_URL" "http://training-worker:8010"
-  $ComposeProfile += @("--profile", "training")
-} else { Set-DotEnvValue "TRAINING_WORKER_URL" "" }
+# Training worker is always part of the stack. It reports GPU mode when NVIDIA
+# Container Toolkit is available and otherwise remains usable in CPU fallback.
+Set-DotEnvValue "TRAINING_WORKER_URL" "http://training-worker:8010"
 $inference = if ($NonInteractive) { $env:ENABLE_INFERENCE } else { Read-Host "Enable real RTSP YOLO inference worker? [y/N]" }
 if ($inference -match '^(y|Y|true|1)$') {
   $workerToken = if ($env:ZMK_WORKER_TOKEN) { $env:ZMK_WORKER_TOKEN } else { [guid]::NewGuid().ToString('N') }

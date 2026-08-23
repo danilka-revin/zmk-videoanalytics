@@ -1,17 +1,18 @@
 # Реальное автодообучение по кадрам камеры
 
-Training profile использует NVIDIA GPU и Ultralytics YOLO.
+Постоянный `training-worker` использует Ultralytics YOLO и запускается вместе с базовым стеком.
 
 ## Запуск
 
 ```bash
-# .env
-TRAINING_WORKER_URL=http://training-worker:8010
+# CPU fallback — доступен на любом хосте
+docker compose up -d --build
 
-docker compose --profile training up -d --build
+# NVIDIA Driver + NVIDIA Container Toolkit установлены
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 ```
 
-Требуются NVIDIA Driver и NVIDIA Container Toolkit.
+При наличии NVIDIA Container Toolkit worker автоматически получает GPU. Без него сервис остаётся запущенным и доступным в панели в CPU fallback; обучение будет медленнее, но не требует ручного включения Compose profile.
 
 ## Pipeline
 

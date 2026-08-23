@@ -66,14 +66,9 @@ run_config(){
     *) echo "MESSENGER_PROVIDER must be telegram, max or none"; return 1;;
   esac
 
-  if [[ -n "${NONINTERACTIVE:-}" ]]; then TRAINING="${ENABLE_TRAINING:-false}"; else read -r -p "Включить реальное YOLO auto-training на NVIDIA GPU? [y/N]: " TRAINING; fi
-  if [[ "$TRAINING" =~ ^([yY]|true|1)$ ]]; then
-    command -v nvidia-smi >/dev/null 2>&1 || echo "WARNING: nvidia-smi не найден; установите NVIDIA driver и Container Toolkit"
-    set_env TRAINING_WORKER_URL "http://training-worker:8010"
-    PROFILE+=(--profile training)
-  else
-    set_env TRAINING_WORKER_URL ""
-  fi
+  # Training worker is always started. It reports GPU availability itself and
+  # runs on CPU when NVIDIA Container Toolkit is not installed.
+  set_env TRAINING_WORKER_URL "http://training-worker:8010"
 
   if [[ -n "${NONINTERACTIVE:-}" ]]; then INFERENCE="${ENABLE_INFERENCE:-false}"; else read -r -p "Включить реальный RTSP YOLO inference worker? [y/N]: " INFERENCE; fi
   if [[ "$INFERENCE" =~ ^([yY]|true|1)$ ]]; then

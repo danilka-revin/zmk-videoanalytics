@@ -643,16 +643,14 @@ bash installers/uninstall-linux.sh --purge
 
 # Часть J. Реальное автодообучение
 
-Для обучения установите NVIDIA Driver и NVIDIA Container Toolkit. В `.env` задайте:
-
-```env
-TRAINING_WORKER_URL=http://training-worker:8010
-```
-
-Запустите:
+`training-worker` запускается всегда вместе с проектом. На CPU он доступен сразу; NVIDIA Driver и NVIDIA Container Toolkit нужны только для ускорения на GPU:
 
 ```bash
-docker compose --profile training up -d --build
+# CPU fallback
+docker compose up -d --build
+
+# GPU-режим
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 ```
 
 Добавьте RTSP-камеру, передайте ей статус `online` через ingestion telemetry, зарегистрируйте активную модель или используйте YOLO11n, затем откройте **Модели → Обучение**. Worker захватит кадры, выполнит псевдоразметку, создаст train/val, обучит YOLO11n и экспортирует ONNX. При недостатке кадров, объектов или CUDA задача завершится ошибкой с реальной причиной.
