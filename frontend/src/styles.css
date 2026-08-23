@@ -94,3 +94,4 @@ html[data-theme=dark] .trainer-head select,html[data-theme=dark] .error-report s
 .feed>b{z-index:3;right:10px;top:10px;bottom:auto;background:#0a100dcc;padding:3px 6px;border-radius:4px;color:#d7e2dc}
 .frame-age{z-index:3;left:10px;bottom:10px}
 @media(max-width:900px){.cards{grid-template-columns:1fr}.feed{min-height:160px}}
+.modal-actions .danger{background:#b8443d;color:#fff;border-color:#b8443d;display:flex;align-items:center;gap:5px}

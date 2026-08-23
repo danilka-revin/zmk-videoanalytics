@@ -281,7 +281,7 @@ def test_camera_errors_redact_rtsp_credentials(worker_mod):
 
 def test_ffmpeg_decoder_uses_corruption_tolerant_pipeline():
     source = WORKER.read_text(encoding="utf-8")
-    for option in ("CAMERA_DECODER", "discardcorrupt", "ignore_err", "max_delay", "image2pipe", "ZMK_RTSP_URL"):
+    for option in ("CAMERA_DECODER", "discardcorrupt", "ignore_err", "nobuffer", "avioflags", "max_delay", "image2pipe", "ZMK_RTSP_URL"):
         assert option in source
 
 
