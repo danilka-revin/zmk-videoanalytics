@@ -229,6 +229,69 @@ def _person_id(camera_id: str, box: ModelBox) -> str:
     return f"{camera_id}-person-{int(x // 100)}-{int(y // 100)}"
 
 
+def draw_detection_overlay(
+    image: Any,
+    boxes: list[ModelBox],
+    helmet_violations: list[tuple[ModelBox, ModelBox | None, bool]],
+) -> Any | None:
+    """Draw real detector boxes onto a live frame for the browser preview.
+
+    The stream is not decorated with invented boxes: every rectangle comes
+    directly from the current YOLO result.  A person linked to a real
+    no-helmet violation is red; a regular person is blue; a detected helmet is
+    green.  ASCII labels are intentional because OpenCV's built-in Hershey
+    font cannot render Cyrillic reliably in a minimal container.
+    """
+
+    recognised = {"person", "helmet", "no_helmet", "vest", *EVENT_CLASSES}
+    if not any(box.semantic in recognised for box in boxes):
+        return None
+    try:
+        canvas = image.copy()
+        height, width = canvas.shape[:2]
+        thickness = max(1, round(min(height, width) / 500))
+        scale = max(.35, min(.7, min(height, width) / 1000))
+        violating_people = {person.index for _, person, _ in helmet_violations if person is not None}
+        for box in boxes:
+            if box.semantic not in recognised:
+                continue
+            x1, y1, x2, y2 = box.bbox
+            left = max(0, min(width - 1, round(x1)))
+            top = max(0, min(height - 1, round(y1)))
+            right = max(0, min(width - 1, round(x2)))
+            bottom = max(0, min(height - 1, round(y2)))
+            if right <= left or bottom <= top:
+                continue
+            if box.semantic == "person":
+                violation = box.index in violating_people
+                colour = (50, 55, 235) if violation else (235, 170, 30)  # BGR: red / blue
+                title = "NO HELMET" if violation else "PERSON"
+            elif box.semantic == "helmet":
+                colour, title = (55, 205, 75), "HELMET"
+            elif box.semantic == "no_helmet":
+                colour, title = (50, 55, 235), "NO HELMET"
+            elif box.semantic == "vest":
+                colour, title = (200, 80, 170), "VEST"
+            else:
+                colour, title = (0, 165, 255), box.semantic.upper()
+            cv2.rectangle(canvas, (left, top), (right, bottom), colour, thickness)
+            cv2.putText(
+                canvas,
+                f"{title} {box.confidence:.0%}",
+                (left, max(14, top - 6)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                scale,
+                colour,
+                thickness,
+                cv2.LINE_AA,
+            )
+        return canvas
+    except Exception:  # noqa: BLE001 - drawing is optional and must never stop RTSP.
+        # Annotation must never make camera transport fail. Returning None
+        # preserves the original decoded frame as the preview fallback.
+        return None
+
+
 def redact_error(value: object, limit: int = 300) -> str:
     """Return an operator-safe error: never echo an RTSP credential."""
     text = _URL_SECRET.sub("<rtsp-url>", str(value or "")).replace("\n", " ").strip()
@@ -936,7 +999,7 @@ class Runtime:
         except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
             self._log(f"live preview upload failed for {session.config.camera_id}: {redact_error(exc)}")
 
-    async def _infer(self, session: CameraSession, image: Any) -> None:
+    async def _infer(self, session: CameraSession, image: Any) -> Any | None:
         if self.model is None or not self.model_name:
             return
         try:
@@ -1009,7 +1072,8 @@ class Runtime:
         for box in raw:
             if box.semantic in EVENT_CLASSES and box.semantic != "no_helmet":
                 append_event(box.semantic, box)
-        for evidence, person, inferred in ppe_no_helmet_violations(raw, declared):
+        helmet_violations = ppe_no_helmet_violations(raw, declared)
+        for evidence, person, inferred in helmet_violations:
             append_event("no_helmet", evidence, person, inferred=inferred)
 
         if detections:
@@ -1017,6 +1081,14 @@ class Runtime:
                 await self.post("/api/inference/detections", {"detections": detections})
             except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
                 self._log(f"detections rejected: {redact_error(exc)}")
+
+        # The browser receives this annotated JPEG, not a CSS imitation. It is
+        # created from exactly the same YOLO result used for event creation.
+        try:
+            return await asyncio.to_thread(draw_detection_overlay, image, raw, helmet_violations)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            self._log(f"overlay render failed; raw preview continues: {redact_error(exc)}")
+            return None
 
     async def frame(self, camera: dict[str, Any] | CameraConfig) -> None:
         """Read one frame. Scheduling is performed by run(), so tests and
@@ -1065,9 +1137,13 @@ class Runtime:
         session.received_first_frame = True
         session.frames_in_window += 1
         await self._report(session, "online", latency, "", force=session.status != "online")
-        await self._publish_live(session, image)
-        await self._publish_snapshot(session, image)
-        await self._infer(session, image)
+        annotated = await self._infer(session, image)
+        # When AI is active, stream the detector-rendered frame so the operator
+        # sees person/helmet/no-helmet boxes on the actual camera feed. If no
+        # model or overlay is available, preserve the original low-latency view.
+        preview = annotated if annotated is not None else image
+        await self._publish_live(session, preview)
+        await self._publish_snapshot(session, preview)
 
     async def run(self) -> None:
         print(

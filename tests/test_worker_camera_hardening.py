@@ -20,6 +20,9 @@ WORKER = Path(__file__).resolve().parents[1] / "services" / "inference_worker" /
 class _FakeImage:
     shape = (20, 20, 3)
 
+    def copy(self):
+        return self
+
 
 class _FakeCap:
     default_opened: ClassVar[bool] = True
@@ -71,6 +74,10 @@ def worker_mod(monkeypatch):
     cv2.VideoCapture = _FakeCap
     cv2.resize = lambda image, size: image
     cv2.imencode = lambda suffix, image, params: (True, b"\xff\xd8frame\xff\xd9")
+    cv2.FONT_HERSHEY_SIMPLEX = 0
+    cv2.LINE_AA = 16
+    cv2.rectangle = lambda image, *args: image
+    cv2.putText = lambda image, *args: image
     monkeypatch.setitem(sys.modules, "cv2", cv2)
 
     # Intentionally do not stub torch/ultralytics. Camera bootstrap cannot
@@ -173,6 +180,48 @@ def test_ppe_inference_posts_no_helmet_event_for_the_matching_person(worker_mod)
     assert detection["event_type"] == "no_helmet"
     assert detection["bbox"] == [0.0, 0.0, 100.0, 200.0]
     assert detection["person_id"].startswith("cam_01-person-")
+
+
+def test_ppe_boxes_are_drawn_into_the_published_camera_preview(worker_mod):
+    class Tensor:
+        def __init__(self, value): self.value = value
+        def cpu(self): return self
+        def tolist(self): return self.value
+
+    result = types.SimpleNamespace(
+        boxes=types.SimpleNamespace(
+            xyxy=Tensor([[1, 1, 18, 19], [6, 2, 13, 7]]),
+            cls=Tensor([0, 1]),
+            conf=Tensor([.96, .91]),
+        )
+    )
+
+    class PpeModel:
+        def __init__(self): self.names = {0: "Human", 1: "Helmet", 2: "No-Helmet", 3: "Vest"}
+        def predict(self, *_args, **_kwargs): return [result]
+
+    worker_mod.LIVE_PREVIEW_FPS = 20
+    rectangles, labels, live = [], [], []
+    worker_mod.cv2.rectangle = lambda image, *args: rectangles.append(args) or image
+    worker_mod.cv2.putText = lambda image, text, *args: labels.append(text) or image
+    _FakeCap.results = [(True, _FakeImage())]
+    runtime = worker_mod.Runtime()
+    runtime.model = PpeModel()
+    runtime.model_name = "ppe-person-helmet-yolo11"
+
+    async def post_internal(*_args, **_kwargs): return None
+    async def post_internal_jpeg(path, image): live.append((path, image))
+    async def post(*_args, **_kwargs): return None
+
+    runtime.post_internal = post_internal
+    runtime.post_internal_jpeg = post_internal_jpeg
+    runtime.post = post
+    asyncio.run(runtime.frame(_camera()))
+
+    assert live and live[0][0].endswith("/live-frame")
+    assert len(rectangles) >= 2
+    assert any(text.startswith("PERSON") for text in labels)
+    assert any(text.startswith("HELMET") for text in labels)
 
 
 def test_ppe_preset_refuses_artifact_without_person_and_helmet_labels(worker_mod, tmp_path, monkeypatch):
