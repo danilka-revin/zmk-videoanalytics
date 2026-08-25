@@ -1622,6 +1622,21 @@ async def upload_model_file(
     return {"name":name,"status":"ready","registered":True,"uploaded":True,"artifact_uri":f"file://{target}","checksum":checksum,"size_bytes":total,"source":source}
 
 
+def _preset_artifact_extension(preset: dict[str,Any]) -> str:
+    """Keep custom preset artifacts compatible with their declared format."""
+    model_format=str(preset.get("format") or "")
+    allowed=MODEL_UPLOAD_EXTENSIONS.get(model_format,set())
+    if not allowed:
+        raise HTTPException(422,f"Пресет {preset.get('id','')} имеет неподдерживаемый формат")
+    extension=Path(urlparse(str(preset.get("url") or "")).path).suffix.lower()
+    if extension in allowed:
+        return extension
+    # Built-in models are PyTorch; custom preset URLs may omit a suffix, so
+    # choose the conventional extension for their declared runtime format.
+    preferred={"ONNX":".onnx","ONNX FP16":".onnx","TensorRT":".engine","TensorRT FP16":".engine","PyTorch":".pt"}
+    return preferred.get(model_format,min(allowed))
+
+
 def _preset_view(preset:dict) -> dict:
     name=preset["name"]
     existing=rows("SELECT name,status,precision,recall,source FROM model_registry WHERE name=?",(name,))
@@ -1644,7 +1659,7 @@ def download_model_preset(preset_id:str):
     try: minimum_bytes=max(1,int(preset.get("min_bytes",1)))
     except (TypeError,ValueError): minimum_bytes=1
     MODEL_DIR.mkdir(parents=True,exist_ok=True)
-    ext=".pt"
+    ext=_preset_artifact_extension(preset)
     dest=MODEL_DIR/f"{name}{ext}"
     tmp=dest.with_suffix(ext+".tmp")
     try:
@@ -1793,6 +1808,35 @@ def deactivate_trial_model(name:str):
         return {"active_model":restored,"restored_model":restored or None,"stopped":True,"idempotent":False}
     finally:
         con.close()
+
+
+@app.post("/api/models/{name}/deactivate-test")
+def deactivate_test_model(name:str):
+    """Stop an explicit camera test while retaining the model in the registry."""
+    con=db()
+    try:
+        row=con.execute("SELECT source FROM model_registry WHERE name=?",(name,)).fetchone()
+        if not row: raise HTTPException(404,"Модель не найдена")
+        active=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()[0]
+        testing=con.execute("SELECT value FROM settings WHERE key='model_test_mode'").fetchone()
+        if active != name or not testing or testing[0]!="true":
+            return {"active_model":active or None,"stopped":False,"idempotent":True}
+        if _is_trial_preset_source(row[0]):
+            # Preserve the PPE-specific restore behaviour for its previous
+            # validated model rather than unexpectedly leaving it disabled.
+            con.close()
+            con = None
+            return deactivate_trial_model(name)
+        con.execute("UPDATE settings SET value='' WHERE key='active_model'")
+        con.execute("UPDATE settings SET value='true' WHERE key='active_model_disabled'")
+        con.execute("UPDATE settings SET value='false' WHERE key='model_test_mode'")
+        con.execute("UPDATE settings SET value='' WHERE key='ppe_trial_previous_model'")
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","model_manager",f"Camera test stopped: {name}"))
+        con.commit()
+        return {"active_model":None,"stopped":True,"idempotent":False}
+    finally:
+        if con is not None:
+            con.close()
 
 @app.delete("/api/models/{name}")
 def delete_model(name:str, deactivate:bool=False):
@@ -2126,6 +2170,11 @@ async def start_training(payload:TrainingIn):
         if cam[0] != "online": con.close(); raise HTTPException(409,"Камера офлайн: кадры недоступны")
         rtsp=cam[1]
     active=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()[0]
+    test_mode_row=con.execute("SELECT value FROM settings WHERE key='model_test_mode'").fetchone()
+    if test_mode_row and test_mode_row[0]=='true':
+        # A visual camera test is intentionally not promoted into the training
+        # baseline; fine-tuning falls back to the validated/default YOLO base.
+        active=""
     suffix=payload.dataset_name or payload.camera_id
     target=payload.target_name or f"siz-auto-{suffix}-{datetime.now(TZ).strftime('%m%d-%H%M%S')}"
     if con.execute("SELECT 1 FROM model_registry WHERE name=?",(target,)).fetchone() or con.execute("SELECT 1 FROM training_jobs WHERE target_name=? AND status IN ('queued','running')",(target,)).fetchone():

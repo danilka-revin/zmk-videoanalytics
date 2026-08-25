@@ -16,7 +16,7 @@ class _Handler(BaseHTTPRequestHandler):
     payload = b"pretended-model-bytes"
 
     def do_GET(self):
-        if self.path.endswith("yolo11n.pt"):
+        if self.path.endswith(("yolo11n.pt", "custom.onnx", "custom.engine")):
             self.send_response(200)
             self.send_header("Content-Length", str(len(self.payload)))
             self.end_headers()
@@ -87,6 +87,19 @@ def test_download_and_register_preset(model_dir, preset_url, monkeypatch):
         # idempotent: second attempt reports already
         r2 = c.post("/api/models/presets/yolo11n/download")
         assert r2.json()["already"] is True
+
+
+def test_custom_onnx_preset_keeps_onnx_extension(model_dir, preset_url, monkeypatch):
+    monkeypatch.setattr(main, "MODEL_PRESETS", [{
+        "id": "custom-onnx", "name": "custom-onnx", "format": "ONNX",
+        "url": f"{preset_url}/custom.onnx", "size_bytes": 1000, "classes": 2,
+        "category": "custom", "description": "local test preset",
+    }])
+    with TestClient(main.app) as c:
+        result = c.post("/api/models/presets/custom-onnx/download")
+        assert result.status_code == 200, result.text
+        assert (model_dir / "custom-onnx.onnx").is_file()
+        assert result.json()["artifact_uri"].endswith("custom-onnx.onnx")
 
 
 def test_ppe_preset_requires_explicit_trial_activation(model_dir, preset_url, monkeypatch):

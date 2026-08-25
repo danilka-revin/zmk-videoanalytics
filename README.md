@@ -340,7 +340,8 @@ Web Admin ── Telegram/MAX Bot ── Mini App ── СКУД Webhook
 | `GET` | `/api/models/presets` | Каталог готовых моделей |
 | `POST` | `/api/models/presets/{id}/download` | Скачать и зарегистрировать готовую модель |
 | `POST` | `/api/models/{name}/activate` | Атомарный production hot-swap |
-| `POST` | `/api/models/{name}/activate-test` | Явный тест модели на live-камерах без обхода quality gate |
+| `POST` | `/api/models/{name}/activate-test` | Явный тест модели: реальные рамки на live-камерах без production-событий и без обхода quality gate |
+| `POST` | `/api/models/{name}/deactivate-test` | Остановить тест, сохранив модель в реестре |
 | `GET/POST` | `/api/training/jobs` | Задачи автодообучения (source: `camera`/`dataset`) |
 | `GET/POST/DELETE` | `/api/datasets` | Загрузка/список/удаление фото-, видео- или YOLO-датасетов |
 | `GET/PUT` | `/api/admin/config` | Конфигурация платформы |
