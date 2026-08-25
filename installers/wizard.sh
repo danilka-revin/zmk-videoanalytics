@@ -26,10 +26,10 @@ run_config(){
     MESSENGER="${MESSENGER_PROVIDER:-none}"
   else
     echo ""
-    echo "Выберите мессенджер для уведомлений:"
+    echo "Выберите провайдера для первичной настройки (после запуска оба бота управляются в Admin → Боты):"
     echo "  1 — Telegram"
     echo "  2 — MAX"
-    echo "  0 — без бота"
+    echo "  0 — настрою ботов позже в Admin панели"
     read -r -p "Ваш выбор [0/1/2]: " CHOICE
     case "$CHOICE" in
       1) MESSENGER=telegram;;
@@ -48,8 +48,7 @@ run_config(){
       if ! [[ "$ADMIN" =~ ^[0-9]+(,[0-9]+)*$ ]]; then echo "Ошибка: Telegram admin ID должен состоять из цифр через запятую"; return 1; fi
       if [[ -n "$WEBAPP" && "$WEBAPP" != https://* ]]; then echo "Ошибка: Mini App URL должен быть https"; return 1; fi
       set_env TELEGRAM_BOT_TOKEN "$TOKEN"; set_env TELEGRAM_ADMIN_IDS "$ADMIN"; set_env TELEGRAM_WEBAPP_URL "$WEBAPP"
-      set_env MAX_BOT_TOKEN ""; set_env MESSENGER_PROVIDER "telegram"
-      PROFILE=(--profile telegram)
+      set_env MESSENGER_PROVIDER "telegram"
       ;;
     max)
       if [[ -n "${NONINTERACTIVE:-}" ]]; then TOKEN="${MAX_BOT_TOKEN:-}"; ADMIN="${MAX_ADMIN_IDS:-}"
@@ -57,11 +56,12 @@ run_config(){
       if ! [[ "$TOKEN" =~ ^[A-Za-z0-9._:-]{20,500}$ ]]; then echo "Ошибка: неверный формат MAX token"; return 1; fi
       if ! [[ "$ADMIN" =~ ^[0-9]+(,[0-9]+)*$ ]]; then echo "Ошибка: MAX admin ID должен состоять из цифр через запятую"; return 1; fi
       set_env MAX_BOT_TOKEN "$TOKEN"; set_env MAX_ADMIN_IDS "$ADMIN"
-      set_env TELEGRAM_BOT_TOKEN ""; set_env MESSENGER_PROVIDER "max"
-      PROFILE=(--profile max)
+      set_env MESSENGER_PROVIDER "max"
       ;;
     none)
-      set_env TELEGRAM_BOT_TOKEN ""; set_env MAX_BOT_TOKEN ""; set_env MESSENGER_PROVIDER "none"
+      # Do not erase existing provider secrets: after the stack is running,
+      # enablement and all operational bot settings live in Admin → Боты.
+      set_env MESSENGER_PROVIDER "none"
       ;;
     *) echo "MESSENGER_PROVIDER must be telegram, max or none"; return 1;;
   esac

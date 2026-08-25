@@ -95,8 +95,7 @@ switch ($messenger.ToLowerInvariant()) {
     $url = if ($NonInteractive) { $env:TELEGRAM_WEBAPP_URL } else { Read-Host "Public HTTPS Mini App URL (Enter for bot-only)" }
     if ($url -and $url -notmatch '^https://') { throw "Telegram Mini App URL must use HTTPS" }
     Set-DotEnvValue "TELEGRAM_BOT_TOKEN" $token; Set-DotEnvValue "TELEGRAM_ADMIN_IDS" $admin; Set-DotEnvValue "TELEGRAM_WEBAPP_URL" $url
-    Set-DotEnvValue "MAX_BOT_TOKEN" ""; Set-DotEnvValue "MESSENGER_PROVIDER" "telegram"
-    $ComposeProfile = @("--profile", "telegram")
+    Set-DotEnvValue "MESSENGER_PROVIDER" "telegram"
   }
   "max" {
     $token = if ($NonInteractive) { $env:MAX_BOT_TOKEN } else { Read-Host "MAX bot token from @MasterBot" }
@@ -104,13 +103,11 @@ switch ($messenger.ToLowerInvariant()) {
     $admin = if ($NonInteractive) { $env:MAX_ADMIN_IDS } else { Read-Host "Your MAX numeric ID (admin)" }
     if ($admin -notmatch '^\d+(,\d+)*$') { throw "MAX admin ID must contain only numeric IDs separated by commas" }
     Set-DotEnvValue "MAX_BOT_TOKEN" $token; Set-DotEnvValue "MAX_ADMIN_IDS" $admin
-    Set-DotEnvValue "TELEGRAM_BOT_TOKEN" ""; Set-DotEnvValue "MESSENGER_PROVIDER" "max"
-    $ComposeProfile = @("--profile", "max")
+    Set-DotEnvValue "MESSENGER_PROVIDER" "max"
   }
-  "none" { Set-DotEnvValue "TELEGRAM_BOT_TOKEN" ""; Set-DotEnvValue "MAX_BOT_TOKEN" ""; Set-DotEnvValue "MESSENGER_PROVIDER" "none" }
+  "none" { Set-DotEnvValue "MESSENGER_PROVIDER" "none" }
   default { throw "MESSENGER_PROVIDER must be telegram, max or none" }
 }
-docker compose --profile telegram --profile max stop telegram-bot max-bot 2>$null | Out-Null
 # Training worker is always part of the stack. It reports GPU mode when NVIDIA
 # Container Toolkit is available and otherwise remains usable in CPU fallback.
 Set-DotEnvValue "TRAINING_WORKER_URL" "http://training-worker:8010"

@@ -19,8 +19,10 @@ def test_linux_installers_pass_shell_parser_and_dry_check():
     # The config wizard lives in its own shared file sourced by both the
     # installer and start.sh, so the messenger/token/profile logic is there.
     wizard = (ROOT/'installers/wizard.sh').read_text()
-    for needle in ['MESSENGER_PROVIDER', 'MAX_BOT_TOKEN', '--profile max', '--profile telegram', 'run_config']:
+    for needle in ['MESSENGER_PROVIDER', 'MAX_BOT_TOKEN', 'Admin → Боты', 'run_config']:
         assert needle in wizard
+    assert 'set_env MAX_BOT_TOKEN ""' not in wizard
+    assert 'set_env TELEGRAM_BOT_TOKEN ""' not in wizard
     # start.sh must source the wizard and provide --setup / first-run path.
     start = (ROOT/'start.sh').read_text()
     assert 'installers/wizard.sh' in start and 'run_config' in start and '--setup' in start
@@ -72,9 +74,14 @@ def test_compose_and_environment_are_consistent():
     assert 'healthcheck' in compose['services']['api']
     assert compose['services']['api']['environment']['VIDEOANALYTICS_DB'] == '/app/data/videoanalytics.db'
     assert compose['services']['api']['ports'] == ['127.0.0.1:8000:8000']
-    assert compose['services']['telegram-bot']['profiles'] == ['telegram']
-    assert compose['services']['max-bot']['profiles'] == ['max']
+    # Both messenger workers stay available and idle safely until the Admin → Боты
+    # control plane enables a provider; this makes UI toggles real without Docker CLI use.
+    assert 'profiles' not in compose['services']['telegram-bot']
+    assert 'profiles' not in compose['services']['max-bot']
+    assert compose['services']['telegram-bot']['restart'] == 'unless-stopped'
+    assert compose['services']['max-bot']['restart'] == 'unless-stopped'
     assert compose['services']['max-bot']['build'] == './services/max_bot'
+    assert compose['services']['api']['environment']['MAX_BOT_TOKEN'] == '${MAX_BOT_TOKEN:-}'
     assert 'profiles' not in compose['services']['training-worker']
     assert compose['services']['training-worker']['build'] == './services/training_worker'
     assert compose['services']['api']['environment']['TRAINING_WORKER_URL'] == '${TRAINING_WORKER_URL:-http://training-worker:8010}'

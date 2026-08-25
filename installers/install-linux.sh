@@ -91,7 +91,6 @@ else
   echo "NVIDIA Container Runtime не найден: workers запустятся в CPU fallback без ошибки"
 fi
 
-"${DC[@]}" --profile telegram --profile max stop telegram-bot max-bot >/dev/null 2>&1 || true
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml or .env validation failed"
 if ! "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose startup failed"; fi
 if ! wait_http http://localhost:8000/api/health 120; then "${DC[@]}" logs --tail=100 api; fail "API health check failed"; fi

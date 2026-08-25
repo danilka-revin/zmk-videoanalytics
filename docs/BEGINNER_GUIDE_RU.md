@@ -313,10 +313,10 @@ TELEGRAM_OPERATOR_IDS=111111111,222222222
 
 ## 17. Запуск Telegram-бота
 
-Windows или Linux:
+Windows или Linux: запустите обычный стек, затем включите Telegram в **Админ → Боты**.
 
 ```bash
-docker compose --profile telegram up -d --build
+./start.sh
 ```
 
 Проверить лог:
@@ -364,10 +364,10 @@ MAX_OPERATOR_IDS=
 MAX_VIEWER_IDS=
 ```
 
-5. Запустите:
+5. Запустите обычный стек, затем включите MAX в **Админ → Боты**:
 
 ```bash
-docker compose --profile max up -d --build
+./start.sh
 ```
 
 Бот MAX поддерживает состояние системы, камеры, события, логи, CSV-отчёты, модели, hot-swap, thresholds, обучение, отмену обучения и тестовые тревоги.
@@ -380,7 +380,7 @@ docker compose --profile max up -d --build
 0 — без бота
 ```
 
-Одновременно запускается только выбранный bot-сервис. Для автоматической установки без вопросов используйте `MESSENGER_PROVIDER=telegram`, `MESSENGER_PROVIDER=max` или `MESSENGER_PROVIDER=none`.
+Оба bot-сервиса запускаются в безопасном режиме ожидания. В Admin → Боты включаются провайдеры, задаются роли, получатели, политика push и тест доставки. `MESSENGER_PROVIDER` остаётся только подсказкой для первичной настройки.
 
 Официальная документация MAX Bot API: https://dev.max.ru/docs-api/
 
@@ -677,17 +677,13 @@ PostgreSQL, Redis и MinIO в production-профиле являются под�
 docker compose up -d --build
 ```
 
-Запуск с Telegram:
+Управление Telegram и MAX:
 
-```bash
-docker compose --profile telegram up -d --build
+```text
+Админ → Боты
 ```
 
-Запуск с MAX:
-
-```bash
-docker compose --profile max up -d --build
-```
+Обычный запуск стартует оба безопасных worker-сервиса; провайдеры включаются в панели.
 
 Проверка:
 

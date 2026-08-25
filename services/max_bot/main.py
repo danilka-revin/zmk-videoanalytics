@@ -5,6 +5,7 @@ import asyncio
 import logging
 import os
 import tempfile
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -18,26 +19,55 @@ log = logging.getLogger("zmk.max")
 TOKEN = os.getenv("MAX_BOT_TOKEN", "")
 API_URL = os.getenv("ZMK_API_URL", "http://api:8000").rstrip("/")
 API_KEY = os.getenv("ZMK_API_KEY", "")
-ADMINS = {int(x) for x in os.getenv("MAX_ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-OPERATORS = {int(x) for x in os.getenv("MAX_OPERATOR_IDS", "").split(",") if x.strip().isdigit()}
-VIEWERS = {int(x) for x in os.getenv("MAX_VIEWER_IDS", "").split(",") if x.strip().isdigit()}
+def _ids(value: str) -> set[int]:
+    result=set()
+    for token in value.replace(";", ",").replace("\n", ",").split(","):
+        token=token.strip()
+        if token and token.lstrip("-").isdigit(): result.add(int(token))
+    return result
+
+ADMINS = _ids(os.getenv("MAX_ADMIN_IDS", ""))
+OPERATORS = _ids(os.getenv("MAX_OPERATOR_IDS", ""))
+VIEWERS = _ids(os.getenv("MAX_VIEWER_IDS", ""))
+
+@dataclass
+class RuntimeConfig:
+    enabled: bool = False
+    alerts_enabled: bool = False
+    alert_min_severity: str = "high"
+    admins: set[int] = field(default_factory=lambda: set(ADMINS))
+    operators: set[int] = field(default_factory=lambda: set(OPERATORS))
+    viewers: set[int] = field(default_factory=lambda: set(VIEWERS))
+    alert_recipients: set[int] = field(default_factory=set)
+
+RUNTIME = RuntimeConfig()
 ROLE_LEVEL = {"denied": 0, "viewer": 1, "operator": 2, "admin": 3}
+SEVERITY_LEVEL = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 bot: Bot | None = None
 dp = Dispatcher()
 
 
 def role_for(user_id: int) -> str:
-    if user_id in ADMINS:
+    if user_id in RUNTIME.admins:
         return "admin"
-    if user_id in OPERATORS:
+    if user_id in RUNTIME.operators:
         return "operator"
-    if user_id in VIEWERS:
+    if user_id in RUNTIME.viewers:
         return "viewer"
     return "denied"
 
 
 def allowed(user_id: int, minimum: str = "viewer") -> bool:
     return ROLE_LEVEL[role_for(user_id)] >= ROLE_LEVEL[minimum]
+
+
+def alert_recipients() -> set[int]:
+    return set(RUNTIME.alert_recipients) or (set(RUNTIME.admins) | set(RUNTIME.operators))
+
+
+def should_alert(event: dict[str, Any]) -> bool:
+    threshold=SEVERITY_LEVEL.get(RUNTIME.alert_min_severity, SEVERITY_LEVEL["high"])
+    return RUNTIME.alerts_enabled and SEVERITY_LEVEL.get(str(event.get("severity", "")), 0) >= threshold
 
 
 def user_id(event: MessageCreated) -> int:
@@ -49,6 +79,8 @@ def args(event: MessageCreated) -> list[str]:
 
 
 async def guard(event: MessageCreated, minimum: str = "viewer") -> bool:
+    if not RUNTIME.enabled:
+        return False
     uid = user_id(event)
     if allowed(uid, minimum):
         return True
@@ -241,6 +273,53 @@ async def alert_test(event: MessageCreated):
     await event.message.answer("✅ Канал оповещений работает. Событие или ошибка в системе не создавались.")
 
 
+async def _complete_command(command_id: int, status: str, error: str = "") -> None:
+    await api("POST",f"/api/bots/max/commands/{command_id}/complete",json={"status":status,"error":error[:300]})
+
+async def _send_test_alert(text: str) -> tuple[bool, str]:
+    if bot is None: return False, "MAX bot не инициализирован"
+    recipients=alert_recipients()
+    if not recipients: return False, "Не настроены получатели теста"
+    failures=[]
+    for recipient in recipients:
+        try: await bot.send_message(user_id=recipient, text=f"✅ ZMK Vision\n{text}")
+        except Exception as exc:  # noqa: BLE001 - messenger SDK exposes heterogeneous transport errors
+            failures.append(f"{recipient}: {type(exc).__name__}")
+    return (not failures, "; ".join(failures))
+
+async def runtime_worker():
+    while True:
+        try:
+            config=await api("GET","/api/bots/max/runtime")
+            RUNTIME.enabled=bool(config.get("enabled"))
+            RUNTIME.alerts_enabled=bool(config.get("alerts_enabled"))
+            RUNTIME.alert_min_severity=str(config.get("alert_min_severity") or "high")
+            RUNTIME.admins={int(x) for x in config.get("admin_ids",[]) }
+            RUNTIME.operators={int(x) for x in config.get("operator_ids",[]) }
+            RUNTIME.viewers={int(x) for x in config.get("viewer_ids",[]) }
+            RUNTIME.alert_recipients={int(x) for x in config.get("alert_recipients",[]) }
+            status="active" if RUNTIME.enabled else "disabled"
+            detail="Управляется из Admin панели" if RUNTIME.enabled else "Отключён оператором в Admin панели"
+            await api("POST","/api/bots/max/heartbeat",json={"status":status,"detail":detail,"enabled":RUNTIME.enabled})
+            if RUNTIME.enabled:
+                commands=await api("GET","/api/bots/max/commands")
+                for command in commands.get("commands",[]):
+                    if command.get("action")!="test_alert":
+                        await _complete_command(int(command["id"]),"failed","Неизвестная команда")
+                        continue
+                    try:
+                        ok,error=await _send_test_alert(str(command.get("payload",{}).get("text") or "Тестовое сообщение"))
+                        await _complete_command(int(command["id"]),"completed" if ok else "failed",error)
+                    except Exception as exc:
+                        log.exception("MAX test alert failed")
+                        await _complete_command(int(command["id"]),"failed",type(exc).__name__)
+        except Exception:
+            log.exception("MAX runtime configuration refresh failed")
+            try: await api("POST","/api/bots/max/heartbeat",json={"status":"api_unavailable","detail":"Не удалось получить настройки Admin панели","enabled":RUNTIME.enabled})
+            except Exception:
+                log.debug("Could not report MAX API-unavailable heartbeat",exc_info=True)
+        await asyncio.sleep(4)
+
 async def alert_worker():
     if bot is None:
         raise RuntimeError("MAX bot is not initialized")
@@ -250,10 +329,10 @@ async def alert_worker():
             events_data = await api("GET", "/api/events?limit=50")
             if last_id == 0:
                 last_id = max((x["id"] for x in events_data), default=0)
-            fresh = [x for x in events_data if x["id"] > last_id and x["severity"] in {"critical", "high"}]
+            fresh = [x for x in events_data if x["id"] > last_id and RUNTIME.enabled and should_alert(x)]
             for item in reversed(fresh):
                 text = "🚨 Новое событие ZMK Vision\n" + event_text(item) + f"\nID: {item['id']}"
-                for recipient in ADMINS | OPERATORS:
+                for recipient in alert_recipients():
                     try:
                         await bot.send_message(user_id=recipient, text=text)
                     except Exception:
@@ -263,21 +342,30 @@ async def alert_worker():
             log.exception("MAX alert worker iteration failed")
         await asyncio.sleep(5)
 
+async def wait_for_token():
+    while True:
+        try: await api("POST","/api/bots/max/heartbeat",json={"status":"waiting_token","detail":"MAX_BOT_TOKEN не задан на сервере","enabled":False})
+        except Exception:
+            log.debug("Could not report MAX waiting-token heartbeat",exc_info=True)
+        await asyncio.sleep(15)
 
 async def main():
     global bot
     if not TOKEN:
-        raise RuntimeError("MAX_BOT_TOKEN is not configured")
+        log.warning("MAX_BOT_TOKEN is not configured; service stays ready for Admin status only")
+        await wait_for_token()
+        return
     bot = Bot(token=TOKEN)
     if not (ADMINS or OPERATORS or VIEWERS):
-        log.warning("MAX whitelist is empty; all users will be denied")
+        log.warning("MAX whitelist is empty; configure roles in Admin → Боты")
     await bot.delete_webhook()
+    runtime = asyncio.create_task(runtime_worker())
     alerts = asyncio.create_task(alert_worker())
     try:
         await dp.start_polling(bot)
     finally:
-        alerts.cancel()
-        await asyncio.gather(alerts, return_exceptions=True)
+        runtime.cancel(); alerts.cancel()
+        await asyncio.gather(runtime, alerts, return_exceptions=True)
 
 
 if __name__ == "__main__":

@@ -48,3 +48,59 @@ def test_training_rejects_offline_camera_and_completes_online_job():
         assert (job['batch'],job['imgsz'],job['patience'],job['confidence'],job['val_split'],job['capture_fps']) == (4,512,5,.4,.25,1)
         models = c.get('/api/models').json()
         assert any(x['name'] == target_name and x['status'] == 'ready' for x in models)
+
+
+def test_admin_bot_workspace_controls_runtime_roles_alerts_and_test_queue(monkeypatch):
+    monkeypatch.setenv('TELEGRAM_BOT_TOKEN', 'telegram-test-token')
+    monkeypatch.delenv('MAX_BOT_TOKEN', raising=False)
+    with TestClient(app) as c:
+        initial = c.get('/api/admin/bots')
+        assert initial.status_code == 200
+        telegram = next(item for item in initial.json()['providers'] if item['provider'] == 'telegram')
+        assert telegram['token_configured'] is True
+
+        saved = c.put('/api/admin/bots/telegram', json={
+            'enabled': True,
+            'alerts_enabled': True,
+            'alert_min_severity': 'high',
+            'admin_ids': '100, 200',
+            'operator_ids': '300',
+            'viewer_ids': '400',
+            'alert_recipients': '-100555, 100',
+            'webapp_url': 'https://vision.example.test/telegram',
+        })
+        assert saved.status_code == 200, saved.text
+        body = saved.json()
+        assert body['enabled'] is True
+        assert body['admin_ids'] == '100,200'
+        assert body['alert_recipients'] == '-100555,100'
+        assert body['webapp_url'] == 'https://vision.example.test/telegram'
+
+        runtime = c.get('/api/bots/telegram/runtime').json()
+        assert runtime['enabled'] is True
+        assert runtime['admin_ids'] == [100, 200]
+        assert runtime['alert_recipients'] == [-100555, 100]
+
+        heartbeat = c.post('/api/bots/telegram/heartbeat', json={'status': 'active', 'detail': 'polling', 'enabled': True})
+        assert heartbeat.status_code == 200
+        queued = c.post('/api/admin/bots/telegram/test-alert')
+        assert queued.status_code == 202
+        command_id = queued.json()['id']
+        commands = c.get('/api/bots/telegram/commands').json()['commands']
+        assert any(item['id'] == command_id and item['action'] == 'test_alert' for item in commands)
+        assert c.post(f'/api/bots/telegram/commands/{command_id}/complete', json={'status': 'completed'}).status_code == 200
+        listed = c.get('/api/admin/bots').json()
+        telegram = next(item for item in listed['providers'] if item['provider'] == 'telegram')
+        assert telegram['runtime']['status'] == 'active'
+        assert telegram['last_test']['status'] == 'completed'
+
+        bad_ids = c.put('/api/admin/bots/telegram', json={
+            'enabled': True, 'alerts_enabled': False, 'alert_min_severity': 'high',
+            'admin_ids': 'not-an-id', 'operator_ids': '', 'viewer_ids': '', 'alert_recipients': '',
+        })
+        assert bad_ids.status_code == 422
+        missing_token = c.put('/api/admin/bots/max', json={
+            'enabled': True, 'alerts_enabled': False, 'alert_min_severity': 'high',
+            'admin_ids': '', 'operator_ids': '', 'viewer_ids': '', 'alert_recipients': '',
+        })
+        assert missing_token.status_code == 422

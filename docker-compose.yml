@@ -30,6 +30,11 @@ services:
       TELEGRAM_ADMIN_IDS: ${TELEGRAM_ADMIN_IDS:-}
       TELEGRAM_OPERATOR_IDS: ${TELEGRAM_OPERATOR_IDS:-}
       TELEGRAM_VIEWER_IDS: ${TELEGRAM_VIEWER_IDS:-}
+      TELEGRAM_WEBAPP_URL: ${TELEGRAM_WEBAPP_URL:-http://localhost:5173/telegram}
+      MAX_BOT_TOKEN: ${MAX_BOT_TOKEN:-}
+      MAX_ADMIN_IDS: ${MAX_ADMIN_IDS:-}
+      MAX_OPERATOR_IDS: ${MAX_OPERATOR_IDS:-}
+      MAX_VIEWER_IDS: ${MAX_VIEWER_IDS:-}
     restart: unless-stopped
     healthcheck:
       test:
@@ -50,8 +55,6 @@ services:
     restart: unless-stopped
   telegram-bot:
     build: ./services/telegram_bot
-    profiles:
-    - telegram
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ADMIN_IDS: ${TELEGRAM_ADMIN_IDS:-}
@@ -66,8 +69,6 @@ services:
     restart: unless-stopped
   max-bot:
     build: ./services/max_bot
-    profiles:
-    - max
     environment:
       MAX_BOT_TOKEN: ${MAX_BOT_TOKEN:-}
       MAX_ADMIN_IDS: ${MAX_ADMIN_IDS:-}

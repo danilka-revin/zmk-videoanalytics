@@ -90,7 +90,6 @@ fi
 wait_http(){ local url="$1" s="${2:-120}" i; for ((i=0;i<s/2;i++)); do curl -fsS --max-time 3 "$url" >/dev/null 2>&1 && return 0; sleep 2; done; return 1; }
 
 echo "[start] Запускаю сервисы ZMK Vision..."
-"${DC[@]}" --profile telegram --profile max stop telegram-bot max-bot >/dev/null 2>&1 || true
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml или .env не прошли валидацию"
 "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans || "${DC[@]}" "${PROFILE[@]}" logs --tail=100
 if ! wait_http http://localhost:8000/api/health 120; then "${DC[@]}" logs --tail=100 api; fail "API health check failed"; fi

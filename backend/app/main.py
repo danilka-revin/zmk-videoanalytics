@@ -238,13 +238,32 @@ def init_db():
     con.execute("CREATE INDEX IF NOT EXISTS ix_logs_timestamp_level ON logs(timestamp DESC,level)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_training_status ON training_jobs(status,created_at DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_capture_jobs_status ON dataset_capture_jobs(status,created_at DESC)")
+    con.execute("CREATE TABLE IF NOT EXISTS bot_runtime(provider TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'absent', detail TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT '')")
+    con.execute("CREATE TABLE IF NOT EXISTS bot_commands(id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, action TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending', error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, completed_at TEXT NOT NULL DEFAULT '')")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_bot_commands_provider_status ON bot_commands(provider,status,id DESC)")
     con.execute("UPDATE training_jobs SET status='failed',stage='Прервано перезапуском',error='Worker restarted before completion',updated_at=? WHERE status IN ('queued','running')",(now_iso(),))
+    legacy_telegram_enabled_row=con.execute("SELECT value FROM settings WHERE key='telegram_enabled'").fetchone()
+    legacy_telegram_chats_row=con.execute("SELECT value FROM settings WHERE key='telegram_chat_ids'").fetchone()
+    legacy_critical_alerts_row=con.execute("SELECT value FROM settings WHERE key='critical_alerts'").fetchone()
+    legacy_telegram_enabled=bool(legacy_telegram_enabled_row and legacy_telegram_enabled_row[0]=='true')
+    legacy_critical_alerts=bool(legacy_critical_alerts_row and legacy_critical_alerts_row[0]=='true')
     config_defaults={
         "active_model":"", "active_model_disabled":"false", "ppe_trial_previous_model":"", "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
         "retention_days":"90", "archive_quality":"90", "archive_clip_seconds":"10",
         "inference_fps":"8", "inference_device":"cuda:0", "batch_size":"4", "nms_iou":"0.45",
         "helmet_conf":"0.85", "vest_conf":"0.80", "phone_conf":"0.78", "smoking_conf":"0.80", "restricted_zone_conf":"0.82", "immobility_conf":"0.80", "min_model_precision":"90", "min_model_recall":"85",
-        "telegram_enabled":"false", "telegram_chat_ids":"", "critical_alerts":"true",
+        "telegram_enabled":"true" if legacy_telegram_enabled else "false", "telegram_chat_ids":legacy_telegram_chats_row[0] if legacy_telegram_chats_row else "", "critical_alerts":"true",
+        # Bot tokens remain process secrets in .env. Everything operational —
+        # enablement, roles, recipients and alert policy — is controlled from
+        # the Admin → Bots workspace and read live by bot services.
+        "telegram_bot_enabled":"true" if (legacy_telegram_enabled or MESSENGER_PROVIDER=="telegram") else "false",
+        "telegram_alerts_enabled":"true" if (legacy_telegram_enabled or MESSENGER_PROVIDER=="telegram") else "false",
+        "telegram_alert_min_severity":"critical" if legacy_critical_alerts else "high",
+        "telegram_admin_ids":os.getenv("TELEGRAM_ADMIN_IDS", "").strip(), "telegram_operator_ids":os.getenv("TELEGRAM_OPERATOR_IDS", "").strip(), "telegram_viewer_ids":os.getenv("TELEGRAM_VIEWER_IDS", "").strip(), "telegram_alert_recipients":legacy_telegram_chats_row[0] if legacy_telegram_chats_row else "", "telegram_webapp_url":os.getenv("TELEGRAM_WEBAPP_URL", "").strip(),
+        "max_bot_enabled":"true" if MESSENGER_PROVIDER=="max" else "false",
+        "max_alerts_enabled":"true" if MESSENGER_PROVIDER=="max" else "false",
+        "max_alert_min_severity":"critical" if legacy_critical_alerts else "high",
+        "max_admin_ids":os.getenv("MAX_ADMIN_IDS", "").strip(), "max_operator_ids":os.getenv("MAX_OPERATOR_IDS", "").strip(), "max_viewer_ids":os.getenv("MAX_VIEWER_IDS", "").strip(), "max_alert_recipients":"",
         "webhook_enabled":"false", "webhook_url":"", "webhook_timeout":"5",
         "minio_endpoint":"minio:9000", "minio_bucket":"videoanalytics", "minio_secure":"false",
         "rtsp_reconnect_seconds":"5", "event_cooldown_seconds":"30"
@@ -306,7 +325,7 @@ def telegram_webapp_role(init_data:str)->str|None:
         secret=hmac.new(b"WebAppData",TELEGRAM_BOT_TOKEN.encode(),hashlib.sha256).digest()
         expected=hmac.new(secret,check.encode(),hashlib.sha256).hexdigest()
         if not hmac.compare_digest(supplied,expected): return None
-        user=json.loads(values.get("user","{}")); return TELEGRAM_ROLES.get(int(user.get("id",0)))
+        user=json.loads(values.get("user","{}")); role=_bot_role_for_user("telegram",int(user.get("id",0))); return role if role in {"viewer","operator","admin"} else None
     except (ValueError,TypeError,json.JSONDecodeError): return None
 
 @app.middleware("http")
@@ -328,8 +347,8 @@ async def security_middleware(request: Request, call_next):
         from fastapi.responses import JSONResponse
         return JSONResponse({"detail":"Invalid or missing API credentials"},status_code=401,headers={"WWW-Authenticate":"ApiKey"})
     if telegram_role and not api_key_ok:
-        admin_write=path.startswith(("/api/admin/","/api/training/","/api/settings","/api/models/")) and request.method!="GET"
-        admin_read=path.startswith(("/api/admin/","/api/logs","/api/settings"))
+        admin_write=path.startswith(("/api/admin/","/api/bots/","/api/training/","/api/settings","/api/models/")) and request.method!="GET"
+        admin_read=path.startswith(("/api/admin/","/api/bots/","/api/logs","/api/settings"))
         operator_only=path.startswith("/api/reports/")
         viewer_write=telegram_role=="viewer" and request.method!="GET"
         operator_write=telegram_role=="operator" and request.method!="GET" and not (path.startswith("/api/events/") and (path.endswith(("/ack","/reject")) or path in {"/api/events/ack-bulk","/api/events/reject-bulk"}))
@@ -499,6 +518,22 @@ class DetectionIn(BaseModel):
         return value
 class DetectionBatch(BaseModel): detections:list[DetectionIn]=Field(min_length=1,max_length=500)
 class ConfigPatch(BaseModel): values:dict[str,Any]
+class BotConfigIn(BaseModel):
+    enabled:bool=False
+    alerts_enabled:bool=False
+    alert_min_severity:Literal["critical","high","medium","low"]="high"
+    admin_ids:str=Field(default="",max_length=4000)
+    operator_ids:str=Field(default="",max_length=4000)
+    viewer_ids:str=Field(default="",max_length=4000)
+    alert_recipients:str=Field(default="",max_length=4000)
+    webapp_url:str=Field(default="",max_length=1000)
+class BotHeartbeatIn(BaseModel):
+    status:Literal["active","disabled","waiting_token","api_unavailable","error"]
+    detail:str=Field(default="",max_length=300)
+    enabled:bool=False
+class BotCommandCompleteIn(BaseModel):
+    status:Literal["completed","failed"]
+    error:str=Field(default="",max_length=300)
 class UserIn(BaseModel):
     name:str=Field(min_length=2,max_length=80)
     login:str=Field(min_length=2,max_length=40,pattern=r"^[a-zA-Z0-9._-]+$")
@@ -535,6 +570,76 @@ class TrainingIn(BaseModel):
 
 def rows(query,args=()):
     con=db(); result=[dict(r) for r in con.execute(query,args).fetchall()]; con.close(); return result
+
+BOT_PROVIDERS=("telegram","max")
+
+def _parse_bot_ids(value: str | None) -> list[int]:
+    """Parse operator-maintained comma/newline-separated signed messenger IDs."""
+    result=[]
+    for token in re.split(r"[,;\s]+", str(value or "").strip()):
+        if not token:
+            continue
+        if not re.fullmatch(r"-?\d{1,20}", token):
+            raise ValueError(f"Недопустимый ID: {token}")
+        parsed=int(token)
+        if parsed==0:
+            raise ValueError("ID не может быть нулём")
+        if parsed not in result:
+            result.append(parsed)
+    return result
+
+
+def _normalized_bot_ids(value: str | None) -> str:
+    return ",".join(str(item) for item in _parse_bot_ids(value))
+
+
+def _bot_role_for_user(provider: str, user_id: int) -> str:
+    """Use DB-managed roles, falling back to legacy environment roles safely."""
+    if provider not in BOT_PROVIDERS:
+        return "denied"
+    try:
+        data={item["key"]:item["value"] for item in rows("SELECT key,value FROM settings WHERE key IN (?,?,?)",(f"{provider}_admin_ids",f"{provider}_operator_ids",f"{provider}_viewer_ids"))}
+        configured=any(str(data.get(f"{provider}_{role}_ids","")).strip() for role in ("admin","operator","viewer"))
+        if configured:
+            if user_id in _parse_bot_ids(data.get(f"{provider}_admin_ids")): return "admin"
+            if user_id in _parse_bot_ids(data.get(f"{provider}_operator_ids")): return "operator"
+            if user_id in _parse_bot_ids(data.get(f"{provider}_viewer_ids")): return "viewer"
+            return "denied"
+    except (sqlite3.Error,ValueError):
+        pass
+    legacy={"telegram":(TELEGRAM_ROLES.get(user_id) if "TELEGRAM_ROLES" in globals() else None),"max":None}
+    return legacy.get(provider) or "denied"
+
+
+def _active_bot_provider(settings: dict[str,str]) -> str:
+    active=[provider for provider in BOT_PROVIDERS if settings.get(f"{provider}_bot_enabled")=="true"]
+    return active[0] if len(active)==1 else "multiple" if active else "none"
+
+
+def _bot_token_configured(provider: str) -> bool:
+    return bool(os.getenv("TELEGRAM_BOT_TOKEN" if provider=="telegram" else "MAX_BOT_TOKEN", "").strip())
+
+
+def _bot_view(provider: str, settings: dict[str,str], runtime: sqlite3.Row | None, last_command: sqlite3.Row | None) -> dict[str,Any]:
+    updated_at=runtime[4] if runtime else ""
+    age=timestamp_age_seconds(updated_at)
+    status=runtime[1] if runtime else "absent"
+    return {
+        "provider":provider,
+        "label":"Telegram" if provider=="telegram" else "MAX",
+        "enabled":settings.get(f"{provider}_bot_enabled","false")=="true",
+        "alerts_enabled":settings.get(f"{provider}_alerts_enabled","false")=="true",
+        "alert_min_severity":settings.get(f"{provider}_alert_min_severity","high"),
+        "admin_ids":settings.get(f"{provider}_admin_ids",""),
+        "operator_ids":settings.get(f"{provider}_operator_ids",""),
+        "viewer_ids":settings.get(f"{provider}_viewer_ids",""),
+        "alert_recipients":settings.get(f"{provider}_alert_recipients",""),
+        "token_configured":_bot_token_configured(provider),
+        "runtime":{"status":status,"detail":runtime[2] if runtime else "Сервис ещё не сообщил состояние","enabled":bool(runtime[3]) if runtime else False,"updated_at":updated_at,"age_seconds":age,"online":bool(age is not None and age<=20 and status in {"active","disabled","waiting_token"})},
+        "webapp_url":settings.get("telegram_webapp_url",os.getenv("TELEGRAM_WEBAPP_URL","")) if provider=="telegram" else "",
+        "last_test":{"id":last_command[0],"status":last_command[1],"error":last_command[2],"created_at":last_command[3],"completed_at":last_command[4]} if last_command else None,
+    }
+
 
 def inference_worker_state() -> dict[str,Any]:
     con=db(); row=con.execute("SELECT status,detail,camera_count,updated_at FROM worker_status WHERE name='inference'").fetchone(); con.close()
@@ -601,12 +706,14 @@ def dashboard():
     critical=con.execute("SELECT COUNT(*) FROM events WHERE severity='critical' AND acknowledged=0").fetchone()[0]
     avg=con.execute("SELECT COALESCE(AVG(fps),0), COALESCE(AVG(latency_ms),0) FROM cameras WHERE status='online' AND telemetry_at>=?",(fresh_after,)).fetchone()
     model=con.execute("SELECT m.name,m.precision,m.recall FROM model_registry m JOIN settings s ON s.key='active_model' AND s.value=m.name").fetchone()
+    bot_settings={row[0]:row[1] for row in con.execute("SELECT key,value FROM settings WHERE key IN ('telegram_bot_enabled','max_bot_enabled')").fetchall()}
+    messenger_provider=_active_bot_provider(bot_settings)
     trend=[]
     for h in range(11,-1,-1):
         end=datetime.now(TZ)-timedelta(hours=h); start=end-timedelta(hours=1)
         n=con.execute("SELECT COUNT(*) FROM events WHERE timestamp BETWEEN ? AND ?",(start.isoformat(),end.isoformat())).fetchone()[0]
         trend.append({"label":end.strftime("%H:00"),"value":n})
-    con.close(); gpu=gpu_metrics(); return {"cameras":{"total":total,"online":online},"events24h":events24,"critical_unacked":critical,"avg_fps":round(avg[0],1),"avg_latency_ms":round(avg[1]),"gpu_load":gpu["gpu"],"gpu_temp":gpu["gpu_temp"],"messenger_provider":MESSENGER_PROVIDER,"active_model":model[0] if model else None,"precision":model[1] if model else None,"recall":model[2] if model else None,"trend":trend}
+    con.close(); gpu=gpu_metrics(); return {"cameras":{"total":total,"online":online},"events24h":events24,"critical_unacked":critical,"avg_fps":round(avg[0],1),"avg_latency_ms":round(avg[1]),"gpu_load":gpu["gpu"],"gpu_temp":gpu["gpu_temp"],"messenger_provider":messenger_provider,"active_model":model[0] if model else None,"precision":model[1] if model else None,"recall":model[2] if model else None,"trend":trend}
 
 EVENT_LABELS={"no_helmet":"Без каски","no_vest":"Без жилета","phone_usage":"Телефон","smoking":"Курение","restricted_zone":"Опасная зона","immobility":"Неподвижность"}
 REVIEW_LABELS={"pending":"Требуют внимания","accepted":"Приняты","rejected":"Не приняты"}
@@ -1063,6 +1170,137 @@ def update_config(payload:ConfigPatch):
     if "retention_days" in payload.values: apply_retention(con)
     con.commit(); con.close()
     return {"updated":list(payload.values),"restart_required":any(k in payload.values for k in ("inference_device","minio_endpoint"))}
+
+def _bot_settings_map(con: sqlite3.Connection) -> dict[str,str]:
+    keys=[f"{provider}_{field}" for provider in BOT_PROVIDERS for field in ("bot_enabled","alerts_enabled","alert_min_severity","admin_ids","operator_ids","viewer_ids","alert_recipients","webapp_url")]
+    marks=",".join("?" for _ in keys)
+    return {row[0]:row[1] for row in con.execute(f"SELECT key,value FROM settings WHERE key IN ({marks})",keys).fetchall()}  # nosec B608 - placeholders only
+
+
+@app.get("/api/admin/bots")
+def admin_bots():
+    con=db()
+    try:
+        settings=_bot_settings_map(con)
+        providers=[]
+        for provider in BOT_PROVIDERS:
+            runtime=con.execute("SELECT provider,status,detail,enabled,updated_at FROM bot_runtime WHERE provider=?",(provider,)).fetchone()
+            last_command=con.execute("SELECT id,status,error,created_at,completed_at FROM bot_commands WHERE provider=? AND action='test_alert' ORDER BY id DESC LIMIT 1",(provider,)).fetchone()
+            providers.append(_bot_view(provider,settings,runtime,last_command))
+        return {"providers":providers,"active_providers":[provider for provider in BOT_PROVIDERS if settings.get(f"{provider}_bot_enabled")=="true"]}
+    finally:
+        con.close()
+
+
+@app.put("/api/admin/bots/{provider}")
+def update_bot(provider: Literal["telegram","max"], payload: BotConfigIn):
+    if payload.enabled and not _bot_token_configured(provider):
+        label="TELEGRAM_BOT_TOKEN" if provider=="telegram" else "MAX_BOT_TOKEN"
+        raise HTTPException(422,f"Нельзя включить {provider}: {label} не задан на сервере. Токен намеренно не хранится в панели.")
+    try:
+        values={
+            f"{provider}_bot_enabled":"true" if payload.enabled else "false",
+            f"{provider}_alerts_enabled":"true" if payload.alerts_enabled else "false",
+            f"{provider}_alert_min_severity":payload.alert_min_severity,
+            f"{provider}_admin_ids":_normalized_bot_ids(payload.admin_ids),
+            f"{provider}_operator_ids":_normalized_bot_ids(payload.operator_ids),
+            f"{provider}_viewer_ids":_normalized_bot_ids(payload.viewer_ids),
+            f"{provider}_alert_recipients":_normalized_bot_ids(payload.alert_recipients),
+        }
+        if provider=="telegram":
+            url=payload.webapp_url.strip()
+            if url and not url.startswith(("https://","http://localhost")):
+                raise HTTPException(422,"Telegram Mini App URL должен быть HTTPS (localhost разрешён только для локальной разработки)")
+            values["telegram_webapp_url"]=url
+    except ValueError as exc:
+        raise HTTPException(422,str(exc))
+    con=db()
+    try:
+        for key,value in values.items(): con.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,value))
+        # Keep legacy settings coherent for existing integrations and upgrades.
+        if provider=="telegram":
+            con.execute("INSERT INTO settings VALUES('telegram_enabled',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(values[f"{provider}_alerts_enabled"],))
+            con.execute("INSERT INTO settings VALUES('telegram_chat_ids',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(values[f"{provider}_alert_recipients"],))
+            con.execute("INSERT INTO settings VALUES('critical_alerts',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",("true" if payload.alert_min_severity=="critical" else "false",))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","bot_admin",f"{provider} bot configured: enabled={payload.enabled}, alerts={payload.alerts_enabled}"))
+        con.commit()
+        runtime=con.execute("SELECT provider,status,detail,enabled,updated_at FROM bot_runtime WHERE provider=?",(provider,)).fetchone()
+        last_command=con.execute("SELECT id,status,error,created_at,completed_at FROM bot_commands WHERE provider=? AND action='test_alert' ORDER BY id DESC LIMIT 1",(provider,)).fetchone()
+        settings=_bot_settings_map(con)
+        return _bot_view(provider,settings,runtime,last_command)
+    finally:
+        con.close()
+
+
+@app.post("/api/admin/bots/{provider}/test-alert",status_code=202)
+def request_bot_test_alert(provider: Literal["telegram","max"]):
+    if not _bot_token_configured(provider):
+        raise HTTPException(422,"У этого бота нет токена на сервере")
+    con=db()
+    try:
+        settings=_bot_settings_map(con)
+        if settings.get(f"{provider}_bot_enabled")!="true":
+            raise HTTPException(409,"Сначала включите бота и сохраните настройки")
+        cur=con.execute("INSERT INTO bot_commands(provider,action,payload,status,created_at) VALUES(?,?,?,?,?)",(provider,"test_alert",json.dumps({"text":"Тестовое сообщение из Admin панели ZMK Vision"},ensure_ascii=False),"pending",now_iso()))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","bot_admin",f"{provider} test alert queued: command={cur.lastrowid}"))
+        con.commit()
+        return {"id":cur.lastrowid,"provider":provider,"status":"pending","message":"Тест поставлен в очередь бота"}
+    finally:
+        con.close()
+
+
+@app.get("/api/bots/{provider}/runtime")
+def bot_runtime_config(provider: Literal["telegram","max"]):
+    con=db()
+    try:
+        settings=_bot_settings_map(con)
+        return {
+            "provider":provider,
+            "enabled":settings.get(f"{provider}_bot_enabled","false")=="true",
+            "alerts_enabled":settings.get(f"{provider}_alerts_enabled","false")=="true",
+            "alert_min_severity":settings.get(f"{provider}_alert_min_severity","high"),
+            "admin_ids":_parse_bot_ids(settings.get(f"{provider}_admin_ids")),
+            "operator_ids":_parse_bot_ids(settings.get(f"{provider}_operator_ids")),
+            "viewer_ids":_parse_bot_ids(settings.get(f"{provider}_viewer_ids")),
+            "alert_recipients":_parse_bot_ids(settings.get(f"{provider}_alert_recipients")),
+            "webapp_url":settings.get("telegram_webapp_url","") if provider=="telegram" else "",
+        }
+    finally:
+        con.close()
+
+
+@app.post("/api/bots/{provider}/heartbeat")
+def bot_heartbeat(provider: Literal["telegram","max"], payload: BotHeartbeatIn):
+    con=db(); con.execute("INSERT INTO bot_runtime(provider,status,detail,enabled,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(provider) DO UPDATE SET status=excluded.status,detail=excluded.detail,enabled=excluded.enabled,updated_at=excluded.updated_at",(provider,payload.status,payload.detail,payload.enabled,now_iso())); con.commit(); con.close()
+    return {"provider":provider,"status":payload.status}
+
+
+@app.get("/api/bots/{provider}/commands")
+def bot_commands(provider: Literal["telegram","max"], limit:int=Query(10,ge=1,le=50)):
+    con=db()
+    try:
+        result=[]
+        for row in con.execute("SELECT id,action,payload,created_at FROM bot_commands WHERE provider=? AND status='pending' ORDER BY id LIMIT ?",(provider,limit)).fetchall():
+            try: payload=json.loads(row[2])
+            except (TypeError,ValueError,json.JSONDecodeError): payload={}
+            result.append({"id":row[0],"action":row[1],"payload":payload,"created_at":row[3]})
+        return {"commands":result}
+    finally:
+        con.close()
+
+
+@app.post("/api/bots/{provider}/commands/{command_id}/complete")
+def complete_bot_command(provider: Literal["telegram","max"], command_id:int, payload: BotCommandCompleteIn):
+    con=db()
+    try:
+        row=con.execute("SELECT id FROM bot_commands WHERE id=? AND provider=? AND status='pending'",(command_id,provider)).fetchone()
+        if not row: raise HTTPException(404,"Команда бота не найдена или уже завершена")
+        con.execute("UPDATE bot_commands SET status=?,error=?,completed_at=? WHERE id=?",(payload.status,payload.error,now_iso(),command_id))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO" if payload.status=="completed" else "ERROR","bot_admin",f"{provider} command {command_id}: {payload.status}"))
+        con.commit(); return {"id":command_id,"status":payload.status}
+    finally:
+        con.close()
+
 
 @app.get("/api/admin/users")
 def get_users(): return rows("SELECT id,name,login,role,active,created_at FROM users ORDER BY id")
@@ -1850,7 +2088,10 @@ def gpu_metrics():
         except pynvml.NVMLError: pass
 
 def system_health_data():
-    gpu=gpu_metrics(); con=db(); con.execute("SELECT 1").fetchone(); camera_count=con.execute("SELECT COUNT(*) FROM cameras WHERE enabled=1").fetchone()[0]; con.close()
+    gpu=gpu_metrics(); con=db(); con.execute("SELECT 1").fetchone(); camera_count=con.execute("SELECT COUNT(*) FROM cameras WHERE enabled=1").fetchone()[0]
+    settings=_bot_settings_map(con)
+    runtime={row[0]:row for row in con.execute("SELECT provider,status,updated_at FROM bot_runtime").fetchall()}
+    con.close()
     snap_dir=SNAPSHOT_DIR or (DB_PATH.parent/"snapshots")
     fresh=sum(1 for r in snap_dir.glob("*.jpg") if (time.time()-r.stat().st_mtime)<10) if snap_dir.exists() else 0
     worker=inference_worker_state()
@@ -1858,7 +2099,13 @@ def system_health_data():
     elif not worker["connected"]: inference_status="error"
     elif fresh: inference_status="healthy"
     else: inference_status="degraded"
-    return {"cpu":round(psutil.cpu_percent(interval=.05),1),"ram":round(psutil.virtual_memory().percent,1),"disk":round(psutil.disk_usage(str(DB_PATH.parent)).percent,1),**gpu,"messenger_provider":MESSENGER_PROVIDER,"worker":worker,"services":[{"name":"api","status":"healthy"},{"name":"database","status":"healthy"},{"name":"ingestion","status":"healthy" if camera_count else "not_configured"},{"name":"inference","status":inference_status}]}
+    bot_services=[]
+    for provider in BOT_PROVIDERS:
+        row=runtime.get(provider); age=timestamp_age_seconds(row[2]) if row else None
+        enabled=settings.get(f"{provider}_bot_enabled")=="true"
+        status="healthy" if enabled and row and row[1]=="active" and age is not None and age<=20 else "disabled" if not enabled else "degraded"
+        bot_services.append({"name":f"bot-{provider}","status":status})
+    return {"cpu":round(psutil.cpu_percent(interval=.05),1),"ram":round(psutil.virtual_memory().percent,1),"disk":round(psutil.disk_usage(str(DB_PATH.parent)).percent,1),**gpu,"messenger_provider":_active_bot_provider(settings),"worker":worker,"services":[{"name":"api","status":"healthy"},{"name":"database","status":"healthy"},{"name":"ingestion","status":"healthy" if camera_count else "not_configured"},{"name":"inference","status":inference_status},*bot_services]}
 
 @app.get("/api/system-health")
 def system_health(): return system_health_data()
