@@ -37,6 +37,9 @@ def test_bootstrap_launcher_and_rtsp_wizard_escape_credentials(tmp_path):
     # remote-tracking origin/<slash-containing-branch> ref. The repeat launcher
     # must therefore check out the fetched commit directly.
     assert 'checkout -B "$ZMK_REF" FETCH_HEAD' in bootstrap
+    # bootstrap has already checked out the requested Git ref; the release
+    # updater must not replace a feature branch immediately afterwards.
+    assert 'ZMK_NO_AUTO_UPDATE=1' in bootstrap
 
     # An RTSP password may include & or |. The wizard must preserve it rather
     # than interpreting it as a sed replacement expression.

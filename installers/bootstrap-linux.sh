@@ -106,7 +106,10 @@ if [[ "$needs_setup" == true ]]; then
   fi
   [[ "$ZMK_RTSP_URL" =~ ^rtsps?://[^[:space:]]+$ ]] || fail "A non-empty rtsp:// or rtsps:// URL is required"
   info "Installing Docker if necessary, configuring the camera and starting ZMK Vision..."
+  # bootstrap already fetched the requested Git ref. Do not let the release
+  # updater immediately replace a feature branch with the latest main release.
   exec env \
+    ZMK_NO_AUTO_UPDATE=1 \
     NONINTERACTIVE=1 \
     MESSENGER_PROVIDER=none \
     ENABLE_INFERENCE=true \
@@ -118,4 +121,6 @@ if [[ "$needs_setup" == true ]]; then
 fi
 
 info "Configuration already exists. Updating source and starting ZMK Vision..."
-exec bash start.sh
+# The Git ref above is authoritative for this launcher run (including custom
+# arena/feature refs), so skip the release-only updater in start.sh.
+exec env ZMK_NO_AUTO_UPDATE=1 bash start.sh
