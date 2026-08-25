@@ -1,0 +1,66 @@
+"""Password gate, change flow and email-code recovery contracts."""
+from __future__ import annotations
+
+from app import main
+from fastapi.testclient import TestClient
+
+
+def enable_password_auth(monkeypatch):
+    monkeypatch.setattr(main, "PASSWORD_AUTH_ENABLED", True)
+    monkeypatch.setattr(main, "INITIAL_APP_PASSWORD", "1243")
+    main._auth_attempts.clear()
+
+
+def test_password_gate_login_change_and_logout(monkeypatch):
+    enable_password_auth(monkeypatch)
+    with TestClient(main.app) as client:
+        assert client.get("/api/dashboard").status_code == 401
+        status = client.get("/api/auth/status").json()
+        assert status["enabled"] is True and status["authenticated"] is False
+        assert client.post("/api/auth/login", json={"password": "wrong"}).status_code == 401
+        login = client.post("/api/auth/login", json={"password": "1243"})
+        assert login.status_code == 200, login.text
+        assert login.json()["must_change"] is True
+        assert client.get("/api/dashboard").status_code == 403
+
+        changed = client.put("/api/auth/password", json={"current_password": "1243", "new_password": "new-password-42"})
+        assert changed.status_code == 200, changed.text
+        assert changed.json()["changed"] is True
+        assert client.get("/api/dashboard").status_code == 200
+        assert client.post("/api/auth/logout").status_code == 200
+        assert client.get("/api/dashboard").status_code == 401
+        assert client.post("/api/auth/login", json={"password": "1243"}).status_code == 401
+        assert client.post("/api/auth/login", json={"password": "new-password-42"}).status_code == 200
+
+
+def test_bot_service_token_keeps_messenger_control_plane_working(monkeypatch):
+    enable_password_auth(monkeypatch)
+    monkeypatch.setattr(main, "BOT_API_TOKEN", "bot-service-secret")
+    with TestClient(main.app) as client:
+        assert client.get("/api/dashboard").status_code == 401
+        assert client.get("/api/dashboard", headers={"X-Bot-Service-Token": "bot-service-secret"}).status_code == 200
+
+
+def test_email_binding_and_recovery_code_resets_password(monkeypatch):
+    enable_password_auth(monkeypatch)
+    sent: dict[str, str] = {}
+
+    def fake_send(address: str, code: str):
+        sent["address"] = address
+        sent["code"] = code
+
+    monkeypatch.setattr(main, "_smtp_ready", lambda: True)
+    monkeypatch.setattr(main, "_send_recovery_email", fake_send)
+    with TestClient(main.app) as client:
+        assert client.post("/api/auth/login", json={"password": "1243"}).status_code == 200
+        assert client.put("/api/auth/password", json={"current_password": "1243", "new_password": "recovery-start-password"}).status_code == 200
+        bound = client.put("/api/auth/email", json={"email": "owner@example.test", "password": "recovery-start-password"})
+        assert bound.status_code == 200, bound.text
+        assert bound.json()["email"] == "o***@example.test"
+        request = client.post("/api/auth/recovery/request", json={"email": "owner@example.test"})
+        assert request.status_code == 200, request.text
+        assert sent["address"] == "owner@example.test" and len(sent["code"]) == 6
+        reset = client.post("/api/auth/recovery/verify", json={"email": "owner@example.test", "code": sent["code"], "new_password": "recovered-password"})
+        assert reset.status_code == 200, reset.text
+        assert client.post("/api/auth/logout").status_code == 200
+        assert client.post("/api/auth/login", json={"password": "recovered-password"}).status_code == 200

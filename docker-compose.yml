@@ -16,6 +16,16 @@ services:
       MODEL_DIR: /models
       # Maximum size of a locally uploaded model artifact (2 GB by default).
       MODEL_UPLOAD_MAX_BYTES: ${MODEL_UPLOAD_MAX_BYTES:-2000000000}
+      ZMK_PASSWORD_AUTH: ${ZMK_PASSWORD_AUTH:-true}
+      ZMK_INITIAL_PASSWORD: ${ZMK_INITIAL_PASSWORD:-1243}
+      ZMK_AUTH_SESSION_HOURS: ${ZMK_AUTH_SESSION_HOURS:-12}
+      ZMK_AUTH_COOKIE_SECURE: ${ZMK_AUTH_COOKIE_SECURE:-false}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USERNAME: ${SMTP_USERNAME:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+      SMTP_FROM: ${SMTP_FROM:-}
+      SMTP_USE_TLS: ${SMTP_USE_TLS:-true}
       ZMK_API_KEY: ${ZMK_API_KEY:-}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
       # Upgrade legacy 20 FPS camera limits unless explicitly disabled.
@@ -30,6 +40,8 @@ services:
       # Write-only tokens entered in Admin → Боты. This dedicated volume is
       # mounted read-only into messenger workers and never exposed by an API response.
       ZMK_BOT_TOKEN_DIR: /bot-tokens
+      # API-to-bot control-plane token; auto-provisioned in the same private volume.
+      ZMK_BOT_API_TOKEN_FILE: /bot-tokens/.api-token
       UPDATE_SERVICE_URL: ${UPDATE_SERVICE_URL:-http://updater:8020}
       ZMK_UPDATE_TOKEN: ${ZMK_UPDATE_TOKEN:-}
       # Optional first-camera bootstrap; keep empty when configuring cameras in UI.
@@ -73,6 +85,7 @@ services:
       TELEGRAM_WEBAPP_URL: ${TELEGRAM_WEBAPP_URL:-http://localhost:5173/telegram}
       # The API writes Admin-entered tokens here atomically; bots can only read.
       ZMK_BOT_TOKEN_DIR: /bot-secrets
+      ZMK_BOT_API_TOKEN_FILE: /bot-secrets/.api-token
       ZMK_API_URL: http://api:8000
       ZMK_API_KEY: ${ZMK_API_KEY:-}
     volumes:
@@ -90,6 +103,7 @@ services:
       MAX_VIEWER_IDS: ${MAX_VIEWER_IDS:-}
       # Same dedicated private read-only volume as telegram-bot.
       ZMK_BOT_TOKEN_DIR: /bot-secrets
+      ZMK_BOT_API_TOKEN_FILE: /bot-secrets/.api-token
       ZMK_API_URL: http://api:8000
       ZMK_API_KEY: ${ZMK_API_KEY:-}
     volumes:
@@ -148,6 +162,7 @@ services:
     environment:
       ZMK_API_URL: http://api:8000
       ZMK_API_KEY: ${ZMK_API_KEY:-}
+      ZMK_BOT_API_TOKEN_FILE: /bot-secrets/.api-token
       TRAINING_DATA_DIR: /data
       MODEL_DIR: /models
       DATASET_DIR: /datasets
@@ -156,6 +171,7 @@ services:
     - training-data:/data
     - model-data:/models
     - dataset-data:/datasets
+    - bot-token-data:/bot-secrets:ro
     depends_on:
       api:
         condition: service_healthy

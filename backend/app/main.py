@@ -12,8 +12,10 @@ import os
 import re
 import secrets
 import shutil
+import smtplib
 import socket
 import sqlite3
+import ssl
 import tempfile
 import threading
 import time
@@ -23,6 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
+from email.message import EmailMessage
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlparse
@@ -31,7 +34,7 @@ import httpx
 import psutil
 import pynvml
 import yaml
-from fastapi import Body, FastAPI, HTTPException, Query, Request
+from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
@@ -48,6 +51,22 @@ EVENT_FRAME_DIR = Path(os.getenv("EVENT_FRAME_DIR", "")) if os.getenv("EVENT_FRA
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
 STARTED = time.time()
 API_KEY = os.getenv("ZMK_API_KEY", "").strip()
+PASSWORD_AUTH_ENABLED=os.getenv("ZMK_PASSWORD_AUTH","false").strip().lower() not in {"0","false","no","off"}
+INITIAL_APP_PASSWORD=os.getenv("ZMK_INITIAL_PASSWORD",str(1243))
+AUTH_COOKIE_NAME="zmk_session"
+try: AUTH_SESSION_HOURS=max(1,min(720,int(os.getenv("ZMK_AUTH_SESSION_HOURS","12") or 12)))
+except ValueError: AUTH_SESSION_HOURS=12
+AUTH_COOKIE_SECURE=os.getenv("ZMK_AUTH_COOKIE_SECURE","false").strip().lower() in {"1","true","yes","on"}
+try: AUTH_RECOVERY_MINUTES=max(5,min(60,int(os.getenv("ZMK_RECOVERY_MINUTES","15") or 15)))
+except ValueError: AUTH_RECOVERY_MINUTES=15
+SMTP_HOST=os.getenv("SMTP_HOST","").strip()
+try: SMTP_PORT=max(1,min(65535,int(os.getenv("SMTP_PORT","587") or 587)))
+except ValueError: SMTP_PORT=587
+SMTP_USERNAME=os.getenv("SMTP_USERNAME","").strip()
+SMTP_PASSWORD=os.getenv("SMTP_PASSWORD","")
+SMTP_FROM=os.getenv("SMTP_FROM","").strip()
+SMTP_USE_TLS=os.getenv("SMTP_USE_TLS","true").strip().lower() not in {"0","false","no","off"}
+_auth_attempts: dict[str,list[float]] = {}
 try: RATE_LIMIT_PER_MINUTE = max(10,int(os.getenv("RATE_LIMIT_PER_MINUTE", "120")))
 except ValueError: RATE_LIMIT_PER_MINUTE = 120
 _rate_buckets: dict[str, list[float]] = {}
@@ -103,6 +122,9 @@ def provision_worker_token(token_file: Path, env_token: str | None = None) -> st
         return ""
 
 WORKER_TOKEN = provision_worker_token(WORKER_TOKEN_FILE, os.getenv("ZMK_WORKER_TOKEN", ""))
+_bot_token_dir=os.getenv("ZMK_BOT_TOKEN_DIR","").strip()
+BOT_API_TOKEN_FILE=Path(os.getenv("ZMK_BOT_API_TOKEN_FILE", "")) if os.getenv("ZMK_BOT_API_TOKEN_FILE") else ((Path(_bot_token_dir)/".api-token") if _bot_token_dir else (DB_PATH.parent/".bot-api-token"))
+BOT_API_TOKEN=provision_worker_token(BOT_API_TOKEN_FILE,os.getenv("ZMK_BOT_API_TOKEN", ""))
 UPDATE_SERVICE_URL = os.getenv("UPDATE_SERVICE_URL", "").rstrip("/")
 # Catalog of ready-to-download pretrained models.  Generic COCO weights are
 # useful for fine-tuning, but COCO does not contain a safety-helmet class.  The
@@ -166,6 +188,121 @@ def db():
     con.execute("PRAGMA busy_timeout=10000")
     return con
 
+def _hash_password(password: str, salt: bytes | None = None) -> str:
+    salt=salt or secrets.token_bytes(16)
+    digest=hashlib.pbkdf2_hmac("sha256",password.encode("utf-8"),salt,260_000)
+    return "pbkdf2_sha256$260000$"+base64.urlsafe_b64encode(salt).decode()+"$"+base64.urlsafe_b64encode(digest).decode()
+
+
+def _password_matches(password: str, encoded: str) -> bool:
+    try:
+        algorithm,rounds,salt_b64,digest_b64=encoded.split("$",3)
+        if algorithm!="pbkdf2_sha256": return False
+        salt=base64.urlsafe_b64decode(salt_b64.encode())
+        expected=base64.urlsafe_b64decode(digest_b64.encode())
+        actual=hashlib.pbkdf2_hmac("sha256",password.encode("utf-8"),salt,int(rounds))
+        return hmac.compare_digest(actual,expected)
+    except (TypeError,ValueError,binascii.Error):
+        return False
+
+
+def _auth_setting(key: str, default: str = "") -> str:
+    con=db()
+    try:
+        row=con.execute("SELECT value FROM settings WHERE key=?",(key,)).fetchone()
+        return str(row[0]) if row else default
+    finally:
+        con.close()
+
+
+def _smtp_ready() -> bool:
+    return bool(SMTP_HOST and SMTP_FROM)
+
+
+def _masked_email(value: str) -> str:
+    if "@" not in value: return ""
+    local,domain=value.split("@",1)
+    return (local[:1]+"***@"+domain) if local else "***@"+domain
+
+
+def _auth_token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def _auth_session(request: Request) -> dict[str,Any] | None:
+    token=request.cookies.get(AUTH_COOKIE_NAME,"")
+    if not token or len(token)>512:
+        return None
+    con=db()
+    try:
+        row=con.execute("SELECT id,expires_at FROM auth_sessions WHERE token_hash=?",(_auth_token_digest(token),)).fetchone()
+        if not row:
+            return None
+        if str(row[1])<=now_iso():
+            con.execute("DELETE FROM auth_sessions WHERE id=?",(row[0],)); con.commit()
+            return None
+        return {"id":str(row[0]),"expires_at":str(row[1])}
+    finally:
+        con.close()
+
+
+def _create_auth_session() -> tuple[str,str]:
+    token=secrets.token_urlsafe(36)
+    session_id=uuid.uuid4().hex
+    expires=(datetime.now(TZ)+timedelta(hours=AUTH_SESSION_HOURS)).isoformat(timespec="seconds")
+    con=db()
+    try:
+        con.execute("DELETE FROM auth_sessions WHERE expires_at<=?",(now_iso(),))
+        con.execute("INSERT INTO auth_sessions(id,token_hash,created_at,expires_at,last_seen_at) VALUES(?,?,?,?,?)",(session_id,_auth_token_digest(token),now_iso(),expires,now_iso()))
+        con.commit()
+    finally:
+        con.close()
+    return token,expires
+
+
+def _revoke_auth_sessions(except_id: str = "") -> None:
+    con=db()
+    try:
+        if except_id: con.execute("DELETE FROM auth_sessions WHERE id!=?",(except_id,))
+        else: con.execute("DELETE FROM auth_sessions")
+        con.commit()
+    finally:
+        con.close()
+
+
+def _set_auth_cookie(response: Response, token: str, request: Request) -> None:
+    secure=AUTH_COOKIE_SECURE or request.headers.get("X-Forwarded-Proto","").lower()=="https"
+    response.set_cookie(AUTH_COOKIE_NAME,token,max_age=AUTH_SESSION_HOURS*3600,httponly=True,secure=secure,samesite="lax",path="/")
+
+
+def _allow_auth_attempt(request: Request) -> bool:
+    now=time.time()
+    source=request.headers.get("X-Real-IP") or (request.client.host if request.client else "unknown")
+    attempts=[value for value in _auth_attempts.get(source,[]) if now-value<600]
+    _auth_attempts[source]=attempts
+    if len(attempts)>=5:
+        return False
+    attempts.append(now)
+    _auth_attempts[source]=attempts
+    return True
+
+
+def _send_recovery_email(address: str, code: str) -> None:
+    if not _smtp_ready():
+        raise RuntimeError("SMTP не настроен")
+    message=EmailMessage()
+    message["Subject"]="ZMK Vision — код восстановления пароля"
+    message["From"]=SMTP_FROM
+    message["To"]=address
+    message.set_content(f"Код восстановления ZMK Vision: {code}\n\nОн действует {AUTH_RECOVERY_MINUTES} минут. Если вы не запрашивали восстановление, проигнорируйте это письмо.")
+    with smtplib.SMTP(SMTP_HOST,SMTP_PORT,timeout=20) as client:
+        if SMTP_USE_TLS:
+            client.starttls(context=ssl.create_default_context())
+        if SMTP_USERNAME:
+            client.login(SMTP_USERNAME,SMTP_PASSWORD)
+        client.send_message(message)
+
+
 def event_frame_path_for(event_id:int) -> Path:
     """Return the single safe evidence JPEG location for an event."""
     if event_id < 1:
@@ -206,6 +343,8 @@ def init_db():
     CREATE TABLE IF NOT EXISTS model_registry(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, format TEXT NOT NULL, status TEXT NOT NULL, precision REAL, recall REAL, trained_at TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'external', artifact_uri TEXT NOT NULL DEFAULT '', checksum TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS training_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, camera_id TEXT NOT NULL, base_model TEXT NOT NULL, target_name TEXT NOT NULL, image_count INTEGER NOT NULL, epochs INTEGER NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL, error TEXT, batch INTEGER NOT NULL DEFAULT 8, imgsz INTEGER NOT NULL DEFAULT 640, patience INTEGER NOT NULL DEFAULT 20, confidence REAL NOT NULL DEFAULT .35, val_split REAL NOT NULL DEFAULT .2, capture_fps REAL NOT NULL DEFAULT 2, FOREIGN KEY(camera_id) REFERENCES cameras(id));
     CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, login TEXT UNIQUE NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS auth_sessions(id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, last_seen_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS auth_recovery_codes(id TEXT PRIMARY KEY, email TEXT NOT NULL, code_hash TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, used_at TEXT NOT NULL DEFAULT '');
     """)
     camera_columns={r[1] for r in con.execute("PRAGMA table_info(cameras)").fetchall()}
     for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''","telemetry_at":"TEXT NOT NULL DEFAULT ''","last_error":"TEXT NOT NULL DEFAULT ''","restart_requested_at":"TEXT NOT NULL DEFAULT ''"}.items():
@@ -248,6 +387,8 @@ def init_db():
     con.execute("CREATE INDEX IF NOT EXISTS ix_logs_timestamp_level ON logs(timestamp DESC,level)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_training_status ON training_jobs(status,created_at DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_capture_jobs_status ON dataset_capture_jobs(status,created_at DESC)")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_auth_sessions_expires ON auth_sessions(expires_at)")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_auth_recovery_email_expires ON auth_recovery_codes(email,expires_at)")
     con.execute("CREATE TABLE IF NOT EXISTS bot_runtime(provider TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'absent', detail TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT '')")
     con.execute("CREATE TABLE IF NOT EXISTS bot_commands(id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, action TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending', error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, completed_at TEXT NOT NULL DEFAULT '')")
     con.execute("CREATE INDEX IF NOT EXISTS ix_bot_commands_provider_status ON bot_commands(provider,status,id DESC)")
@@ -258,7 +399,7 @@ def init_db():
     legacy_telegram_enabled=bool(legacy_telegram_enabled_row and legacy_telegram_enabled_row[0]=='true')
     legacy_critical_alerts=bool(legacy_critical_alerts_row and legacy_critical_alerts_row[0]=='true')
     config_defaults={
-        "active_model":"", "active_model_disabled":"false", "ppe_trial_previous_model":"", "model_test_mode":"false", "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
+        "active_model":"", "active_model_disabled":"false", "ppe_trial_previous_model":"", "model_test_mode":"false", "auth_email":"", "auth_password_must_change":str(True).lower(), "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
         "retention_days":"90", "archive_quality":"90", "archive_clip_seconds":"10",
         "inference_fps":"8", "inference_device":"cuda:0", "batch_size":"4", "nms_iou":"0.45",
         "helmet_conf":"0.85", "vest_conf":"0.80", "phone_conf":"0.78", "smoking_conf":"0.80", "restricted_zone_conf":"0.82", "immobility_conf":"0.80", "min_model_precision":"90", "min_model_recall":"85",
@@ -279,6 +420,12 @@ def init_db():
         "rtsp_reconnect_seconds":"5", "event_cooldown_seconds":"30"
     }
     for key,value in config_defaults.items(): con.execute("INSERT OR IGNORE INTO settings VALUES(?,?)",(key,value))
+    password_row=con.execute("SELECT value FROM settings WHERE key='auth_password_hash'").fetchone()
+    if not password_row or not str(password_row[0]).strip():
+        con.execute("INSERT INTO settings(key,value) VALUES('auth_password_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(_hash_password(INITIAL_APP_PASSWORD),))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","auth","Initial local password initialized; change it after first login"))
+    con.execute("DELETE FROM auth_sessions WHERE expires_at<=?",(now_iso(),))
+    con.execute("DELETE FROM auth_recovery_codes WHERE expires_at<=? OR used_at!=''",(now_iso(),))
     disabled_row=con.execute("SELECT value FROM settings WHERE key='active_model_disabled'").fetchone()
     if disabled_row and disabled_row[0]=='true':
         # No model is active after an explicitly stopped PPE trial. Do not
@@ -303,6 +450,32 @@ def init_db():
     apply_retention(con)
     con.commit(); con.close()
 
+class AuthLoginIn(BaseModel):
+    password:str=Field(min_length=1,max_length=128)
+class AuthPasswordIn(BaseModel):
+    current_password:str=Field(min_length=1,max_length=128)
+    new_password:str=Field(min_length=4,max_length=128)
+class AuthEmailIn(BaseModel):
+    email:str=Field(min_length=5,max_length=254)
+    password:str=Field(min_length=1,max_length=128)
+    @field_validator("email")
+    @classmethod
+    def validate_email(cls,value:str):
+        value=value.strip().lower()
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+",value): raise ValueError("Некорректный email")
+        return value
+class AuthRecoveryRequestIn(BaseModel):
+    email:str=Field(min_length=5,max_length=254)
+    @field_validator("email")
+    @classmethod
+    def validate_recovery_email(cls,value:str):
+        value=value.strip().lower()
+        if not re.fullmatch(r"[^\s@]+@[^\s@]+\.[^\s@]+",value): raise ValueError("Некорректный email")
+        return value
+class AuthRecoveryVerifyIn(AuthRecoveryRequestIn):
+    code:str=Field(min_length=6,max_length=6,pattern=r"^\d{6}$")
+    new_password:str=Field(min_length=4,max_length=128)
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -320,7 +493,7 @@ def custom_openapi():
     schema=get_openapi(title=app.title,version=app.version,description=app.description,routes=app.routes)
     schema.setdefault("components",{}).setdefault("securitySchemes",{})["ApiKeyAuth"]={"type":"apiKey","in":"header","name":"X-API-Key"}
     for path,methods in schema.get("paths",{}).items():
-        if path.startswith("/api/") and path!="/api/health":
+        if path.startswith("/api/") and path not in {"/api/health","/api/auth/status","/api/auth/login","/api/auth/recovery/request","/api/auth/recovery/verify"}:
             for operation in methods.values():
                 if isinstance(operation,dict): operation["security"]=[{"ApiKeyAuth":[]}]
     app.openapi_schema=schema; return schema
@@ -345,10 +518,11 @@ def telegram_webapp_role(init_data:str)->str|None:
 
 @app.get("/api/session")
 def session_info(request: Request):
-    """Minimal authenticated identity for the Telegram Mini App UI."""
+    """Minimal authenticated identity for the Telegram Mini App and web shell."""
     init_data=request.headers.get("X-Telegram-Init-Data","")
     role=telegram_webapp_role(init_data)
     api_key_ok=bool(API_KEY and hmac.compare_digest(request.headers.get("X-API-Key",""),API_KEY))
+    password_session=_auth_session(request) if PASSWORD_AUTH_ENABLED else None
     user={}
     if role:
         try:
@@ -357,13 +531,14 @@ def session_info(request: Request):
             user={"id":int(raw.get("id",0)),"name":str(raw.get("first_name") or raw.get("username") or "Telegram")[:80]}
         except (TypeError,ValueError,json.JSONDecodeError):
             user={}
-    return {"telegram":bool(role),"authenticated":bool(role or api_key_ok or not API_KEY),"role":role or ("api_key" if api_key_ok else "local"),"user":user}
+    return {"telegram":bool(role),"authenticated":bool(role or api_key_ok or password_session or not PASSWORD_AUTH_ENABLED),"role":role or ("api_key" if api_key_ok else "password" if password_session else "local"),"user":user}
 
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
     """Optional API-key protection, size/rate limits and baseline response headers."""
     path=request.url.path
     public=path in {"/api/health","/docs","/openapi.json","/redoc"} or not path.startswith("/api/")
+    worker_token_ok=bool(WORKER_TOKEN and hmac.compare_digest(request.headers.get("X-Worker-Token",""),WORKER_TOKEN))
     if path.startswith("/api/internal/"):
         from fastapi.responses import JSONResponse
         # A worker token is auto-provisioned on the shared model-data volume.
@@ -371,13 +546,26 @@ async def security_middleware(request: Request, call_next):
         # read-only). Otherwise we require it strictly (constant-time).
         if not WORKER_TOKEN:
             return JSONResponse({"detail":"Worker token could not be provisioned: ensure model-data volume is writable"},status_code=503)
-        if not hmac.compare_digest(request.headers.get("X-Worker-Token",""),WORKER_TOKEN): return JSONResponse({"detail":"Invalid worker token"},status_code=401)
+        if not worker_token_ok: return JSONResponse({"detail":"Invalid worker token"},status_code=401)
     api_key_ok=bool(API_KEY and hmac.compare_digest(request.headers.get("X-API-Key",""),API_KEY))
     telegram_role=telegram_webapp_role(request.headers.get("X-Telegram-Init-Data",""))
-    if API_KEY and not public and not (api_key_ok or telegram_role or path.startswith("/api/internal/")):
+    bot_service_ok=bool(BOT_API_TOKEN and hmac.compare_digest(request.headers.get("X-Bot-Service-Token",""),BOT_API_TOKEN))
+    auth_public=path in {"/api/auth/status","/api/auth/login","/api/auth/recovery/request","/api/auth/recovery/verify"}
+    password_session=_auth_session(request) if PASSWORD_AUTH_ENABLED and path.startswith("/api/") else None
+    session_ok=bool(password_session)
+    request.state.password_session=password_session
+    worker_service_ok=worker_token_ok and path.startswith(("/api/internal/","/api/inference/"))
+    access_ok=api_key_ok or bool(telegram_role) or bot_service_ok or session_ok or worker_service_ok
+    if API_KEY and not public and not auth_public and not access_ok:
         from fastapi.responses import JSONResponse
         return JSONResponse({"detail":"Invalid or missing API credentials"},status_code=401,headers={"WWW-Authenticate":"ApiKey"})
-    if telegram_role and not api_key_ok:
+    if PASSWORD_AUTH_ENABLED and path.startswith("/api/") and not public and not auth_public and not access_ok:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail":"Password authentication required"},status_code=401,headers={"WWW-Authenticate":"Session"})
+    if PASSWORD_AUTH_ENABLED and session_ok and not (api_key_ok or telegram_role or bot_service_ok) and _auth_setting("auth_password_must_change","false")=="true" and path.startswith("/api/") and path not in {"/api/auth/status","/api/auth/password","/api/auth/logout"}:
+        from fastapi.responses import JSONResponse
+        return JSONResponse({"detail":"Change the initial password before using the system"},status_code=403)
+    if telegram_role and not api_key_ok and not bot_service_ok:
         admin_write=path.startswith(("/api/admin/","/api/bots/","/api/training/","/api/settings","/api/models/")) and request.method!="GET"
         admin_read=path.startswith(("/api/admin/","/api/bots/","/api/logs","/api/settings"))
         operator_only=path.startswith("/api/reports/")
@@ -415,6 +603,132 @@ async def security_middleware(request: Request, call_next):
     response.headers.update({"X-Content-Type-Options":"nosniff","X-Frame-Options":"SAMEORIGIN","Referrer-Policy":"no-referrer","Permissions-Policy":"camera=(), microphone=(), geolocation=()"})
     if path.startswith("/api/"): response.headers["Cache-Control"]="no-store"
     return response
+
+@app.get("/api/auth/status")
+def auth_status(request: Request):
+    session=_auth_session(request) if PASSWORD_AUTH_ENABLED else None
+    api_key_ok=bool(API_KEY and hmac.compare_digest(request.headers.get("X-API-Key",""),API_KEY))
+    email=_auth_setting("auth_email","") if PASSWORD_AUTH_ENABLED else ""
+    return {"enabled":PASSWORD_AUTH_ENABLED,"authenticated":bool(session or api_key_ok or not PASSWORD_AUTH_ENABLED),"must_change":_auth_setting("auth_password_must_change","false")=="true" if PASSWORD_AUTH_ENABLED and not api_key_ok else False,"email_bound":bool(email),"email":_masked_email(email),"recovery_available":_smtp_ready(),"expires_at":session.get("expires_at","") if session else ""}
+
+
+@app.post("/api/auth/login")
+def auth_login(payload: AuthLoginIn, request: Request, response: Response):
+    if not PASSWORD_AUTH_ENABLED:
+        raise HTTPException(409,"Парольный вход отключён администратором")
+    if not _allow_auth_attempt(request):
+        raise HTTPException(429,"Слишком много попыток. Повторите через 10 минут.")
+    encoded=_auth_setting("auth_password_hash","")
+    if not _password_matches(payload.password,encoded):
+        con=db(); con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","auth","Failed password login")); con.commit(); con.close()
+        raise HTTPException(401,"Неверный пароль")
+    token,expires=_create_auth_session()
+    _set_auth_cookie(response,token,request)
+    con=db(); con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth","Password login succeeded")); con.commit(); con.close()
+    return {"authenticated":True,"must_change":_auth_setting("auth_password_must_change","false")=="true","expires_at":expires}
+
+
+@app.post("/api/auth/logout")
+def auth_logout(request: Request, response: Response):
+    session=_auth_session(request)
+    if session:
+        con=db(); con.execute("DELETE FROM auth_sessions WHERE id=?",(session["id"],)); con.commit(); con.close()
+    response.delete_cookie(AUTH_COOKIE_NAME,path="/")
+    return {"logged_out":True}
+
+
+def _require_password_session(request: Request) -> dict[str,Any]:
+    if not PASSWORD_AUTH_ENABLED:
+        raise HTTPException(409,"Парольный вход отключён администратором")
+    session=_auth_session(request)
+    if not session:
+        raise HTTPException(401,"Требуется вход по паролю")
+    return session
+
+
+@app.put("/api/auth/password")
+def auth_change_password(payload: AuthPasswordIn, request: Request, response: Response):
+    _require_password_session(request)
+    encoded=_auth_setting("auth_password_hash","")
+    if not _password_matches(payload.current_password,encoded):
+        raise HTTPException(401,"Текущий пароль неверный")
+    if hmac.compare_digest(payload.current_password,payload.new_password):
+        raise HTTPException(422,"Новый пароль должен отличаться от текущего")
+    con=db(); con.execute("INSERT INTO settings(key,value) VALUES('auth_password_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(_hash_password(payload.new_password),)); con.execute("INSERT INTO settings(key,value) VALUES('auth_password_must_change','false') ON CONFLICT(key) DO UPDATE SET value=excluded.value"); con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth","Password changed")); con.commit(); con.close()
+    _revoke_auth_sessions()
+    token,expires=_create_auth_session()
+    _set_auth_cookie(response,token,request)
+    return {"changed":True,"expires_at":expires}
+
+
+@app.put("/api/auth/email")
+def auth_bind_email(payload: AuthEmailIn, request: Request):
+    _require_password_session(request)
+    if not _password_matches(payload.password,_auth_setting("auth_password_hash","") ):
+        raise HTTPException(401,"Пароль неверный")
+    con=db(); con.execute("INSERT INTO settings(key,value) VALUES('auth_email',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(payload.email,)); con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth","Recovery email bound")); con.commit(); con.close()
+    return {"email":_masked_email(payload.email),"recovery_available":_smtp_ready()}
+
+
+@app.post("/api/auth/recovery/request")
+def auth_recovery_request(payload: AuthRecoveryRequestIn, request: Request):
+    if not PASSWORD_AUTH_ENABLED:
+        raise HTTPException(409,"Парольный вход отключён администратором")
+    email=_auth_setting("auth_email","")
+    # Do not reveal whether a different address is bound.
+    if not email or not hmac.compare_digest(email,payload.email):
+        return {"accepted":True,"message":"Если адрес привязан, код отправлен."}
+    if not _smtp_ready():
+        raise HTTPException(503,"SMTP не настроен. Войдите локально и настройте почту/SMTP.")
+    if not _allow_auth_attempt(request):
+        raise HTTPException(429,"Слишком много запросов. Повторите через 10 минут.")
+    code=f"{secrets.randbelow(1_000_000):06d}"
+    expires=(datetime.now(TZ)+timedelta(minutes=AUTH_RECOVERY_MINUTES)).isoformat(timespec="seconds")
+    recovery_id=uuid.uuid4().hex
+    con=db()
+    try:
+        con.execute("DELETE FROM auth_recovery_codes WHERE email=?",(email,))
+        con.execute("INSERT INTO auth_recovery_codes(id,email,code_hash,created_at,expires_at,attempts,used_at) VALUES(?,?,?,?,?,?,?)",(recovery_id,email,hashlib.sha256(code.encode()).hexdigest(),now_iso(),expires,0,""))
+        con.commit()
+    finally:
+        con.close()
+    try:
+        _send_recovery_email(email,code)
+    except Exception as exc:
+        con=db(); con.execute("DELETE FROM auth_recovery_codes WHERE id=?",(recovery_id,)); con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"ERROR","auth",f"Recovery email failed: {type(exc).__name__}")); con.commit(); con.close()
+        raise HTTPException(502,"Не удалось отправить письмо с кодом") from exc
+    con=db(); con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth","Password recovery code sent")); con.commit(); con.close()
+    return {"accepted":True,"message":f"Код отправлен. Он действует {AUTH_RECOVERY_MINUTES} минут."}
+
+
+@app.post("/api/auth/recovery/verify")
+def auth_recovery_verify(payload: AuthRecoveryVerifyIn, request: Request, response: Response):
+    if not PASSWORD_AUTH_ENABLED:
+        raise HTTPException(409,"Парольный вход отключён администратором")
+    email=_auth_setting("auth_email","")
+    if not email or not hmac.compare_digest(email,payload.email):
+        raise HTTPException(400,"Код недействителен или истёк")
+    con=db()
+    try:
+        row=con.execute("SELECT id,code_hash,expires_at,attempts FROM auth_recovery_codes WHERE email=? AND used_at='' ORDER BY created_at DESC LIMIT 1",(email,)).fetchone()
+        if not row or str(row[2])<=now_iso() or int(row[3])>=5:
+            raise HTTPException(400,"Код недействителен или истёк")
+        actual=hashlib.sha256(payload.code.encode()).hexdigest()
+        if not hmac.compare_digest(actual,str(row[1])):
+            con.execute("UPDATE auth_recovery_codes SET attempts=attempts+1 WHERE id=?",(row[0],)); con.commit()
+            raise HTTPException(400,"Код недействителен или истёк")
+        con.execute("UPDATE auth_recovery_codes SET used_at=? WHERE id=?",(now_iso(),row[0]))
+        con.execute("INSERT INTO settings(key,value) VALUES('auth_password_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(_hash_password(payload.new_password),))
+        con.execute("INSERT INTO settings(key,value) VALUES('auth_password_must_change','false') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth","Password reset by recovery code"))
+        con.commit()
+    finally:
+        con.close()
+    _revoke_auth_sessions()
+    token,expires=_create_auth_session()
+    _set_auth_cookie(response,token,request)
+    return {"reset":True,"expires_at":expires}
+
 
 def safe_camera_error(value: str) -> str:
     """Keep diagnostic text useful without exposing RTSP credentials."""

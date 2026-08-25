@@ -131,6 +131,8 @@ def test_compose_and_environment_are_consistent():
     assert 'healthcheck' in compose['services']['api']
     assert compose['services']['api']['environment']['VIDEOANALYTICS_DB'] == '/app/data/videoanalytics.db'
     assert compose['services']['api']['environment']['MODEL_UPLOAD_MAX_BYTES'] == '${MODEL_UPLOAD_MAX_BYTES:-2000000000}'
+    assert compose['services']['api']['environment']['ZMK_PASSWORD_AUTH'] == '${ZMK_PASSWORD_AUTH:-true}'
+    assert compose['services']['api']['environment']['ZMK_BOT_API_TOKEN_FILE'] == '/bot-tokens/.api-token'
     assert compose['services']['api']['ports'] == ['127.0.0.1:8000:8000']
     # Both messenger workers stay available and idle safely until the Admin → Боты
     # control plane enables a provider; this makes UI toggles real without Docker CLI use.
@@ -146,10 +148,13 @@ def test_compose_and_environment_are_consistent():
     assert 'bot-token-data:/bot-tokens' in compose['services']['api']['volumes']
     for service in ('telegram-bot', 'max-bot'):
         assert compose['services'][service]['environment']['ZMK_BOT_TOKEN_DIR'] == '/bot-secrets'
+        assert compose['services'][service]['environment']['ZMK_BOT_API_TOKEN_FILE'] == '/bot-secrets/.api-token'
         assert 'bot-token-data:/bot-secrets:ro' in compose['services'][service]['volumes']
     assert 'bot-token-data' in compose['volumes']
     assert 'profiles' not in compose['services']['training-worker']
     assert compose['services']['training-worker']['build'] == './services/training_worker'
+    assert compose['services']['training-worker']['environment']['ZMK_BOT_API_TOKEN_FILE'] == '/bot-secrets/.api-token'
+    assert 'bot-token-data:/bot-secrets:ro' in compose['services']['training-worker']['volumes']
     assert compose['services']['api']['environment']['TRAINING_WORKER_URL'] == '${TRAINING_WORKER_URL:-http://training-worker:8010}'
     assert compose['services']['inference-worker']['profiles'] == ['inference']
     assert compose['services']['inference-worker']['build'] == './services/inference_worker'
@@ -163,7 +168,7 @@ def test_compose_and_environment_are_consistent():
     lines = [x for x in (ROOT/'.env.example').read_text().splitlines() if x and not x.startswith('#')]
     keys = [x.split('=',1)[0] for x in lines]
     assert len(keys) == len(set(keys))
-    assert {'MESSENGER_PROVIDER','ZMK_API_KEY','TELEGRAM_BOT_TOKEN','MAX_BOT_TOKEN','MAX_ADMIN_IDS','MODEL_UPLOAD_MAX_BYTES','POSTGRES_PASSWORD','MINIO_ROOT_PASSWORD'} <= set(keys)
+    assert {'MESSENGER_PROVIDER','ZMK_API_KEY','ZMK_PASSWORD_AUTH','ZMK_INITIAL_PASSWORD','SMTP_HOST','TELEGRAM_BOT_TOKEN','MAX_BOT_TOKEN','MAX_ADMIN_IDS','MODEL_UPLOAD_MAX_BYTES','POSTGRES_PASSWORD','MINIO_ROOT_PASSWORD'} <= set(keys)
 
 
 def test_release_contains_installation_assets():

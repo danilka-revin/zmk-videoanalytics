@@ -58,3 +58,10 @@ def test_camera_keyboard_and_snapshot_delivery(monkeypatch):
     asyncio.run(bot_main._send_camera_snapshot(message, "cam_01"))
     assert message.photos
     assert "Проходная" in message.photos[0][1]["caption"]
+
+
+def test_bot_api_token_reads_private_mount(tmp_path, monkeypatch):
+    token_file=tmp_path/'api-token'
+    token_file.write_text('service-token\n',encoding='utf-8')
+    monkeypatch.setenv('ZMK_BOT_API_TOKEN_FILE',str(token_file))
+    assert bot_main._bot_api_token()=='service-token'

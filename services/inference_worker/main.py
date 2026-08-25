@@ -476,7 +476,9 @@ class Runtime:
         return await self._request("GET", path, internal=internal)
 
     async def post(self, path: str, data: dict[str, Any]) -> Any:
-        return await self._request("POST", path, data)
+        # Detection ingestion is worker-only even though it lives outside the
+        # /api/internal namespace; browser password sessions must not block it.
+        return await self._request("POST", path, data, internal=path.startswith("/api/inference/"))
 
     async def post_internal(self, path: str, data: dict[str, Any]) -> Any:
         return await self._request("POST", path, data, internal=True)

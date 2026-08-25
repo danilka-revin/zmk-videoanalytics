@@ -39,6 +39,14 @@ def bot_token() -> str:
     return _managed_token() or os.getenv("MAX_BOT_TOKEN", "").strip() or TOKEN.strip()
 
 
+def _bot_api_token() -> str:
+    path=Path(os.getenv("ZMK_BOT_API_TOKEN_FILE", "")) if os.getenv("ZMK_BOT_API_TOKEN_FILE") else (Path(os.getenv("ZMK_BOT_TOKEN_DIR", "")) / ".api-token" if os.getenv("ZMK_BOT_TOKEN_DIR") else Path("/bot-secrets/.api-token"))
+    try:
+        return path.read_text(encoding="utf-8").strip() if path.is_file() else ""
+    except OSError:
+        return ""
+
+
 def _ids(value: str) -> set[int]:
     result=set()
     for token in value.replace(";", ",").replace("\n", ",").split(","):
@@ -111,6 +119,8 @@ async def guard(event: MessageCreated, minimum: str = "viewer") -> bool:
 async def api(method: str, path: str, **kwargs: Any) -> Any:
     attempts = 3 if method.upper() == "GET" else 1
     headers = {"X-API-Key": API_KEY} if API_KEY else {}
+    service_token=_bot_api_token()
+    if service_token: headers["X-Bot-Service-Token"]=service_token
     async with httpx.AsyncClient(base_url=API_URL, headers=headers, timeout=15) as client:
         for attempt in range(attempts):
             try:

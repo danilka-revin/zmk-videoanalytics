@@ -16,3 +16,5 @@ htmlcov/
 .zmk-profiles
 .live-data/
 .worker-token
+
+.bot-api-token
