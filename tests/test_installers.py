@@ -8,27 +8,52 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_linux_installers_pass_shell_parser_and_dry_check():
-    scripts = [ROOT/'installers/install-linux.sh', ROOT/'installers/uninstall-linux.sh', ROOT/'installers/wizard.sh', ROOT/'start.sh']
+    scripts = [ROOT/'installers/bootstrap-linux.sh', ROOT/'installers/install-linux.sh', ROOT/'installers/uninstall-linux.sh', ROOT/'installers/wizard.sh', ROOT/'start.sh']
     subprocess.run(['bash','-n',*[str(x) for x in scripts]], check=True)
-    result = subprocess.run(['bash',str(scripts[0]),'--check'], cwd=ROOT, text=True, capture_output=True, check=False)
+    result = subprocess.run(['bash',str(ROOT/'installers/install-linux.sh'),'--check'], cwd=ROOT, text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
     assert 'Installer validation: OK' in result.stdout
+    bootstrap = subprocess.run(['bash',str(ROOT/'installers/bootstrap-linux.sh'),'--check'], cwd=ROOT, text=True, capture_output=True, check=False)
+    assert bootstrap.returncode == 0, bootstrap.stderr
+    assert 'bootstrap launcher: OK' in bootstrap.stdout
     # The config wizard lives in its own shared file sourced by both the
     # installer and start.sh, so the messenger/token/profile logic is there.
     wizard = (ROOT/'installers/wizard.sh').read_text()
-    for needle in ['MESSENGER_PROVIDER', 'MAX_BOT_TOKEN', '--profile max', '--profile telegram', 'run_config']:
+    for needle in ['MESSENGER_PROVIDER', 'MAX_BOT_TOKEN', 'Admin → Боты', 'run_config']:
         assert needle in wizard
+    assert 'set_env MAX_BOT_TOKEN ""' not in wizard
+    assert 'set_env TELEGRAM_BOT_TOKEN ""' not in wizard
     # start.sh must source the wizard and provide --setup / first-run path.
     start = (ROOT/'start.sh').read_text()
     assert 'installers/wizard.sh' in start and 'run_config' in start and '--setup' in start
     assert '.zmk-profiles' in start
 
 
+def test_bootstrap_launcher_and_rtsp_wizard_escape_credentials(tmp_path):
+    bootstrap = (ROOT/'installers/bootstrap-linux.sh').read_text()
+    for required in ['git clone', 'ZMK_REF', 'ZMK_INSTALL_DIR', 'zmk-vision', '/dev/tty', 'NONINTERACTIVE=1', 'ENABLE_INFERENCE=true']:
+        assert required in bootstrap
+
+    # An RTSP password may include & or |. The wizard must preserve it rather
+    # than interpreting it as a sed replacement expression.
+    (tmp_path/'.env').write_text((ROOT/'.env.example').read_text())
+    value = 'rtsp://admin:p&ss|word!@192.0.2.10:554/stream'
+    result = subprocess.run(
+        ['bash', '-c', 'source "$1"; set_env RTSP_CAM_01 "$VALUE"; grep "^RTSP_CAM_01=" .env', '_', str(ROOT/'installers/wizard.sh')],
+        cwd=tmp_path,
+        env={**__import__('os').environ, 'VALUE': value},
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert result.stdout.strip() == f'RTSP_CAM_01={value}'
+
+
 def test_windows_wrapper_and_powershell_structure():
     bat = (ROOT/'installers/install-windows.bat').read_text()
     ps = (ROOT/'installers/install-windows.ps1').read_text()
     assert 'install-windows.ps1' in bat and '%*' in bat
-    for required in ['param(', 'Assert-ProjectFiles', 'docker compose', 'Wait-Http', 'config --quiet', '--remove-orphans', 'MESSENGER_PROVIDER', 'MAX_BOT_TOKEN', 'ENABLE_TRAINING', 'TRAINING_WORKER_URL']:
+    for required in ['param(', 'Assert-ProjectFiles', 'docker compose', 'Wait-Http', 'config --quiet', '--remove-orphans', 'MESSENGER_PROVIDER', 'MAX_BOT_TOKEN', 'TRAINING_WORKER_URL']:
         assert required in ps
     # Lightweight delimiter guard for environments where pwsh is unavailable.
     clean = re.sub(r'(?s)<#.*?#>|#.*', '', ps)
@@ -49,16 +74,24 @@ def test_compose_and_environment_are_consistent():
     assert 'healthcheck' in compose['services']['api']
     assert compose['services']['api']['environment']['VIDEOANALYTICS_DB'] == '/app/data/videoanalytics.db'
     assert compose['services']['api']['ports'] == ['127.0.0.1:8000:8000']
-    assert compose['services']['telegram-bot']['profiles'] == ['telegram']
-    assert compose['services']['max-bot']['profiles'] == ['max']
+    # Both messenger workers stay available and idle safely until the Admin → Боты
+    # control plane enables a provider; this makes UI toggles real without Docker CLI use.
+    assert 'profiles' not in compose['services']['telegram-bot']
+    assert 'profiles' not in compose['services']['max-bot']
+    assert compose['services']['telegram-bot']['restart'] == 'unless-stopped'
+    assert compose['services']['max-bot']['restart'] == 'unless-stopped'
     assert compose['services']['max-bot']['build'] == './services/max_bot'
-    assert compose['services']['training-worker']['profiles'] == ['training']
+    assert compose['services']['api']['environment']['MAX_BOT_TOKEN'] == '${MAX_BOT_TOKEN:-}'
+    assert 'profiles' not in compose['services']['training-worker']
     assert compose['services']['training-worker']['build'] == './services/training_worker'
+    assert compose['services']['api']['environment']['TRAINING_WORKER_URL'] == '${TRAINING_WORKER_URL:-http://training-worker:8010}'
     assert compose['services']['inference-worker']['profiles'] == ['inference']
     assert compose['services']['inference-worker']['build'] == './services/inference_worker'
     assert 'RUN nginx -t' in (ROOT/'frontend/Dockerfile').read_text()
     nginx = (ROOT/'frontend/nginx.conf').read_text()
     assert 'set $api_upstream http://api:8000' in nginx and 'proxy_pass $api_upstream' in nginx
+    assert "img-src 'self' data: blob:" in nginx
+    assert '/mjpeg$' in nginx and 'proxy_buffering off' in nginx
     assert 'location ^~ /telegram' in nginx and 'https://web.telegram.org' in nginx
     lines = [x for x in (ROOT/'.env.example').read_text().splitlines() if x and not x.startswith('#')]
     keys = [x.split('=',1)[0] for x in lines]

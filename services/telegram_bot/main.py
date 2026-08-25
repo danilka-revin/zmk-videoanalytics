@@ -5,6 +5,7 @@ import asyncio
 import html
 import logging
 import os
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
@@ -29,24 +30,52 @@ TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 API_URL = os.getenv("ZMK_API_URL", "http://api:8000").rstrip("/")
 WEBAPP_URL = os.getenv("TELEGRAM_WEBAPP_URL", "http://localhost:5173/telegram")
 API_KEY = os.getenv("ZMK_API_KEY", "")
-ADMINS = {int(x) for x in os.getenv("TELEGRAM_ADMIN_IDS", "").split(",") if x.strip().isdigit()}
-OPERATORS = {int(x) for x in os.getenv("TELEGRAM_OPERATOR_IDS", "").split(",") if x.strip().isdigit()}
-VIEWERS = {int(x) for x in os.getenv("TELEGRAM_VIEWER_IDS", "").split(",") if x.strip().isdigit()}
-router = Router()
+def _ids(value: str) -> set[int]:
+    result=set()
+    for token in value.replace(";", ",").replace("\n", ",").split(","):
+        token=token.strip()
+        if token and token.lstrip("-").isdigit(): result.add(int(token))
+    return result
 
+ADMINS = _ids(os.getenv("TELEGRAM_ADMIN_IDS", ""))
+OPERATORS = _ids(os.getenv("TELEGRAM_OPERATOR_IDS", ""))
+VIEWERS = _ids(os.getenv("TELEGRAM_VIEWER_IDS", ""))
+
+@dataclass
+class RuntimeConfig:
+    enabled: bool = False
+    alerts_enabled: bool = False
+    alert_min_severity: str = "high"
+    admins: set[int] = field(default_factory=lambda: set(ADMINS))
+    operators: set[int] = field(default_factory=lambda: set(OPERATORS))
+    viewers: set[int] = field(default_factory=lambda: set(VIEWERS))
+    alert_recipients: set[int] = field(default_factory=set)
+    webapp_url: str = ""
+
+RUNTIME = RuntimeConfig()
+router = Router()
 ROLE_LEVEL = {"denied": 0, "viewer": 1, "operator": 2, "admin": 3}
+SEVERITY_LEVEL = {"low": 1, "medium": 2, "high": 3, "critical": 4}
+
 def role_for(user_id: int) -> str:
-    if user_id in ADMINS: return "admin"
-    if user_id in OPERATORS: return "operator"
-    if user_id in VIEWERS: return "viewer"
+    if user_id in RUNTIME.admins: return "admin"
+    if user_id in RUNTIME.operators: return "operator"
+    if user_id in RUNTIME.viewers: return "viewer"
     return "denied"
 def allowed(user_id: int, minimum: str = "viewer") -> bool:
     return ROLE_LEVEL[role_for(user_id)] >= ROLE_LEVEL[minimum]
 
+def alert_recipients() -> set[int]:
+    return set(RUNTIME.alert_recipients) or (set(RUNTIME.admins) | set(RUNTIME.operators))
+def should_alert(event: dict[str, Any]) -> bool:
+    threshold=SEVERITY_LEVEL.get(RUNTIME.alert_min_severity, SEVERITY_LEVEL["high"])
+    return RUNTIME.alerts_enabled and SEVERITY_LEVEL.get(str(event.get("severity", "")), 0) >= threshold
+
 def menu(user_id: int) -> InlineKeyboardMarkup:
     rows = []
-    if WEBAPP_URL.startswith("https://"):
-        rows.append([InlineKeyboardButton(text="📊 Открыть ZMK Mini App", web_app=WebAppInfo(url=WEBAPP_URL))])
+    webapp_url=RUNTIME.webapp_url or WEBAPP_URL
+    if webapp_url.startswith("https://"):
+        rows.append([InlineKeyboardButton(text="📊 Открыть ZMK Mini App", web_app=WebAppInfo(url=webapp_url))])
     rows += [
         [InlineKeyboardButton(text="🟢 Статус", callback_data="status"), InlineKeyboardButton(text="📷 Камеры", callback_data="cameras")],
         [InlineKeyboardButton(text="🚨 События", callback_data="events"), InlineKeyboardButton(text="🧾 Ошибки", callback_data="errors")],
@@ -84,6 +113,7 @@ def event_text(e: dict[str, Any]) -> str:
     return f"• <b>{html.escape(labels.get(e['type'],e['type']))}</b> · {html.escape(str(e.get('camera_name',e['camera_id'])))} · {round(e['confidence']*100)}% · {html.escape(str(e['severity']))}"
 
 async def guard(message: Message, minimum: str = "viewer") -> bool:
+    if not RUNTIME.enabled: return False
     uid = message.from_user.id if message.from_user else 0
     if allowed(uid, minimum): return True
     await message.answer(f"⛔ Ваш Telegram ID не включён в белый список.\nID: <code>{uid}</code>")
@@ -196,6 +226,7 @@ async def health_cmd(message: Message):
 
 @router.callback_query(F.data.in_({"status","cameras","events","errors","models","health","report"}))
 async def callbacks(query: CallbackQuery):
+    if not RUNTIME.enabled: await query.answer("Бот отключён оператором",show_alert=True); return
     if not query.from_user or not allowed(query.from_user.id): await query.answer("Нет доступа",show_alert=True); return
     if query.data in {"errors","report"} and not allowed(query.from_user.id,"operator"): await query.answer("Нужна роль operator",show_alert=True); return
     await query.answer(); message=query.message
@@ -213,22 +244,77 @@ async def callbacks(query: CallbackQuery):
     elif query.data=="report":
         content=await api("GET","/api/reports/events.csv"); await message.answer_document(BufferedInputFile(content,filename=f"zmk-events-{datetime.now(timezone.utc):%Y%m%d}.csv"))
 
+async def _complete_command(command_id: int, status: str, error: str = "") -> None:
+    await api("POST",f"/api/bots/telegram/commands/{command_id}/complete",json={"status":status,"error":error[:300]})
+
+async def _send_test_alert(bot: Bot, text: str) -> tuple[bool, str]:
+    recipients=alert_recipients()
+    if not recipients: return False, "Не настроены получатели теста"
+    failures=[]
+    for chat_id in recipients:
+        try: await bot.send_message(chat_id, f"✅ <b>ZMK Vision</b>\n{text}")
+        except Exception as exc:  # noqa: BLE001 - messenger SDK exposes heterogeneous transport errors
+            failures.append(f"{chat_id}: {type(exc).__name__}")
+    return (not failures, "; ".join(failures))
+
+async def runtime_worker(bot: Bot):
+    """Apply Admin → Bots settings without a container restart and execute safe commands."""
+    while True:
+        try:
+            config=await api("GET","/api/bots/telegram/runtime")
+            RUNTIME.enabled=bool(config.get("enabled"))
+            RUNTIME.alerts_enabled=bool(config.get("alerts_enabled"))
+            RUNTIME.alert_min_severity=str(config.get("alert_min_severity") or "high")
+            RUNTIME.admins={int(x) for x in config.get("admin_ids",[]) }
+            RUNTIME.operators={int(x) for x in config.get("operator_ids",[]) }
+            RUNTIME.viewers={int(x) for x in config.get("viewer_ids",[]) }
+            RUNTIME.alert_recipients={int(x) for x in config.get("alert_recipients",[]) }
+            RUNTIME.webapp_url=str(config.get("webapp_url") or "")
+            status="active" if RUNTIME.enabled else "disabled"
+            detail="Управляется из Admin панели" if RUNTIME.enabled else "Отключён оператором в Admin панели"
+            await api("POST","/api/bots/telegram/heartbeat",json={"status":status,"detail":detail,"enabled":RUNTIME.enabled})
+            if RUNTIME.enabled:
+                commands=await api("GET","/api/bots/telegram/commands")
+                for command in commands.get("commands",[]):
+                    if command.get("action")!="test_alert":
+                        await _complete_command(int(command["id"]),"failed","Неизвестная команда")
+                        continue
+                    try:
+                        ok,error=await _send_test_alert(bot,str(command.get("payload",{}).get("text") or "Тестовое сообщение"))
+                        await _complete_command(int(command["id"]),"completed" if ok else "failed",error)
+                    except Exception as exc:
+                        log.exception("Test alert failed")
+                        await _complete_command(int(command["id"]),"failed",type(exc).__name__)
+        except Exception:
+            log.exception("Runtime configuration refresh failed")
+            try: await api("POST","/api/bots/telegram/heartbeat",json={"status":"api_unavailable","detail":"Не удалось получить настройки Admin панели","enabled":RUNTIME.enabled})
+            except Exception:
+                log.debug("Could not report Telegram API-unavailable heartbeat",exc_info=True)
+        await asyncio.sleep(4)
+
 async def alert_worker(bot: Bot):
-    """Push newly received critical events to operators without acknowledging them."""
+    """Push newly received configured-severity events without acknowledging them."""
     last_id=0
     while True:
         try:
             events=await api("GET","/api/events?limit=50")
             if last_id==0: last_id=max((e["id"] for e in events),default=0)
-            fresh=[e for e in events if e["id"]>last_id and e["severity"] in {"critical","high"}]
+            fresh=[e for e in events if e["id"]>last_id and RUNTIME.enabled and should_alert(e)]
             for event in reversed(fresh):
                 text="🚨 <b>Новое событие ZMK Vision</b>\n"+event_text(event)+f"\nID: <code>{event['id']}</code>"
-                for chat_id in ADMINS|OPERATORS:
+                for chat_id in alert_recipients():
                     try: await bot.send_message(chat_id,text)
                     except Exception: log.exception("Alert delivery failed: chat_id=%s",chat_id)
             last_id=max([last_id]+[e["id"] for e in events])
         except Exception: log.exception("Alert worker iteration failed")
         await asyncio.sleep(5)
+
+async def wait_for_token():
+    while True:
+        try: await api("POST","/api/bots/telegram/heartbeat",json={"status":"waiting_token","detail":"TELEGRAM_BOT_TOKEN не задан на сервере","enabled":False})
+        except Exception:
+            log.debug("Could not report Telegram waiting-token heartbeat",exc_info=True)
+        await asyncio.sleep(15)
 
 @router.errors()
 async def telegram_error(event: ErrorEvent):
@@ -241,14 +327,20 @@ async def telegram_error(event: ErrorEvent):
     return True
 
 async def main():
-    if not TOKEN: raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
+    if not TOKEN:
+        log.warning("TELEGRAM_BOT_TOKEN is not configured; service stays ready for Admin status only")
+        await wait_for_token()
+        return
     if not (WEBAPP_URL.startswith(("https://","http://localhost"))): raise RuntimeError("TELEGRAM_WEBAPP_URL must use HTTPS")
-    if not (ADMINS or OPERATORS or VIEWERS): log.warning("Telegram whitelist is empty; all users will be denied")
+    if not (ADMINS or OPERATORS or VIEWERS): log.warning("Telegram whitelist is empty; configure roles in Admin → Боты")
     bot=Bot(TOKEN,default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp=Dispatcher(); dp.include_router(router)
-    log.info("Starting bot; API=%s; admins=%d operators=%d viewers=%d",API_URL,len(ADMINS),len(OPERATORS),len(VIEWERS))
+    log.info("Starting bot; API=%s",API_URL)
+    runtime=asyncio.create_task(runtime_worker(bot))
     alerts=asyncio.create_task(alert_worker(bot))
     try: await dp.start_polling(bot,allowed_updates=dp.resolve_used_update_types())
-    finally: alerts.cancel()
+    finally:
+        runtime.cancel(); alerts.cancel()
+        await asyncio.gather(runtime,alerts,return_exceptions=True)
 
 if __name__=="__main__": asyncio.run(main())

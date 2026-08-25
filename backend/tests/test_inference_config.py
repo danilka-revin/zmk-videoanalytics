@@ -1,5 +1,7 @@
-from app.main import app
+from app import main
 from fastapi.testclient import TestClient
+
+app = main.app
 
 
 def active_model(client):
@@ -48,3 +50,52 @@ def test_user_rbac_safety():
         assert {x['role'] for x in users.json()} >= {'admin','operator','viewer'}
         admin = next(x for x in users.json() if x['role'] == 'admin')
         assert c.patch(f"/api/admin/users/{admin['id']}/toggle").status_code == 409
+
+
+def test_bulk_acknowledgement_preserves_operator_note():
+    with TestClient(app) as c:
+        pending = [event for event in c.get('/api/events?limit=10').json() if not event['acknowledged']][:2]
+        assert len(pending) == 2
+        ids = [event['id'] for event in pending]
+        result = c.post('/api/events/ack-bulk', json={'event_ids': ids, 'note': 'Проверено сменным мастером'})
+        assert result.status_code == 200, result.text
+        assert set(result.json()['acknowledged_ids']) == set(ids)
+        events = {event['id']: event for event in c.get('/api/events?limit=100').json()}
+        assert all(events[event_id]['acknowledged'] == 1 for event_id in ids)
+        assert all(events[event_id]['note'] == 'Проверено сменным мастером' for event_id in ids)
+        assert all(events[event_id]['review_status'] == 'accepted' for event_id in ids)
+        assert c.post('/api/events/ack-bulk', json={'event_ids': [], 'note': ''}).status_code == 422
+
+
+def test_event_csv_export_respects_server_side_filters():
+    with TestClient(app) as c:
+        con = main.db()
+        con.execute(
+            "INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id,acknowledged,note) VALUES(?,?,?,?,?,?,?,?)",
+            (main.now_iso(), 'cam_01', 'smoking', 'high', .95, 'CSV-FILTER', 0, ''),
+        )
+        con.commit(); con.close()
+        response = c.get('/api/reports/events.csv?event_type=smoking&camera_id=cam_01&q=CSV-FILTER')
+        assert response.status_code == 200
+        assert 'smoking' in response.text
+        assert 'no_helmet' not in response.text
+
+
+
+def test_event_can_be_rejected_individually_or_in_bulk():
+    with TestClient(app) as c:
+        pending = [event for event in c.get('/api/events?limit=10').json() if event['review_status'] == 'pending']
+        assert len(pending) >= 2
+        first, second = pending[:2]
+        single = c.post(f"/api/events/{first['id']}/reject", json={'note': 'Ложное срабатывание'})
+        assert single.status_code == 200, single.text
+        assert single.json()['review_status'] == 'rejected'
+        bulk = c.post('/api/events/reject-bulk', json={'event_ids': [second['id']], 'note': 'Работы по обслуживанию'})
+        assert bulk.status_code == 200, bulk.text
+        assert bulk.json()['rejected_ids'] == [second['id']]
+        events = {event['id']: event for event in c.get('/api/events?limit=100').json()}
+        assert events[first['id']]['review_status'] == 'rejected'
+        assert events[first['id']]['acknowledged'] == 1
+        assert events[first['id']]['note'] == 'Ложное срабатывание'
+        assert events[second['id']]['review_status'] == 'rejected'
+        assert events[second['id']]['note'] == 'Работы по обслуживанию'

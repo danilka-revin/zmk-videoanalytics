@@ -313,10 +313,10 @@ TELEGRAM_OPERATOR_IDS=111111111,222222222
 
 ## 17. Запуск Telegram-бота
 
-Windows или Linux:
+Windows или Linux: запустите обычный стек, затем включите Telegram в **Админ → Боты**.
 
 ```bash
-docker compose --profile telegram up -d --build
+./start.sh
 ```
 
 Проверить лог:
@@ -364,10 +364,10 @@ MAX_OPERATOR_IDS=
 MAX_VIEWER_IDS=
 ```
 
-5. Запустите:
+5. Запустите обычный стек, затем включите MAX в **Админ → Боты**:
 
 ```bash
-docker compose --profile max up -d --build
+./start.sh
 ```
 
 Бот MAX поддерживает состояние системы, камеры, события, логи, CSV-отчёты, модели, hot-swap, thresholds, обучение, отмену обучения и тестовые тревоги.
@@ -380,7 +380,7 @@ docker compose --profile max up -d --build
 0 — без бота
 ```
 
-Одновременно запускается только выбранный bot-сервис. Для автоматической установки без вопросов используйте `MESSENGER_PROVIDER=telegram`, `MESSENGER_PROVIDER=max` или `MESSENGER_PROVIDER=none`.
+Оба bot-сервиса запускаются в безопасном режиме ожидания. В Admin → Боты включаются провайдеры, задаются роли, получатели, политика push и тест доставки. `MESSENGER_PROVIDER` остаётся только подсказкой для первичной настройки.
 
 Официальная документация MAX Bot API: https://dev.max.ru/docs-api/
 
@@ -440,7 +440,7 @@ CORS_ORIGINS=https://vision.example.ru
 RTSP_CAM_01=rtsp://user:password@192.168.1.50:554/stream
 ```
 
-Используйте только `rtsp://` или `rtsps://`.
+Используйте только `rtsp://` или `rtsps://`. При первом запуске с пустой базой заданный `RTSP_CAM_01` автоматически создаёт включённую камеру «Камера 01». Если камеры добавляются через web-панель, оставьте переменную пустой, чтобы не создавать её автоматически.
 
 Проверьте поток в VLC:
 
@@ -450,6 +450,8 @@ RTSP_CAM_01=rtsp://user:password@192.168.1.50:554/stream
 4. убедитесь, что видео воспроизводится.
 
 RTSP-пароли не возвращаются через API списка камер, но всё равно должны храниться только в `.env` или secrets.
+
+После запуска worker обязан написать в логи строку `inference: camera runtime started`. Далее будет одна из понятных причин: камера открыта по TCP/UDP, отсутствует активная модель (это **не мешает** просмотру камеры), не получена включённая камера из API, либо RTSP-подключение не удалось. Для повторного открытия потока используйте кнопку **«Перезапустить»** в карточке камеры — перезапускать весь Docker-стек не нужно.
 
 ---
 
@@ -641,16 +643,14 @@ bash installers/uninstall-linux.sh --purge
 
 # Часть J. Реальное автодообучение
 
-Для обучения установите NVIDIA Driver и NVIDIA Container Toolkit. В `.env` задайте:
-
-```env
-TRAINING_WORKER_URL=http://training-worker:8010
-```
-
-Запустите:
+`training-worker` запускается всегда вместе с проектом. На CPU он доступен сразу; NVIDIA Driver и NVIDIA Container Toolkit нужны только для ускорения на GPU:
 
 ```bash
-docker compose --profile training up -d --build
+# CPU fallback
+docker compose up -d --build
+
+# GPU-режим
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 ```
 
 Добавьте RTSP-камеру, передайте ей статус `online` через ingestion telemetry, зарегистрируйте активную модель или используйте YOLO11n, затем откройте **Модели → Обучение**. Worker захватит кадры, выполнит псевдоразметку, создаст train/val, обучит YOLO11n и экспортирует ONNX. При недостатке кадров, объектов или CUDA задача завершится ошибкой с реальной причиной.
@@ -677,17 +677,13 @@ PostgreSQL, Redis и MinIO в production-профиле являются под�
 docker compose up -d --build
 ```
 
-Запуск с Telegram:
+Управление Telegram и MAX:
 
-```bash
-docker compose --profile telegram up -d --build
+```text
+Админ → Боты
 ```
 
-Запуск с MAX:
-
-```bash
-docker compose --profile max up -d --build
-```
+Обычный запуск стартует оба безопасных worker-сервиса; провайдеры включаются в панели.
 
 Проверка:
 

@@ -51,3 +51,20 @@ def test_telemetry_accepts_recovering_status():
         assert r.status_code==200, r.text
         item=next(x for x in c.get('/api/cameras').json() if x['id']==cid)
         assert item['status']=='recovering'
+
+
+def test_overview_analytics_has_real_buckets_breakdowns_and_csv_export():
+    with TestClient(app) as c:
+        analytics = c.get('/api/analytics/overview?hours=24&bucket=hour')
+        assert analytics.status_code == 200, analytics.text
+        body = analytics.json()
+        assert body['hours'] == 24 and body['bucket'] == 'hour'
+        assert body['totals']['events'] >= 24
+        assert len(body['buckets']) >= 24
+        assert body['totals']['pending'] >= 1
+        assert any(item['id'] == 'no_helmet' for item in body['types'])
+        assert any(item['id'] == 'pending' for item in body['review'])
+        report = c.get('/api/reports/analytics.csv?hours=24&bucket=hour')
+        assert report.status_code == 200
+        assert 'avg_confidence' in report.text and 'pending' in report.text
+        assert c.get('/api/analytics/overview?hours=0').status_code == 422

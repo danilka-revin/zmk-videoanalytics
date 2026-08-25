@@ -1,17 +1,18 @@
 # Реальное автодообучение по кадрам камеры
 
-Training profile использует NVIDIA GPU и Ultralytics YOLO.
+Постоянный `training-worker` использует Ultralytics YOLO и запускается вместе с базовым стеком.
 
 ## Запуск
 
 ```bash
-# .env
-TRAINING_WORKER_URL=http://training-worker:8010
+# CPU fallback — доступен на любом хосте
+docker compose up -d --build
 
-docker compose --profile training up -d --build
+# NVIDIA Driver + NVIDIA Container Toolkit установлены
+docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d --build
 ```
 
-Требуются NVIDIA Driver и NVIDIA Container Toolkit.
+При наличии NVIDIA Container Toolkit worker автоматически получает GPU. Без него сервис остаётся запущенным и доступным в панели в CPU fallback; обучение будет медленнее, но не требует ручного включения Compose profile.
 
 ## Pipeline
 
@@ -20,7 +21,7 @@ docker compose --profile training up -d --build
 3. Кадры выбираются с заданным FPS limit.
 4. Активная модель выполняет псевдоразметку. При отсутствии активной модели используется `yolo11n.pt`.
 5. Задача прекращается, если получено меньше 20 кадров или 10 кадров с объектами.
-6. `YOLO11n` проходит fine-tuning на фактически созданном dataset.
+6. Активные PyTorch-веса (например, PPE-модель каска/человек) проходят fine-tuning на фактически созданном dataset; если их нет или активен ONNX, используется `YOLO11n`.
 7. Лучшие веса сохраняются в persistent `model-data`.
 8. Модель экспортируется в динамический ONNX.
 9. Precision/Recall берутся из результата валидации, а не генерируются.

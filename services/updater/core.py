@@ -45,11 +45,23 @@ def current_version(root: Path) -> str:
     return "0.0.0"
 
 
+def _version_parts(value: str) -> tuple[int, int, int]:
+    """Return a tolerant three-part numeric version for release comparison."""
+    cleaned = re.sub(r"[^0-9.]", "", (value or ""))
+    pieces: list[int] = []
+    for part in cleaned.split("."):
+        if not part:
+            continue
+        pieces.append(int(part))
+        if len(pieces) == 3:
+            break
+    normalized = (pieces + [0, 0, 0])[:3]
+    return normalized[0], normalized[1], normalized[2]
+
+
 def version_lt(a: str, b: str) -> bool:
-    """Numeric semver comparison (a < b). Tolerates a leading 'v'."""
-    pa = tuple(int(x) for x in re.sub(r"[^0-9.]", "", (a or "")).split(".")[:3])
-    pb = tuple(int(x) for x in re.sub(r"[^0-9.]", "", (b or "")).split(".")[:3])
-    return pa < pb
+    """Numeric semver comparison (a < b), including short/malformed values."""
+    return _version_parts(a) < _version_parts(b)
 
 
 def latest_version(api_url: str, timeout: float = 20.0) -> str | None:
@@ -99,7 +111,11 @@ def download_and_verify(
     expected = _strip_sums(sums_path).get(f"{base}.tar.gz")
     if not expected:
         raise UpdateError(f"no checksum for {base}.tar.gz in SHA256SUMS.txt")
-    actual = hashlib.sha256(archive.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with archive.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    actual = digest.hexdigest()
     if actual != expected:
         raise UpdateError(f"SHA256 mismatch: expected {expected}, got {actual}")
     return archive
@@ -120,16 +136,17 @@ def extract_to_staging(archive: Path, work_dir: Path) -> Path:
 
     Members are validated for absolute/../ paths and links before being
     written, and each file is extracted individually (no extractall), which
-    avoids the unsafe tar-extraction pattern.
+    avoids the unsafe tar-extraction pattern. We validate members ourselves
+    instead of using TarFile's ``filter=`` argument so this works on Python
+    3.11 as well as the project's CI/runtime Python 3.12+.
     """
-    def id_filter(member: tarfile.TarInfo, _path: str) -> tarfile.TarInfo:  # identity
-        return member
-
+    work_dir.mkdir(parents=True, exist_ok=True)
     with tarfile.open(archive, "r:gz") as tar:
-        for member in tar.getmembers():
+        members = tar.getmembers()
+        for member in members:
             _safe_member(member)
-        for member in tar.getmembers():
-            tar.extract(_safe_member(member), work_dir, filter=id_filter)
+        for member in members:
+            tar.extract(member, path=work_dir)
     candidates = [p for p in work_dir.iterdir() if p.is_dir() and (p / "VERSION").is_file()]
     if not candidates:
         raise UpdateError("archive has no project directory with VERSION")
@@ -239,7 +256,11 @@ def apply_update(
 
     import tempfile
 
-    with tempfile.TemporaryDirectory(prefix="zmk-upd-") as td:
+    temp_options: dict[str, str] = {"prefix": "zmk-upd-"}
+    if work_dir is not None:
+        work_dir.mkdir(parents=True, exist_ok=True)
+        temp_options["dir"] = str(work_dir)
+    with tempfile.TemporaryDirectory(**temp_options) as td:
         work = Path(td)
         archive = download_and_verify(dl_base, latest, work / "dl")
         staged = extract_to_staging(archive, work / "ex")

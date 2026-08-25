@@ -15,12 +15,14 @@ import shutil
 import socket
 import sqlite3
 import tempfile
+import threading
 import time
 import uuid
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlparse
@@ -35,9 +37,14 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 
-APP_VERSION = "2.11.4"
+APP_VERSION = "2.12.0"
 TZ = timezone(timedelta(hours=7))
+CAMERA_TELEMETRY_STALE_SECONDS = 30
+HIGH_FPS_MODE = os.getenv("CAMERA_HIGH_FPS_MODE", "true").strip().lower() not in {"0","false","no","off"}
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
+# Event evidence is persisted beside the SQLite database by default. It is
+# populated only by the internal inference worker after a real event is accepted.
+EVENT_FRAME_DIR = Path(os.getenv("EVENT_FRAME_DIR", "")) if os.getenv("EVENT_FRAME_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
 STARTED = time.time()
 API_KEY = os.getenv("ZMK_API_KEY", "").strip()
@@ -45,6 +52,12 @@ try: RATE_LIMIT_PER_MINUTE = max(10,int(os.getenv("RATE_LIMIT_PER_MINUTE", "120"
 except ValueError: RATE_LIMIT_PER_MINUTE = 120
 _rate_buckets: dict[str, list[float]] = {}
 _training_tasks: dict[int,asyncio.Task] = {}
+_dataset_capture_tasks: dict[int,asyncio.Task] = {}
+# Latest live JPEG per camera. Persistent snapshots remain on disk; this
+# in-memory cache exists solely for the low-latency MJPEG browser stream.
+_live_frames: dict[str, tuple[int, float, bytes]] = {}
+_live_frames_lock = threading.Lock()
+_live_frame_sequence = 0
 MESSENGER_PROVIDER = os.getenv("MESSENGER_PROVIDER", "none").lower()
 if MESSENGER_PROVIDER not in {"none", "telegram", "max"}: MESSENGER_PROVIDER = "none"
 TRAINING_WORKER_URL = os.getenv("TRAINING_WORKER_URL", "").rstrip("/")
@@ -86,27 +99,36 @@ def provision_worker_token(token_file: Path, env_token: str | None = None) -> st
 
 WORKER_TOKEN = provision_worker_token(WORKER_TOKEN_FILE, os.getenv("ZMK_WORKER_TOKEN", ""))
 UPDATE_SERVICE_URL = os.getenv("UPDATE_SERVICE_URL", "").rstrip("/")
-# Catalog of ready-to-download pretrained models (real public weights).
-# Each entry has a real, checked download URL. These are COCO-pretrained
-# detectors, so they serve as a starting base for fine-tuning / preview, not
-# as production safety models (their class labels don't include the custom
-# safety classes, so no events fire until you train on your own labels).
-# metrics are intentionally null: they are not validated on safety data.
+# Catalog of ready-to-download pretrained models.  Generic COCO weights are
+# useful for fine-tuning, but COCO does not contain a safety-helmet class.  The
+# PPE entry below is an opt-in public YOLO11 baseline with person, helmet and
+# no-helmet labels.  It is deliberately marked as a *trial* model: it can be
+# explicitly enabled for an on-site check, but it never pretends to have local
+# validation metrics.
 MODEL_PRESETS = [
     {
         "id":"yolo11n","name":"yolo11n","format":"PyTorch","url":"https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11n.pt",
-        "size_bytes":5613764,"classes":80,"category":"starter","description":"Компактная базовая модель (5.4 МБ) — быстрый старт, подходит как отправная точка для дообучения на своих данных.",
-        "hint":"Скачается и зарегистрируется в реестре. Метрики не заданы — для активации обучите на своих данных или укажите метрики валидации.",
+        "size_bytes":5613764,"classes":80,"category":"starter","description":"Компактная базовая COCO-модель (5.4 МБ) — быстрый старт для дообучения на своих данных.",
+        "hint":"COCO знает класс person, но не знает защитную каску. Метрики не заданы — для активации обучите на своих данных или укажите метрики валидации.",
+    },
+    {
+        "id":"ppe-person-helmet-yolo11","name":"ppe-person-helmet-yolo11","format":"PyTorch",
+        # Pin the immutable Hugging Face revision containing the weights rather
+        # than downloading an arbitrary future revision from the `main` branch.
+        "url":"https://huggingface.co/melihuzunoglu/ppe-detection/resolve/4a4d54e425f82896f1717637603ec28553d7f91c/best.pt?download=true",
+        "source_url":"https://huggingface.co/melihuzunoglu/ppe-detection","size_bytes":5_750_000,"min_bytes":1_000_000,"classes":4,"category":"safety","trial_activation":True,
+        "description":"Готовая YOLO11 PPE-модель: человек, каска, без каски и жилет. Нарушение «без каски» привязывается к человеку.",
+        "hint":"Сторонняя стартовая модель для теста на ваших камерах. Перед промышленным использованием проверьте её на местных кадрах и дообучите на своём датасете.",
     },
     {
         "id":"yolov8n","name":"yolov8n","format":"PyTorch","url":"https://github.com/ultralytics/assets/releases/download/v8.3.0/yolov8n.pt",
         "size_bytes":6549796,"classes":80,"category":"base","description":"Базовая YOLOv8-nano (6.5 МБ) — классический старт для детекции объектов.",
-        "hint":"Скачается и зарегистрируется в реестре. Метрики не заданы — требуется валидация перед активацией.",
+        "hint":"COCO знает класс person, но не знает защитную каску. Метрики не заданы — требуется валидация перед активацией.",
     },
     {
         "id":"yolo11s","name":"yolo11s","format":"PyTorch","url":"https://github.com/ultralytics/assets/releases/download/v8.3.0/yolo11s.pt",
-        "size_bytes":19313732,"classes":80,"category":"quality","description":"Более точная модель (19 МБ) — выше качество детекции, больше ресурсов.",
-        "hint":"Скачается и зарегистрируется в реестре. Метрики не заданы — требуется валидация перед активацией.",
+        "size_bytes":19313732,"classes":80,"category":"quality","description":"Более точная COCO-модель (19 МБ) — выше качество детекции, больше ресурсов.",
+        "hint":"COCO знает класс person, но не знает защитную каску. Метрики не заданы — требуется валидация перед активацией.",
     },
 ]
 # Allow overriding/extending the catalog via env (JSON array), for self-hosted
@@ -123,6 +145,14 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_ROLES = {**{int(x):"viewer" for x in os.getenv("TELEGRAM_VIEWER_IDS","").split(",") if x.strip().isdigit()},**{int(x):"operator" for x in os.getenv("TELEGRAM_OPERATOR_IDS","").split(",") if x.strip().isdigit()},**{int(x):"admin" for x in os.getenv("TELEGRAM_ADMIN_IDS","").split(",") if x.strip().isdigit()}}
 
 def now_iso(): return datetime.now(TZ).isoformat(timespec="seconds")
+def timestamp_age_seconds(value: str | None) -> int | None:
+    if not value: return None
+    try:
+        stamp=datetime.fromisoformat(value)
+        if stamp.tzinfo is None: stamp=stamp.replace(tzinfo=TZ)
+        return max(0,int((datetime.now(TZ)-stamp.astimezone(TZ)).total_seconds()))
+    except (TypeError,ValueError):
+        return None
 def db():
     DB_PATH.parent.mkdir(parents=True,exist_ok=True)
     con = sqlite3.connect(DB_PATH,timeout=10)
@@ -131,6 +161,21 @@ def db():
     con.execute("PRAGMA busy_timeout=10000")
     return con
 
+def event_frame_path_for(event_id:int) -> Path:
+    """Return the single safe evidence JPEG location for an event."""
+    if event_id < 1:
+        raise HTTPException(404,"Событие не найдено")
+    base=EVENT_FRAME_DIR or (DB_PATH.parent/"event_frames")
+    target=(base/f"{event_id}.jpg").resolve()
+    if target.parent != base.resolve():
+        raise HTTPException(400,"Недопустимый путь кадра события")
+    return target
+
+def remove_event_frames(event_ids:list[int]) -> None:
+    for event_id in event_ids:
+        try: event_frame_path_for(int(event_id)).unlink(missing_ok=True)
+        except (OSError,ValueError): pass
+
 def apply_retention(con:sqlite3.Connection|None=None):
     own=con is None; connection=con or db()
     row=connection.execute("SELECT value FROM settings WHERE key='retention_days'").fetchone()
@@ -138,7 +183,9 @@ def apply_retention(con:sqlite3.Connection|None=None):
         try: days=max(1,min(3650,int(float(row[0]))))
         except ValueError: days=90
         cutoff=(datetime.now(TZ)-timedelta(days=days)).isoformat()
+        expired_ids=[int(row[0]) for row in connection.execute("SELECT id FROM events WHERE timestamp<?",(cutoff,)).fetchall()]
         connection.execute("DELETE FROM events WHERE timestamp<?",(cutoff,))
+        remove_event_frames(expired_ids)
         connection.execute("DELETE FROM logs WHERE timestamp<?",(cutoff,))
     if own: connection.commit(); connection.close()
 
@@ -146,18 +193,25 @@ def init_db():
     con = db()
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript("""
-    CREATE TABLE IF NOT EXISTS cameras(id TEXT PRIMARY KEY, name TEXT NOT NULL, zone TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rtsp_url TEXT NOT NULL DEFAULT '', fps_limit REAL NOT NULL DEFAULT 8, status TEXT NOT NULL DEFAULT 'unknown', fps REAL NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, camera_id TEXT NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL, confidence REAL NOT NULL, person_id TEXT, external_id TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '', FOREIGN KEY(camera_id) REFERENCES cameras(id));
+    CREATE TABLE IF NOT EXISTS cameras(id TEXT PRIMARY KEY, name TEXT NOT NULL, zone TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rtsp_url TEXT NOT NULL DEFAULT '', fps_limit REAL NOT NULL DEFAULT 8, status TEXT NOT NULL DEFAULT 'unknown', fps REAL NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, telemetry_at TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '', restart_requested_at TEXT NOT NULL DEFAULT '');
+    CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, camera_id TEXT NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL, confidence REAL NOT NULL, person_id TEXT, external_id TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, review_status TEXT NOT NULL DEFAULT 'pending', reviewed_at TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '', FOREIGN KEY(camera_id) REFERENCES cameras(id));
     CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, level TEXT NOT NULL, service TEXT NOT NULL, message TEXT NOT NULL, camera_id TEXT);
+    CREATE TABLE IF NOT EXISTS worker_status(name TEXT PRIMARY KEY, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', camera_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS model_registry(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, format TEXT NOT NULL, status TEXT NOT NULL, precision REAL, recall REAL, trained_at TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'external', artifact_uri TEXT NOT NULL DEFAULT '', checksum TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS training_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, camera_id TEXT NOT NULL, base_model TEXT NOT NULL, target_name TEXT NOT NULL, image_count INTEGER NOT NULL, epochs INTEGER NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL, error TEXT, batch INTEGER NOT NULL DEFAULT 8, imgsz INTEGER NOT NULL DEFAULT 640, patience INTEGER NOT NULL DEFAULT 20, confidence REAL NOT NULL DEFAULT .35, val_split REAL NOT NULL DEFAULT .2, capture_fps REAL NOT NULL DEFAULT 2, FOREIGN KEY(camera_id) REFERENCES cameras(id));
     CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, login TEXT UNIQUE NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
     """)
     camera_columns={r[1] for r in con.execute("PRAGMA table_info(cameras)").fetchall()}
-    for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''"}.items():
+    for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''","telemetry_at":"TEXT NOT NULL DEFAULT ''","last_error":"TEXT NOT NULL DEFAULT ''","restart_requested_at":"TEXT NOT NULL DEFAULT ''"}.items():
         if column not in camera_columns: con.execute(f"ALTER TABLE cameras ADD COLUMN {column} {ddl}")
     con.execute("UPDATE cameras SET created_at=updated_at WHERE created_at='' OR created_at IS NULL")
+    # A live MJPEG browser stream has a deliberate upper bound: keep stored
+    # legacy values consistent with the UI/API maximum of 60 FPS.
+    con.execute("UPDATE cameras SET fps_limit=60 WHERE fps_limit>60")
+    # Previous releases capped every camera at 20 FPS. High-FPS mode upgrades
+    # the known legacy 8/20 FPS defaults to 60 while the UI still exposes a per-camera choice.
+    if HIGH_FPS_MODE: con.execute("UPDATE cameras SET fps_limit=60 WHERE fps_limit IN (8,20)")
     model_columns={r[1] for r in con.execute("PRAGMA table_info(model_registry)").fetchall()}
     for column,ddl in {"artifact_uri":"TEXT NOT NULL DEFAULT ''","checksum":"TEXT NOT NULL DEFAULT ''"}.items():
         if column not in model_columns: con.execute(f"ALTER TABLE model_registry ADD COLUMN {column} {ddl}")
@@ -165,36 +219,75 @@ def init_db():
     for column,ddl in {"batch":"INTEGER NOT NULL DEFAULT 8","imgsz":"INTEGER NOT NULL DEFAULT 640","patience":"INTEGER NOT NULL DEFAULT 20","confidence":"REAL NOT NULL DEFAULT .35","val_split":"REAL NOT NULL DEFAULT .2","capture_fps":"REAL NOT NULL DEFAULT 2","source":"TEXT NOT NULL DEFAULT 'camera'","dataset_name":"TEXT NOT NULL DEFAULT ''"}.items():
         if column not in training_columns: con.execute(f"ALTER TABLE training_jobs ADD COLUMN {column} {ddl}")
     con.execute("CREATE TABLE IF NOT EXISTS datasets(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, path TEXT NOT NULL, image_count INTEGER NOT NULL DEFAULT 0, class_count INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'yolo', media_count INTEGER NOT NULL DEFAULT 0, label_count INTEGER NOT NULL DEFAULT 0)")
+    con.execute("CREATE TABLE IF NOT EXISTS dataset_capture_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE, camera_id TEXT NOT NULL, target_count INTEGER NOT NULL, capture_fps REAL NOT NULL, status TEXT NOT NULL, captured_count INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL, error TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, FOREIGN KEY(camera_id) REFERENCES cameras(id))")
     dataset_columns={r[1] for r in con.execute("PRAGMA table_info(datasets)").fetchall()}
     for column,ddl in {"kind":"TEXT NOT NULL DEFAULT 'yolo'","media_count":"INTEGER NOT NULL DEFAULT 0","label_count":"INTEGER NOT NULL DEFAULT 0"}.items():
         if column not in dataset_columns: con.execute(f"ALTER TABLE datasets ADD COLUMN {column} {ddl}")
     event_columns={r[1] for r in con.execute("PRAGMA table_info(events)").fetchall()}
     if "external_id" not in event_columns: con.execute("ALTER TABLE events ADD COLUMN external_id TEXT")
+    if "review_status" not in event_columns:
+        con.execute("ALTER TABLE events ADD COLUMN review_status TEXT NOT NULL DEFAULT 'pending'")
+        con.execute("UPDATE events SET review_status=CASE WHEN acknowledged=1 THEN 'accepted' ELSE 'pending' END")
+    if "reviewed_at" not in event_columns: con.execute("ALTER TABLE events ADD COLUMN reviewed_at TEXT NOT NULL DEFAULT ''")
+    con.execute("UPDATE events SET review_status='pending' WHERE review_status NOT IN ('pending','accepted','rejected') OR review_status='' OR review_status IS NULL")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_events_external_id ON events(external_id) WHERE external_id IS NOT NULL")
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_timestamp ON events(timestamp DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_camera_timestamp ON events(camera_id,timestamp DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_severity_ack ON events(severity,acknowledged)")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_events_review_status ON events(review_status,timestamp DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_logs_timestamp_level ON logs(timestamp DESC,level)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_training_status ON training_jobs(status,created_at DESC)")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_capture_jobs_status ON dataset_capture_jobs(status,created_at DESC)")
+    con.execute("CREATE TABLE IF NOT EXISTS bot_runtime(provider TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'absent', detail TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT '')")
+    con.execute("CREATE TABLE IF NOT EXISTS bot_commands(id INTEGER PRIMARY KEY AUTOINCREMENT, provider TEXT NOT NULL, action TEXT NOT NULL, payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending', error TEXT NOT NULL DEFAULT '', created_at TEXT NOT NULL, completed_at TEXT NOT NULL DEFAULT '')")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_bot_commands_provider_status ON bot_commands(provider,status,id DESC)")
     con.execute("UPDATE training_jobs SET status='failed',stage='Прервано перезапуском',error='Worker restarted before completion',updated_at=? WHERE status IN ('queued','running')",(now_iso(),))
+    legacy_telegram_enabled_row=con.execute("SELECT value FROM settings WHERE key='telegram_enabled'").fetchone()
+    legacy_telegram_chats_row=con.execute("SELECT value FROM settings WHERE key='telegram_chat_ids'").fetchone()
+    legacy_critical_alerts_row=con.execute("SELECT value FROM settings WHERE key='critical_alerts'").fetchone()
+    legacy_telegram_enabled=bool(legacy_telegram_enabled_row and legacy_telegram_enabled_row[0]=='true')
+    legacy_critical_alerts=bool(legacy_critical_alerts_row and legacy_critical_alerts_row[0]=='true')
     config_defaults={
-        "active_model":"", "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
+        "active_model":"", "active_model_disabled":"false", "ppe_trial_previous_model":"", "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
         "retention_days":"90", "archive_quality":"90", "archive_clip_seconds":"10",
         "inference_fps":"8", "inference_device":"cuda:0", "batch_size":"4", "nms_iou":"0.45",
         "helmet_conf":"0.85", "vest_conf":"0.80", "phone_conf":"0.78", "smoking_conf":"0.80", "restricted_zone_conf":"0.82", "immobility_conf":"0.80", "min_model_precision":"90", "min_model_recall":"85",
-        "telegram_enabled":"false", "telegram_chat_ids":"", "critical_alerts":"true",
+        "telegram_enabled":"true" if legacy_telegram_enabled else "false", "telegram_chat_ids":legacy_telegram_chats_row[0] if legacy_telegram_chats_row else "", "critical_alerts":"true",
+        # Bot tokens remain process secrets in .env. Everything operational —
+        # enablement, roles, recipients and alert policy — is controlled from
+        # the Admin → Bots workspace and read live by bot services.
+        "telegram_bot_enabled":"true" if (legacy_telegram_enabled or MESSENGER_PROVIDER=="telegram") else "false",
+        "telegram_alerts_enabled":"true" if (legacy_telegram_enabled or MESSENGER_PROVIDER=="telegram") else "false",
+        "telegram_alert_min_severity":"critical" if legacy_critical_alerts else "high",
+        "telegram_admin_ids":os.getenv("TELEGRAM_ADMIN_IDS", "").strip(), "telegram_operator_ids":os.getenv("TELEGRAM_OPERATOR_IDS", "").strip(), "telegram_viewer_ids":os.getenv("TELEGRAM_VIEWER_IDS", "").strip(), "telegram_alert_recipients":legacy_telegram_chats_row[0] if legacy_telegram_chats_row else "", "telegram_webapp_url":os.getenv("TELEGRAM_WEBAPP_URL", "").strip(),
+        "max_bot_enabled":"true" if MESSENGER_PROVIDER=="max" else "false",
+        "max_alerts_enabled":"true" if MESSENGER_PROVIDER=="max" else "false",
+        "max_alert_min_severity":"critical" if legacy_critical_alerts else "high",
+        "max_admin_ids":os.getenv("MAX_ADMIN_IDS", "").strip(), "max_operator_ids":os.getenv("MAX_OPERATOR_IDS", "").strip(), "max_viewer_ids":os.getenv("MAX_VIEWER_IDS", "").strip(), "max_alert_recipients":"",
         "webhook_enabled":"false", "webhook_url":"", "webhook_timeout":"5",
         "minio_endpoint":"minio:9000", "minio_bucket":"videoanalytics", "minio_secure":"false",
         "rtsp_reconnect_seconds":"5", "event_cooldown_seconds":"30"
     }
     for key,value in config_defaults.items(): con.execute("INSERT OR IGNORE INTO settings VALUES(?,?)",(key,value))
-    active_row=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()
-    active_ok=active_row and con.execute("SELECT 1 FROM model_registry WHERE name=? AND status='ready'",(active_row[0],)).fetchone()
-    if not active_ok:
-        fallback=con.execute("SELECT name FROM model_registry WHERE status='ready' ORDER BY id DESC LIMIT 1").fetchone()
-        value=fallback[0] if fallback else ""
-        con.execute("INSERT INTO settings(key,value) VALUES('active_model',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(value,))
-        if fallback: con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"Active model repaired to {fallback[0]}"))
+    disabled_row=con.execute("SELECT value FROM settings WHERE key='active_model_disabled'").fetchone()
+    if disabled_row and disabled_row[0]=='true':
+        # No model is active after an explicitly stopped PPE trial. Do not
+        # resurrect a ready model merely because the API/container restarted.
+        con.execute("UPDATE settings SET value='' WHERE key='active_model'")
+    else:
+        active_row=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()
+        # An empty value means the operator has not selected a model. Never
+        # auto-start a newly downloaded (and possibly unvalidated) preset just
+        # because the API restarted. Only repair a *previously selected* model
+        # that disappeared or became invalid.
+        if active_row and active_row[0]:
+            active_ok=con.execute("SELECT 1 FROM model_registry WHERE name=? AND status='ready'",(active_row[0],)).fetchone()
+            if not active_ok:
+                fallback=con.execute("SELECT name FROM model_registry WHERE status='ready' ORDER BY id DESC LIMIT 1").fetchone()
+                value=fallback[0] if fallback else ""
+                con.execute("INSERT INTO settings(key,value) VALUES('active_model',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(value,))
+                if fallback: con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"Active model repaired to {fallback[0]}"))
+    bootstrap_env_camera(con)
     apply_retention(con)
     con.commit(); con.close()
 
@@ -203,8 +296,9 @@ async def lifespan(app: FastAPI):
     init_db()
     try: yield
     finally:
-        for task in list(_training_tasks.values()): task.cancel()
-        if _training_tasks: await asyncio.gather(*list(_training_tasks.values()),return_exceptions=True)
+        for task in [*list(_training_tasks.values()),*list(_dataset_capture_tasks.values())]: task.cancel()
+        pending=[*list(_training_tasks.values()),*list(_dataset_capture_tasks.values())]
+        if pending: await asyncio.gather(*pending,return_exceptions=True)
 
 app=FastAPI(title="ZMK Vision API",version=APP_VERSION,description="On-premise API контура видеоаналитики",lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:5173").split(",") if x.strip()],allow_credentials=False,allow_methods=["GET","POST","PUT","PATCH","DELETE"],allow_headers=["Content-Type","X-API-Key","X-Telegram-Init-Data"])
@@ -231,7 +325,7 @@ def telegram_webapp_role(init_data:str)->str|None:
         secret=hmac.new(b"WebAppData",TELEGRAM_BOT_TOKEN.encode(),hashlib.sha256).digest()
         expected=hmac.new(secret,check.encode(),hashlib.sha256).hexdigest()
         if not hmac.compare_digest(supplied,expected): return None
-        user=json.loads(values.get("user","{}")); return TELEGRAM_ROLES.get(int(user.get("id",0)))
+        user=json.loads(values.get("user","{}")); role=_bot_role_for_user("telegram",int(user.get("id",0))); return role if role in {"viewer","operator","admin"} else None
     except (ValueError,TypeError,json.JSONDecodeError): return None
 
 @app.middleware("http")
@@ -253,11 +347,11 @@ async def security_middleware(request: Request, call_next):
         from fastapi.responses import JSONResponse
         return JSONResponse({"detail":"Invalid or missing API credentials"},status_code=401,headers={"WWW-Authenticate":"ApiKey"})
     if telegram_role and not api_key_ok:
-        admin_write=path.startswith(("/api/admin/","/api/training/","/api/settings","/api/models/")) and request.method!="GET"
-        admin_read=path.startswith(("/api/admin/","/api/logs","/api/settings"))
+        admin_write=path.startswith(("/api/admin/","/api/bots/","/api/training/","/api/settings","/api/models/")) and request.method!="GET"
+        admin_read=path.startswith(("/api/admin/","/api/bots/","/api/logs","/api/settings"))
         operator_only=path.startswith("/api/reports/")
         viewer_write=telegram_role=="viewer" and request.method!="GET"
-        operator_write=telegram_role=="operator" and request.method!="GET" and not (path.startswith("/api/events/") and path.endswith("/ack"))
+        operator_write=telegram_role=="operator" and request.method!="GET" and not (path.startswith("/api/events/") and (path.endswith(("/ack","/reject")) or path in {"/api/events/ack-bulk","/api/events/reject-bulk"}))
         if (telegram_role!="admin" and (admin_write or admin_read)) or (telegram_role=="viewer" and operator_only) or viewer_write or operator_write:
             from fastapi.responses import JSONResponse
             return JSONResponse({"detail":"Insufficient Telegram role"},status_code=403)
@@ -287,39 +381,125 @@ async def security_middleware(request: Request, call_next):
     if path.startswith("/api/"): response.headers["Cache-Control"]="no-store"
     return response
 
+def safe_camera_error(value: str) -> str:
+    """Keep diagnostic text useful without exposing RTSP credentials."""
+    return re.sub(r"rtsps?://[^\s'\"<>]+","<rtsp-url>",value or "",flags=re.IGNORECASE).replace("\n"," ")[:300]
+
+def normalize_rtsp_url(value: str | None) -> str | None:
+    """Validate an RTSP endpoint early, without ever returning its secret.
+
+    A prefix-only check accepts values such as ``rtsp://host:not-a-port``.
+    They later crash diagnostics through ``urlparse(...).port`` and leave an
+    operator with a 500 instead of an actionable configuration error.
+    """
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        return value
+    if any(char.isspace() or ord(char) < 32 for char in value):
+        raise ValueError("RTSP URL не должен содержать пробелы или управляющие символы")
+    parsed = urlparse(value)
+    if parsed.scheme not in {"rtsp", "rtsps"} or not parsed.hostname:
+        raise ValueError("Требуется корректный RTSP(S) URL с host")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise ValueError("Некорректный порт в RTSP URL") from exc
+    if port is not None and not 1 <= port <= 65535:
+        raise ValueError("Порт RTSP URL должен быть в диапазоне 1–65535")
+    return value
+
+
+def bootstrap_env_camera(con: sqlite3.Connection) -> None:
+    """Create the first camera from RTSP_CAM_01 when the DB has none.
+
+    Docker Compose already passed RTSP_CAM_01 into the API but it was never
+    consumed, so a user could configure a valid URL in .env and the worker
+    would silently receive an empty camera list. The URL remains secret: it is
+    stored only in SQLite and never written to logs or camera-list responses.
+    """
+    raw_url = os.getenv("RTSP_CAM_01", "").strip()
+    if not raw_url:
+        return
+    if con.execute("SELECT 1 FROM cameras WHERE rtsp_url!='' LIMIT 1").fetchone():
+        return
+    try:
+        rtsp_url = normalize_rtsp_url(raw_url)
+    except ValueError:
+        con.execute(
+            "INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",
+            (now_iso(), "WARNING", "camera_manager", "RTSP_CAM_01 ignored: invalid RTSP URL"),
+        )
+        return
+
+    timestamp = now_iso()
+    camera_id = "cam_env_01"
+    existing = con.execute("SELECT rtsp_url FROM cameras WHERE id=?", (camera_id,)).fetchone()
+    if existing:
+        # Never overwrite an already configured camera. A legacy empty
+        # bootstrap row can safely receive the newly supplied environment URL.
+        if existing[0]:
+            return
+        con.execute(
+            "UPDATE cameras SET rtsp_url=?,enabled=1,status='connecting',fps=0,latency_ms=0,last_error='',updated_at=?,telemetry_at='',restart_requested_at=? WHERE id=?",
+            (rtsp_url, timestamp, timestamp, camera_id),
+        )
+    else:
+        con.execute(
+            "INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,restart_requested_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (camera_id, "Камера 01", "Без зоны", "Добавлена из RTSP_CAM_01", rtsp_url, 30, "connecting", 0, 0, 1, timestamp, timestamp, "", timestamp),
+        )
+    con.execute(
+        "INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",
+        (timestamp, "INFO", "camera_manager", "Camera created from RTSP_CAM_01", camera_id),
+    )
+
+
 class CameraIn(BaseModel):
     name:str=Field(min_length=2,max_length=80)
     zone:str=Field(default="Без зоны",min_length=1,max_length=80)
     description:str=Field(default="",max_length=500)
     rtsp_url:str=Field(default="",max_length=2048)
-    fps_limit:float=Field(default=8,ge=.1,le=60)
+    fps_limit:float=Field(default=30,ge=.1,le=60)
     enabled:bool=True
     @field_validator("rtsp_url")
     @classmethod
     def validate_rtsp(cls,value:str):
-        if value and not value.startswith(("rtsp://","rtsps://")): raise ValueError("Требуется RTSP(S) URL")
-        return value
+        return normalize_rtsp_url(value) or ""
 class CameraUpdate(BaseModel):
     name:str=Field(min_length=2,max_length=80)
     zone:str=Field(default="Без зоны",min_length=1,max_length=80)
     description:str=Field(default="",max_length=500)
     rtsp_url:str|None=Field(default=None,max_length=2048)
-    fps_limit:float=Field(default=8,ge=.1,le=60)
+    fps_limit:float=Field(default=30,ge=.1,le=60)
     enabled:bool=True
     @field_validator("rtsp_url")
     @classmethod
     def validate_rtsp(cls,value:str|None):
-        if value and not value.startswith(("rtsp://","rtsps://")): raise ValueError("Требуется RTSP(S) URL")
-        return value
+        return normalize_rtsp_url(value)
 class CameraTelemetry(BaseModel):
-    status:Literal["online","offline","error","unknown","recovering"]
+    status:Literal["connecting","online","offline","error","unknown","recovering"]
     fps:float=Field(default=0,ge=0,le=240)
     latency_ms:int=Field(default=0,ge=0,le=120000)
+    error:str=Field(default="",max_length=300)
+class InferenceHeartbeat(BaseModel):
+    status:Literal["starting","running","idle","degraded","stopped"]
+    detail:str=Field(default="",max_length=300)
+    camera_count:int=Field(default=0,ge=0,le=10000)
 class CameraSnapshotIn(BaseModel):
     jpeg_base64:str=Field(min_length=16,max_length=1_800_000)
     captured_at:datetime|None=None
 class SettingIn(BaseModel): value:float=Field(ge=.1,le=1)
 class AckIn(BaseModel): note:str=Field(default="",max_length=500)
+class BulkAckIn(BaseModel):
+    event_ids:list[int]=Field(min_length=1,max_length=500)
+    note:str=Field(default="",max_length=500)
+    @field_validator("event_ids")
+    @classmethod
+    def unique_positive_ids(cls,value:list[int]):
+        if any(item<1 for item in value): raise ValueError("event_ids must be positive")
+        return list(dict.fromkeys(value))
 class DetectionIn(BaseModel):
     camera_id:str=Field(min_length=1,max_length=64)
     model_name:str=Field(min_length=1,max_length=120)
@@ -338,6 +518,22 @@ class DetectionIn(BaseModel):
         return value
 class DetectionBatch(BaseModel): detections:list[DetectionIn]=Field(min_length=1,max_length=500)
 class ConfigPatch(BaseModel): values:dict[str,Any]
+class BotConfigIn(BaseModel):
+    enabled:bool=False
+    alerts_enabled:bool=False
+    alert_min_severity:Literal["critical","high","medium","low"]="high"
+    admin_ids:str=Field(default="",max_length=4000)
+    operator_ids:str=Field(default="",max_length=4000)
+    viewer_ids:str=Field(default="",max_length=4000)
+    alert_recipients:str=Field(default="",max_length=4000)
+    webapp_url:str=Field(default="",max_length=1000)
+class BotHeartbeatIn(BaseModel):
+    status:Literal["active","disabled","waiting_token","api_unavailable","error"]
+    detail:str=Field(default="",max_length=300)
+    enabled:bool=False
+class BotCommandCompleteIn(BaseModel):
+    status:Literal["completed","failed"]
+    error:str=Field(default="",max_length=300)
 class UserIn(BaseModel):
     name:str=Field(min_length=2,max_length=80)
     login:str=Field(min_length=2,max_length=40,pattern=r"^[a-zA-Z0-9._-]+$")
@@ -374,6 +570,82 @@ class TrainingIn(BaseModel):
 
 def rows(query,args=()):
     con=db(); result=[dict(r) for r in con.execute(query,args).fetchall()]; con.close(); return result
+
+BOT_PROVIDERS=("telegram","max")
+
+def _parse_bot_ids(value: str | None) -> list[int]:
+    """Parse operator-maintained comma/newline-separated signed messenger IDs."""
+    result=[]
+    for token in re.split(r"[,;\s]+", str(value or "").strip()):
+        if not token:
+            continue
+        if not re.fullmatch(r"-?\d{1,20}", token):
+            raise ValueError(f"Недопустимый ID: {token}")
+        parsed=int(token)
+        if parsed==0:
+            raise ValueError("ID не может быть нулём")
+        if parsed not in result:
+            result.append(parsed)
+    return result
+
+
+def _normalized_bot_ids(value: str | None) -> str:
+    return ",".join(str(item) for item in _parse_bot_ids(value))
+
+
+def _bot_role_for_user(provider: str, user_id: int) -> str:
+    """Use DB-managed roles, falling back to legacy environment roles safely."""
+    if provider not in BOT_PROVIDERS:
+        return "denied"
+    try:
+        data={item["key"]:item["value"] for item in rows("SELECT key,value FROM settings WHERE key IN (?,?,?)",(f"{provider}_admin_ids",f"{provider}_operator_ids",f"{provider}_viewer_ids"))}
+        configured=any(str(data.get(f"{provider}_{role}_ids","")).strip() for role in ("admin","operator","viewer"))
+        if configured:
+            if user_id in _parse_bot_ids(data.get(f"{provider}_admin_ids")): return "admin"
+            if user_id in _parse_bot_ids(data.get(f"{provider}_operator_ids")): return "operator"
+            if user_id in _parse_bot_ids(data.get(f"{provider}_viewer_ids")): return "viewer"
+            return "denied"
+    except (sqlite3.Error,ValueError):
+        pass
+    legacy={"telegram":(TELEGRAM_ROLES.get(user_id) if "TELEGRAM_ROLES" in globals() else None),"max":None}
+    return legacy.get(provider) or "denied"
+
+
+def _active_bot_provider(settings: dict[str,str]) -> str:
+    active=[provider for provider in BOT_PROVIDERS if settings.get(f"{provider}_bot_enabled")=="true"]
+    return active[0] if len(active)==1 else "multiple" if active else "none"
+
+
+def _bot_token_configured(provider: str) -> bool:
+    return bool(os.getenv("TELEGRAM_BOT_TOKEN" if provider=="telegram" else "MAX_BOT_TOKEN", "").strip())
+
+
+def _bot_view(provider: str, settings: dict[str,str], runtime: sqlite3.Row | None, last_command: sqlite3.Row | None) -> dict[str,Any]:
+    updated_at=runtime[4] if runtime else ""
+    age=timestamp_age_seconds(updated_at)
+    status=runtime[1] if runtime else "absent"
+    return {
+        "provider":provider,
+        "label":"Telegram" if provider=="telegram" else "MAX",
+        "enabled":settings.get(f"{provider}_bot_enabled","false")=="true",
+        "alerts_enabled":settings.get(f"{provider}_alerts_enabled","false")=="true",
+        "alert_min_severity":settings.get(f"{provider}_alert_min_severity","high"),
+        "admin_ids":settings.get(f"{provider}_admin_ids",""),
+        "operator_ids":settings.get(f"{provider}_operator_ids",""),
+        "viewer_ids":settings.get(f"{provider}_viewer_ids",""),
+        "alert_recipients":settings.get(f"{provider}_alert_recipients",""),
+        "token_configured":_bot_token_configured(provider),
+        "runtime":{"status":status,"detail":runtime[2] if runtime else "Сервис ещё не сообщил состояние","enabled":bool(runtime[3]) if runtime else False,"updated_at":updated_at,"age_seconds":age,"online":bool(age is not None and age<=20 and status in {"active","disabled","waiting_token"})},
+        "webapp_url":settings.get("telegram_webapp_url",os.getenv("TELEGRAM_WEBAPP_URL","")) if provider=="telegram" else "",
+        "last_test":{"id":last_command[0],"status":last_command[1],"error":last_command[2],"created_at":last_command[3],"completed_at":last_command[4]} if last_command else None,
+    }
+
+
+def inference_worker_state() -> dict[str,Any]:
+    con=db(); row=con.execute("SELECT status,detail,camera_count,updated_at FROM worker_status WHERE name='inference'").fetchone(); con.close()
+    if not row: return {"connected":False,"status":"absent","detail":"Нет heartbeat от inference worker","camera_count":0,"age_seconds":None}
+    age=timestamp_age_seconds(row[3]); connected=age is not None and age<=15 and row[0] in {"starting","running","idle","degraded"}
+    return {"connected":connected,"status":row[0],"detail":row[1],"camera_count":row[2],"updated_at":row[3],"age_seconds":age}
 
 def update_headers() -> dict[str,str]:
     headers = {}
@@ -418,35 +690,103 @@ def capabilities():
         except httpx.HTTPError: pass
     snap_dir=SNAPSHOT_DIR or (DB_PATH.parent/"snapshots")
     fresh=sum(1 for r in snap_dir.glob("*.jpg") if (time.time()-r.stat().st_mtime)<15) if snap_dir.exists() else 0
-    # "inference_worker": whether the inference worker is actually feeding
-    # fresh snapshots. If false, the camera is offline/unblacked because the
-    # worker isn't running (profile not enabled) or the stream won't open.
-    inference_active=bool(fresh)
-    return {"demo_mode":SEED_TEST_DATA,"training_worker":worker["reachable"],"training":worker,"external_inference_gateway":True,"camera_crud":True,"diagnostics":True,"search":True,"update_service":bool(UPDATE_SERVICE_URL),"inference_worker":inference_active,"fresh_snapshots":fresh}
+    inference=inference_worker_state()
+    # A heartbeat confirms that the process is alive even before the first
+    # snapshot exists; fresh frames separately confirm that a stream is live.
+    return {"demo_mode":SEED_TEST_DATA,"training_worker":worker["reachable"],"training":worker,"external_inference_gateway":True,"camera_crud":True,"diagnostics":True,"search":True,"update_service":bool(UPDATE_SERVICE_URL),"inference_worker":inference["connected"],"inference":inference,"fresh_snapshots":fresh}
 
 @app.get("/api/health")
 def health(): return {"status":"ok","version":APP_VERSION,"uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
 
 @app.get("/api/dashboard")
 def dashboard():
-    con=db(); total=con.execute("SELECT COUNT(*) FROM cameras").fetchone()[0]; online=con.execute("SELECT COUNT(*) FROM cameras WHERE status='online'").fetchone()[0]
+    fresh_after=(datetime.now(TZ)-timedelta(seconds=CAMERA_TELEMETRY_STALE_SECONDS)).isoformat()
+    con=db(); total=con.execute("SELECT COUNT(*) FROM cameras").fetchone()[0]; online=con.execute("SELECT COUNT(*) FROM cameras WHERE status='online' AND telemetry_at>=?",(fresh_after,)).fetchone()[0]
     events24=con.execute("SELECT COUNT(*) FROM events WHERE timestamp >= ?",((datetime.now(TZ)-timedelta(days=1)).isoformat(),)).fetchone()[0]
     critical=con.execute("SELECT COUNT(*) FROM events WHERE severity='critical' AND acknowledged=0").fetchone()[0]
-    avg=con.execute("SELECT COALESCE(AVG(fps),0), COALESCE(AVG(latency_ms),0) FROM cameras WHERE status='online'").fetchone()
+    avg=con.execute("SELECT COALESCE(AVG(fps),0), COALESCE(AVG(latency_ms),0) FROM cameras WHERE status='online' AND telemetry_at>=?",(fresh_after,)).fetchone()
     model=con.execute("SELECT m.name,m.precision,m.recall FROM model_registry m JOIN settings s ON s.key='active_model' AND s.value=m.name").fetchone()
+    bot_settings={row[0]:row[1] for row in con.execute("SELECT key,value FROM settings WHERE key IN ('telegram_bot_enabled','max_bot_enabled')").fetchall()}
+    messenger_provider=_active_bot_provider(bot_settings)
     trend=[]
     for h in range(11,-1,-1):
         end=datetime.now(TZ)-timedelta(hours=h); start=end-timedelta(hours=1)
         n=con.execute("SELECT COUNT(*) FROM events WHERE timestamp BETWEEN ? AND ?",(start.isoformat(),end.isoformat())).fetchone()[0]
         trend.append({"label":end.strftime("%H:00"),"value":n})
-    con.close(); gpu=gpu_metrics(); return {"cameras":{"total":total,"online":online},"events24h":events24,"critical_unacked":critical,"avg_fps":round(avg[0],1),"avg_latency_ms":round(avg[1]),"gpu_load":gpu["gpu"],"gpu_temp":gpu["gpu_temp"],"messenger_provider":MESSENGER_PROVIDER,"active_model":model[0] if model else None,"precision":model[1] if model else None,"recall":model[2] if model else None,"trend":trend}
+    con.close(); gpu=gpu_metrics(); return {"cameras":{"total":total,"online":online},"events24h":events24,"critical_unacked":critical,"avg_fps":round(avg[0],1),"avg_latency_ms":round(avg[1]),"gpu_load":gpu["gpu"],"gpu_temp":gpu["gpu_temp"],"messenger_provider":messenger_provider,"active_model":model[0] if model else None,"precision":model[1] if model else None,"recall":model[2] if model else None,"trend":trend}
+
+EVENT_LABELS={"no_helmet":"Без каски","no_vest":"Без жилета","phone_usage":"Телефон","smoking":"Курение","restricted_zone":"Опасная зона","immobility":"Неподвижность"}
+REVIEW_LABELS={"pending":"Требуют внимания","accepted":"Приняты","rejected":"Не приняты"}
+
+def _analytics_timestamp(value:str) -> datetime|None:
+    try:
+        parsed=datetime.fromisoformat(value)
+        return (parsed if parsed.tzinfo else parsed.replace(tzinfo=TZ)).astimezone(TZ)
+    except (TypeError,ValueError):
+        return None
+
+def build_overview_analytics(hours:int,bucket:Literal["auto","hour","day"]="auto") -> dict[str,Any]:
+    """Build real, zero-filled event analytics for the requested period."""
+    now=datetime.now(TZ)
+    since=now-timedelta(hours=hours)
+    granularity="hour" if bucket=="hour" or (bucket=="auto" and hours<=48) else "day"
+    if granularity=="hour":
+        cursor=since.replace(minute=0,second=0,microsecond=0); step=timedelta(hours=1); label=lambda stamp:stamp.strftime("%d.%m %H:%M")
+    else:
+        cursor=since.replace(hour=0,minute=0,second=0,microsecond=0); step=timedelta(days=1); label=lambda stamp:stamp.strftime("%d.%m")
+    bucket_rows:dict[str,dict[str,Any]]={}
+    while cursor<=now:
+        key=cursor.isoformat()
+        bucket_rows[key]={"start":key,"label":label(cursor),"total":0,"critical":0,"pending":0,"accepted":0,"rejected":0,"confidence_sum":0.0}
+        cursor+=step
+    con=db()
+    raw=con.execute("""SELECT e.timestamp,e.type,e.severity,e.confidence,e.review_status,e.acknowledged,e.camera_id,c.name camera_name,c.zone
+        FROM events e LEFT JOIN cameras c ON c.id=e.camera_id WHERE e.timestamp>=? ORDER BY e.timestamp""",(since.isoformat(),)).fetchall()
+    con.close()
+    types:dict[str,int]={}; cameras:dict[str,dict[str,Any]]={}; review={"pending":0,"accepted":0,"rejected":0}; severity={"critical":0,"high":0,"medium":0,"low":0}
+    total_confidence=0.0; total=0
+    for row in raw:
+        stamp=_analytics_timestamp(row[0])
+        if stamp is None or stamp<since or stamp>now: continue
+        key=(stamp.replace(minute=0,second=0,microsecond=0) if granularity=="hour" else stamp.replace(hour=0,minute=0,second=0,microsecond=0)).isoformat()
+        slot=bucket_rows.get(key)
+        status=row[4] if row[4] in REVIEW_LABELS else ("accepted" if row[5] else "pending")
+        if slot:
+            slot["total"]+=1; slot[status]+=1; slot["confidence_sum"]+=float(row[3])
+            if row[2]=="critical": slot["critical"]+=1
+        review[status]+=1; severity[row[2]]=severity.get(row[2],0)+1; types[row[1]]=types.get(row[1],0)+1
+        camera=cameras.setdefault(row[6],{"camera_id":row[6],"name":row[7] or row[6],"zone":row[8] or "—","total":0,"critical":0,"pending":0,"accepted":0,"rejected":0})
+        camera["total"]+=1; camera[status]+=1
+        if row[2]=="critical": camera["critical"]+=1
+        total+=1; total_confidence+=float(row[3])
+    buckets=[]
+    for slot in bucket_rows.values():
+        count=slot.pop("confidence_sum")
+        slot["avg_confidence"]=round(count/max(1,slot["total"]),3)
+        buckets.append(slot)
+    return {"generated_at":now_iso(),"hours":hours,"bucket":granularity,"period":{"from":since.isoformat(),"to":now.isoformat()},"totals":{"events":total,"critical":severity.get("critical",0),"pending":review["pending"],"accepted":review["accepted"],"rejected":review["rejected"],"avg_confidence":round(total_confidence/max(1,total),3)},"buckets":buckets,"types":[{"id":key,"label":EVENT_LABELS.get(key,key),"value":value} for key,value in sorted(types.items(),key=lambda item:(-item[1],item[0]))],"cameras":sorted(cameras.values(),key=lambda item:(-item["total"],item["name"]))[:12],"review":[{"id":key,"label":REVIEW_LABELS[key],"value":value} for key,value in review.items()],"severity":[{"id":key,"label":key.upper(),"value":value} for key,value in severity.items() if value]}
+
+@app.get("/api/analytics/overview")
+def overview_analytics(hours:int=Query(24,ge=1,le=2160),bucket:Literal["auto","hour","day"]="auto"):
+    return build_overview_analytics(hours,bucket)
+
+@app.get("/api/reports/analytics.csv")
+def overview_analytics_csv(hours:int=Query(24,ge=1,le=2160),bucket:Literal["auto","hour","day"]="auto"):
+    analytics=build_overview_analytics(hours,bucket)
+    fields=["start","label","total","critical","pending","accepted","rejected","avg_confidence"]
+    out=io.StringIO(); writer=csv.DictWriter(out,fieldnames=fields); writer.writeheader(); writer.writerows(sanitize_csv_rows(analytics["buckets"]))
+    return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":f"attachment; filename=zmk-analytics-{hours}h.csv"})
 
 @app.get("/api/internal/cameras")
-def internal_cameras(): return rows("SELECT id,name,rtsp_url,fps_limit,enabled FROM cameras WHERE enabled=1 AND rtsp_url!='' ORDER BY id")
+def internal_cameras(): return rows("SELECT id,name,rtsp_url,fps_limit,enabled,restart_requested_at FROM cameras WHERE enabled=1 AND rtsp_url!='' ORDER BY id")
+
+@app.post("/api/internal/inference/heartbeat",status_code=204)
+def inference_heartbeat(payload:InferenceHeartbeat):
+    con=db(); con.execute("INSERT INTO worker_status(name,status,detail,camera_count,updated_at) VALUES('inference',?,?,?,?) ON CONFLICT(name) DO UPDATE SET status=excluded.status,detail=excluded.detail,camera_count=excluded.camera_count,updated_at=excluded.updated_at",(payload.status,payload.detail,payload.camera_count,now_iso())); con.commit(); con.close()
 
 @app.get("/api/internal/active-model")
 def internal_active_model():
-    data=rows("SELECT m.name,m.format,m.artifact_uri,m.checksum FROM model_registry m JOIN settings s ON s.key='active_model' AND s.value=m.name WHERE m.status='ready'")
+    data=rows("SELECT m.name,m.format,m.artifact_uri,m.checksum,m.source FROM model_registry m JOIN settings s ON s.key='active_model' AND s.value=m.name WHERE m.status='ready'")
     return data[0] if data else None
 
 import re as _re
@@ -471,70 +811,182 @@ def snapshot_age_seconds(camera_id:str) -> int|None:
     if not target.exists(): return None
     return int(time.time()-target.stat().st_mtime)
 
+def live_frame_age_seconds(camera_id:str) -> float|None:
+    with _live_frames_lock:
+        item=_live_frames.get(camera_id)
+    return None if item is None else max(0,round(time.time()-item[1],2))
+
+def clear_live_frame(camera_id:str) -> None:
+    with _live_frames_lock: _live_frames.pop(camera_id,None)
+
+def telemetry_age_seconds(value: str | None) -> int | None:
+    """Return age of worker telemetry; malformed legacy values are stale."""
+    return timestamp_age_seconds(value)
+
 def camera_with_snapshot(row:dict|sqlite3.Row) -> dict:
-    data=dict(row); data["snapshot_age_seconds"]=snapshot_age_seconds(row["id"]); return data
+    data=dict(row)
+    data["snapshot_age_seconds"]=snapshot_age_seconds(row["id"])
+    data["live_frame_age_seconds"]=live_frame_age_seconds(row["id"])
+    age=telemetry_age_seconds(data.get("telemetry_at"))
+    stale=data.get("status") in {"online","recovering"} and (age is None or age>CAMERA_TELEMETRY_STALE_SECONDS)
+    data["telemetry_age_seconds"]=age
+    data["telemetry_stale"]=stale
+    if stale:
+        # Never present a dead worker as a live camera solely because the last
+        # row in SQLite was online. The database remains unchanged so a new
+        # telemetry callback can recover it immediately.
+        data["status"]="offline"; data["fps"]=0
+    return data
 
 @app.get("/api/cameras")
 def cameras():
-    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras ORDER BY created_at,id")
+    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,last_error,restart_requested_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras ORDER BY created_at,id")
     return [camera_with_snapshot(r) for r in data]
 
 @app.get("/api/cameras/{camera_id}")
 def camera_detail(camera_id:str):
-    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras WHERE id=?",(camera_id,))
+    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,last_error,restart_requested_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras WHERE id=?",(camera_id,))
     if not data: raise HTTPException(404,"Камера не найдена")
     return camera_with_snapshot(data[0])
 
 @app.post("/api/cameras",status_code=201)
 def add_camera(payload:CameraIn):
-    cid=f"cam_{uuid.uuid4().hex[:12]}"; timestamp=now_iso(); con=db()
-    con.execute("INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",(cid,payload.name,payload.zone,payload.description,payload.rtsp_url,payload.fps_limit,"unknown",0,0,int(payload.enabled),timestamp,timestamp)); con.commit(); con.close()
-    return {"id":cid,"name":payload.name,"zone":payload.zone,"description":payload.description,"fps_limit":payload.fps_limit,"enabled":payload.enabled,"configured":bool(payload.rtsp_url),"status":"unknown"}
+    cid=f"cam_{uuid.uuid4().hex[:12]}"; timestamp=now_iso(); con=db(); status="connecting" if payload.enabled and payload.rtsp_url else "unknown"
+    con.execute("INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,restart_requested_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(cid,payload.name,payload.zone,payload.description,payload.rtsp_url,payload.fps_limit,status,0,0,int(payload.enabled),timestamp,timestamp,timestamp if status=="connecting" else "")); con.commit(); con.close()
+    return {"id":cid,"name":payload.name,"zone":payload.zone,"description":payload.description,"fps_limit":payload.fps_limit,"enabled":payload.enabled,"configured":bool(payload.rtsp_url),"status":status}
 
 @app.put("/api/cameras/{camera_id}")
 def update_camera(camera_id:str,payload:CameraUpdate):
-    con=db(); current=con.execute("SELECT rtsp_url FROM cameras WHERE id=?",(camera_id,)).fetchone()
+    con=db(); current=con.execute("SELECT rtsp_url,enabled FROM cameras WHERE id=?",(camera_id,)).fetchone()
     if not current: con.close(); raise HTTPException(404,"Камера не найдена")
     # The RTSP URL is a secret and is never returned by the API. It is only
     # replaced when the client supplies a non-empty value; null or "" ("leave
     # as is" from the edit form) keeps the existing URL.
     new_rtsp=payload.rtsp_url if payload.rtsp_url else current[0]
     rtsp_updated=bool(payload.rtsp_url)
-    con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,updated_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),now_iso(),camera_id)); con.commit(); con.close()
-    return {"id":camera_id,"updated":True,"configured":bool(new_rtsp),"rtsp_updated":rtsp_updated}
+    stream_changed=new_rtsp != current[0] or bool(payload.enabled) != bool(current[1])
+    timestamp=now_iso()
+    if stream_changed:
+        # A frame and telemetry from the old endpoint must not be shown as if
+        # they belonged to the newly configured camera.
+        con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,status='connecting',fps=0,latency_ms=0,last_error='',updated_at=?,telemetry_at='',restart_requested_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),timestamp,timestamp,camera_id))
+    else:
+        con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,updated_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),timestamp,camera_id))
+    con.commit(); con.close()
+    if stream_changed:
+        snapshot_path_for(camera_id).unlink(missing_ok=True); clear_live_frame(camera_id)
+    return {"id":camera_id,"updated":True,"configured":bool(new_rtsp),"rtsp_updated":rtsp_updated,"stream_reset":stream_changed}
 
 @app.delete("/api/cameras/{camera_id}")
 def delete_camera(camera_id:str,delete_events:bool=False):
     con=db(); camera=con.execute("SELECT name FROM cameras WHERE id=?",(camera_id,)).fetchone()
     if not camera: con.close(); raise HTTPException(404,"Камера не найдена")
-    event_count=con.execute("SELECT COUNT(*) FROM events WHERE camera_id=?",(camera_id,)).fetchone()[0]
+    event_rows=con.execute("SELECT id FROM events WHERE camera_id=?",(camera_id,)).fetchall()
+    event_ids=[int(row[0]) for row in event_rows]
+    event_count=len(event_ids)
     if event_count and not delete_events: con.close(); raise HTTPException(409,f"У камеры есть события: {event_count}. Подтвердите delete_events=true")
     con.execute("BEGIN IMMEDIATE")
     if delete_events: con.execute("DELETE FROM events WHERE camera_id=?",(camera_id,))
     con.execute("DELETE FROM cameras WHERE id=?",(camera_id,)); con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(now_iso(),"WARNING","camera_manager",f"Camera deleted: {camera[0]}",camera_id)); con.commit(); con.close()
-    snapshot=snapshot_path_for(camera_id); snapshot.unlink(missing_ok=True)
+    snapshot=snapshot_path_for(camera_id); snapshot.unlink(missing_ok=True); clear_live_frame(camera_id)
+    if delete_events: remove_event_frames(event_ids)
     return {"id":camera_id,"deleted":True,"deleted_events":event_count if delete_events else 0}
 
 @app.patch("/api/cameras/{camera_id}/toggle")
 def toggle_camera(camera_id:str):
     con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone()
     if not row: con.close(); raise HTTPException(404,"Камера не найдена")
-    enabled=0 if row[0] else 1; con.execute("UPDATE cameras SET enabled=?,updated_at=? WHERE id=?",(enabled,now_iso(),camera_id)); con.commit(); con.close(); return {"id":camera_id,"enabled":bool(enabled)}
+    enabled=0 if row[0] else 1
+    # Do not leave a stopped stream marked online while the worker removes it
+    # from its next polling cycle.
+    timestamp=now_iso(); con.execute("UPDATE cameras SET enabled=?,status=?,fps=0,latency_ms=0,last_error='',updated_at=?,telemetry_at='',restart_requested_at=? WHERE id=?",(enabled,"connecting" if enabled else "unknown",timestamp,timestamp,camera_id)); con.commit(); con.close()
+    snapshot_path_for(camera_id).unlink(missing_ok=True); clear_live_frame(camera_id)
+    return {"id":camera_id,"enabled":bool(enabled),"stream_reset":True}
+
+@app.post("/api/cameras/{camera_id}/restart")
+def restart_camera(camera_id:str):
+    con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone()
+    if not row: con.close(); raise HTTPException(404,"Камера не найдена")
+    if not row[0]: con.close(); raise HTTPException(409,"Сначала включите аналитику камеры")
+    timestamp=now_iso(); con.execute("UPDATE cameras SET status='connecting',fps=0,latency_ms=0,last_error='',telemetry_at='',restart_requested_at=?,updated_at=? WHERE id=?",(timestamp,timestamp,camera_id)); con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(timestamp,"INFO","camera_manager","RTSP restart requested",camera_id)); con.commit(); con.close()
+    snapshot_path_for(camera_id).unlink(missing_ok=True); clear_live_frame(camera_id)
+    return {"id":camera_id,"restart_requested_at":timestamp,"status":"connecting"}
+
+def apply_camera_telemetry(camera_id:str,payload:CameraTelemetry):
+    con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone()
+    if not row: con.close(); raise HTTPException(404,"Камера не найдена")
+    if not row[0]:
+        con.close()
+        # An in-flight worker frame must not resurrect a disabled camera.
+        return {"id":camera_id,"ignored":True,"status":"unknown","fps":0,"latency_ms":0,"error":""}
+    timestamp=now_iso(); error=safe_camera_error(payload.error); con.execute("UPDATE cameras SET status=?,fps=?,latency_ms=?,last_error=?,updated_at=?,telemetry_at=? WHERE id=?",(payload.status,payload.fps,payload.latency_ms,error,timestamp,timestamp,camera_id)); con.commit(); con.close()
+    return {"id":camera_id,**payload.model_dump()}
 
 @app.post("/api/cameras/{camera_id}/telemetry")
 def camera_telemetry(camera_id:str,payload:CameraTelemetry):
-    con=db(); cur=con.execute("UPDATE cameras SET status=?,fps=?,latency_ms=?,updated_at=? WHERE id=?",(payload.status,payload.fps,payload.latency_ms,now_iso(),camera_id)); con.commit(); con.close()
-    if not cur.rowcount: raise HTTPException(404,"Камера не найдена")
-    return {"id":camera_id,**payload.model_dump()}
+    return apply_camera_telemetry(camera_id,payload)
 
-@app.post("/api/cameras/{camera_id}/snapshot",status_code=204)
-def upload_camera_snapshot(camera_id:str,payload:CameraSnapshotIn):
-    con=db(); exists=con.execute("SELECT 1 FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
-    if not exists: raise HTTPException(404,"Камера не найдена")
+@app.post("/api/internal/cameras/{camera_id}/telemetry")
+def internal_camera_telemetry(camera_id:str,payload:CameraTelemetry):
+    return apply_camera_telemetry(camera_id,payload)
+
+def store_camera_snapshot(camera_id:str,payload:CameraSnapshotIn):
+    con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
+    if not row: raise HTTPException(404,"Камера не найдена")
+    if not row[0]: return
     try: image=base64.b64decode(payload.jpeg_base64,validate=True)
     except (binascii.Error,ValueError): raise HTTPException(422,"Некорректный base64 JPEG")
     if len(image)>1_300_000 or not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"): raise HTTPException(422,"Некорректный или слишком большой JPEG")
     target=snapshot_path_for(camera_id); target.parent.mkdir(parents=True,exist_ok=True); temp=target.with_name(f".{target.stem}.tmp"); temp.write_bytes(image); temp.replace(target)
+
+@app.post("/api/cameras/{camera_id}/snapshot",status_code=204)
+def upload_camera_snapshot(camera_id:str,payload:CameraSnapshotIn):
+    store_camera_snapshot(camera_id,payload)
+
+@app.post("/api/internal/cameras/{camera_id}/snapshot",status_code=204)
+def internal_camera_snapshot(camera_id:str,payload:CameraSnapshotIn):
+    store_camera_snapshot(camera_id,payload)
+
+@app.post("/api/internal/cameras/{camera_id}/live-frame",status_code=204)
+async def internal_live_frame(camera_id:str,request:Request):
+    con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
+    if not row: raise HTTPException(404,"Камера не найдена")
+    if not row[0]: return
+    image=await request.body()
+    if len(image)>1_300_000 or not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"):
+        raise HTTPException(422,"Некорректный или слишком большой live JPEG")
+    global _live_frame_sequence
+    with _live_frames_lock:
+        _live_frame_sequence+=1
+        _live_frames[camera_id]=(_live_frame_sequence,time.time(),image)
+
+@app.post("/api/internal/events/{event_id}/frame",status_code=204)
+async def internal_event_frame(event_id:int,request:Request):
+    """Persist the annotated frame that produced an accepted event."""
+    con=db(); row=con.execute("SELECT id FROM events WHERE id=?",(event_id,)).fetchone(); con.close()
+    if not row: raise HTTPException(404,"Событие не найдено")
+    image=await request.body()
+    if len(image)>1_300_000 or not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"):
+        raise HTTPException(422,"Некорректный или слишком большой JPEG кадра события")
+    target=event_frame_path_for(event_id); target.parent.mkdir(parents=True,exist_ok=True)
+    temp=target.with_name(f".{target.stem}-{uuid.uuid4().hex}.tmp")
+    temp.write_bytes(image); temp.replace(target)
+
+@app.get("/api/cameras/{camera_id}/mjpeg")
+def camera_mjpeg(camera_id:str):
+    con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
+    if not row: raise HTTPException(404,"Камера не найдена")
+    if not row[0]: raise HTTPException(409,"Аналитика камеры отключена")
+    def generate():
+        sequence=-1
+        while True:
+            with _live_frames_lock:
+                item=_live_frames.get(camera_id)
+            if item and item[0]!=sequence:
+                sequence,_,image=item
+                yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "+str(len(image)).encode()+b"\r\n\r\n"+image+b"\r\n"
+            time.sleep(.02)
+    return StreamingResponse(generate(),media_type="multipart/x-mixed-replace; boundary=frame",headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
 
 @app.get("/api/cameras/{camera_id}/snapshot")
 def camera_snapshot(camera_id:str):
@@ -543,18 +995,23 @@ def camera_snapshot(camera_id:str):
     return FileResponse(target,media_type="image/jpeg",headers={"Cache-Control":"no-store"})
 
 def diagnose_camera_row(camera_id:str):
-    con=db(); row=con.execute("SELECT id,name,rtsp_url,enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
+    con=db(); row=con.execute("SELECT id,name,rtsp_url,enabled,status,telemetry_at,last_error,restart_requested_at FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
     if not row: raise HTTPException(404,"Камера не найдена")
-    if not row[2]: return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"not_configured","latency_ms":None,"message":"RTSP URL не задан"}
-    parsed=urlparse(row[2]); host=parsed.hostname; port=parsed.port or (322 if parsed.scheme=="rtsps" else 554)
-    if not host: return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"invalid_url","latency_ms":None,"message":"Некорректный RTSP URL"}
+    runtime={"camera_status":row[4],"telemetry_age_seconds":telemetry_age_seconds(row[5]),"last_error":row[6],"restart_requested_at":row[7]}
+    if not row[3]: return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"disabled","latency_ms":None,"message":"Аналитика камеры отключена",**runtime}
+    if not row[2]: return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"not_configured","latency_ms":None,"message":"RTSP URL не задан",**runtime}
+    try:
+        parsed=urlparse(row[2]); host=parsed.hostname; port=parsed.port or (322 if parsed.scheme=="rtsps" else 554)
+    except ValueError:
+        return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"invalid_url","latency_ms":None,"message":"Некорректный RTSP URL",**runtime}
+    if not host: return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"invalid_url","latency_ms":None,"message":"Некорректный RTSP URL",**runtime}
     started=time.perf_counter()
     try:
         with socket.create_connection((host,port),timeout=3): pass
         latency=round((time.perf_counter()-started)*1000)
-        return {"camera_id":camera_id,"name":row[1],"reachable":True,"status":"reachable","latency_ms":latency,"message":"TCP-подключение установлено"}
+        return {"camera_id":camera_id,"name":row[1],"reachable":True,"status":"reachable","latency_ms":latency,"message":"TCP-подключение установлено",**runtime}
     except OSError as exc:
-        return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"unreachable","latency_ms":None,"message":str(exc)[:200]}
+        return {"camera_id":camera_id,"name":row[1],"reachable":False,"status":"unreachable","latency_ms":None,"message":str(exc)[:200],**runtime}
 
 @app.post("/api/cameras/{camera_id}/diagnostics")
 def diagnose_camera(camera_id:str):
@@ -565,20 +1022,78 @@ def diagnostics():
     camera_ids=[r["id"] for r in rows("SELECT id FROM cameras ORDER BY id")]
     with ThreadPoolExecutor(max_workers=min(10,max(1,len(camera_ids)))) as pool: camera_results=list(pool.map(diagnose_camera_row,camera_ids))
     for result in camera_results:
-        age=snapshot_age_seconds(result["camera_id"]); result["snapshot_age_seconds"]=age; result["snapshot"]="fresh" if age is not None and age<15 else ("stale" if age is not None else "none")
-    return {"generated_at":now_iso(),"system":system_health_data(),"cameras":camera_results}
+        age=snapshot_age_seconds(result["camera_id"]); result["snapshot_age_seconds"]=age; result["snapshot"]="fresh" if age is not None and age<15 else ("stale" if age is not None else "none"); result["live_frame_age_seconds"]=live_frame_age_seconds(result["camera_id"])
+    return {"generated_at":now_iso(),"system":system_health_data(),"worker":inference_worker_state(),"cameras":camera_results}
 
 @app.get("/api/events")
-def events(limit:int=Query(50,ge=1,le=500),severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None):
+def events(limit:int=Query(50,ge=1,le=500),severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None):
     ack=int(acknowledged) if acknowledged is not None else None
-    return rows("""SELECT e.*,c.name camera_name,c.zone FROM events e JOIN cameras c ON c.id=e.camera_id
-        WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?)
-        ORDER BY e.timestamp DESC LIMIT ?""",(severity,severity,event_type,event_type,ack,ack,limit))
+    data=rows("""SELECT e.*,c.name camera_name,c.zone FROM events e JOIN cameras c ON c.id=e.camera_id
+        WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?) AND (? IS NULL OR e.review_status=?)
+        ORDER BY e.timestamp DESC LIMIT ?""",(severity,severity,event_type,event_type,ack,ack,review_status,review_status,limit))
+    for item in data: item["has_frame"]=event_frame_path_for(int(item["id"])).is_file()
+    return data
+
+@app.get("/api/events/by-id/{event_id}")
+def event_by_id(event_id:int):
+    data=rows("""SELECT e.*,c.name camera_name,c.zone FROM events e JOIN cameras c ON c.id=e.camera_id
+        WHERE e.id=?""",(event_id,))
+    if not data: raise HTTPException(404,"Событие не найдено")
+    item=data[0]; item["has_frame"]=event_frame_path_for(event_id).is_file()
+    return item
+
+@app.get("/api/events/{event_id}/frame")
+def event_frame(event_id:int):
+    con=db(); row=con.execute("SELECT id FROM events WHERE id=?",(event_id,)).fetchone(); con.close()
+    if not row: raise HTTPException(404,"Событие не найдено")
+    target=event_frame_path_for(event_id)
+    if not target.is_file(): raise HTTPException(404,"Кадр события ещё не сохранён")
+    return FileResponse(target,media_type="image/jpeg",headers={"Cache-Control":"no-store"})
+
+def _bulk_review_events(payload:BulkAckIn,review_status:Literal["accepted","rejected"],default_note:str) -> dict:
+    """Apply one review decision to a validated group of event IDs."""
+    event_ids=payload.event_ids
+    marks=",".join("?" for _ in event_ids)
+    note=payload.note.strip() or default_note
+    con=db()
+    try:
+        rows_found=con.execute(f"SELECT id,review_status FROM events WHERE id IN ({marks})",event_ids).fetchall()  # nosec B608 - placeholders only
+        found={int(row[0]):str(row[1] or "pending") for row in rows_found}
+        missing=[event_id for event_id in event_ids if event_id not in found]
+        updated=[event_id for event_id in event_ids if found.get(event_id)!=review_status]
+        already=[event_id for event_id in event_ids if found.get(event_id)==review_status]
+        if updated:
+            update_marks=",".join("?" for _ in updated)
+            con.execute(f"UPDATE events SET acknowledged=1,review_status=?,reviewed_at=?,note=? WHERE id IN ({update_marks})",(review_status,now_iso(),note,*updated))  # nosec B608 - placeholders only
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","event_manager",f"Bulk review status={review_status} updated={len(updated)} already={len(already)} missing={len(missing)}"))
+        con.commit()
+        return {"updated_ids":updated,"already_ids":already,"missing_ids":missing,"review_status":review_status,"note":note}
+    finally:
+        con.close()
+
+@app.post("/api/events/ack-bulk")
+def ack_events_bulk(payload:BulkAckIn):
+    result=_bulk_review_events(payload,"accepted","Проверено оператором")
+    return {**result,"acknowledged_ids":result["updated_ids"],"already_acknowledged_ids":result["already_ids"]}
+
+@app.post("/api/events/reject-bulk")
+def reject_events_bulk(payload:BulkAckIn):
+    result=_bulk_review_events(payload,"rejected","Не принято оператором")
+    return {**result,"rejected_ids":result["updated_ids"],"already_rejected_ids":result["already_ids"]}
+
 @app.post("/api/events/{event_id}/ack")
 def ack(event_id:int,payload:AckIn):
-    con=db(); cur=con.execute("UPDATE events SET acknowledged=1,note=? WHERE id=?",(payload.note,event_id)); con.commit(); con.close()
+    note=payload.note.strip() or "Проверено оператором"
+    con=db(); cur=con.execute("UPDATE events SET acknowledged=1,review_status='accepted',reviewed_at=?,note=? WHERE id=?",(now_iso(),note,event_id)); con.commit(); con.close()
     if not cur.rowcount: raise HTTPException(404,"Событие не найдено")
-    return {"id":event_id,"acknowledged":True}
+    return {"id":event_id,"acknowledged":True,"review_status":"accepted","note":note}
+
+@app.post("/api/events/{event_id}/reject")
+def reject_event(event_id:int,payload:AckIn):
+    note=payload.note.strip() or "Не принято оператором"
+    con=db(); cur=con.execute("UPDATE events SET acknowledged=1,review_status='rejected',reviewed_at=?,note=? WHERE id=?",(now_iso(),note,event_id)); con.commit(); con.close()
+    if not cur.rowcount: raise HTTPException(404,"Событие не найдено")
+    return {"id":event_id,"acknowledged":True,"review_status":"rejected","note":note}
 @app.post("/api/inference/detections")
 def ingest_detections(payload:DetectionBatch):
     """Validated contract from inference workers to the event subsystem."""
@@ -589,7 +1104,8 @@ def ingest_detections(payload:DetectionBatch):
     except ValueError: cooldown=30
     accepted=[]; rejected=[]
     for i,d in enumerate(payload.detections):
-        cam=con.execute("SELECT status,enabled FROM cameras WHERE id=?",(d.camera_id,)).fetchone()
+        cam=con.execute("SELECT status,enabled,telemetry_at FROM cameras WHERE id=?",(d.camera_id,)).fetchone()
+        cam_age=telemetry_age_seconds(cam[2]) if cam else None
         reason=None; normalized_timestamp=now_iso()
         if d.detection_id:
             existing=con.execute("SELECT id FROM events WHERE external_id=?",(d.detection_id,)).fetchone()
@@ -602,7 +1118,7 @@ def ingest_detections(payload:DetectionBatch):
         if not reason:
             if d.model_name != active: reason=f"stale_model: active={active}"
             elif not cam: reason="unknown_camera"
-            elif cam[0] != "online" or not cam[1]: reason="camera_unavailable"
+            elif cam[0] != "online" or not cam[1] or cam_age is None or cam_age>CAMERA_TELEMETRY_STALE_SECONDS: reason="camera_unavailable"
             else:
                 key=thresholds[d.event_type]; threshold=float(con.execute("SELECT value FROM settings WHERE key=?",(key,)).fetchone()[0])
                 if d.confidence < threshold: reason=f"below_threshold:{threshold}"
@@ -655,6 +1171,137 @@ def update_config(payload:ConfigPatch):
     con.commit(); con.close()
     return {"updated":list(payload.values),"restart_required":any(k in payload.values for k in ("inference_device","minio_endpoint"))}
 
+def _bot_settings_map(con: sqlite3.Connection) -> dict[str,str]:
+    keys=[f"{provider}_{field}" for provider in BOT_PROVIDERS for field in ("bot_enabled","alerts_enabled","alert_min_severity","admin_ids","operator_ids","viewer_ids","alert_recipients","webapp_url")]
+    marks=",".join("?" for _ in keys)
+    return {row[0]:row[1] for row in con.execute(f"SELECT key,value FROM settings WHERE key IN ({marks})",keys).fetchall()}  # nosec B608 - placeholders only
+
+
+@app.get("/api/admin/bots")
+def admin_bots():
+    con=db()
+    try:
+        settings=_bot_settings_map(con)
+        providers=[]
+        for provider in BOT_PROVIDERS:
+            runtime=con.execute("SELECT provider,status,detail,enabled,updated_at FROM bot_runtime WHERE provider=?",(provider,)).fetchone()
+            last_command=con.execute("SELECT id,status,error,created_at,completed_at FROM bot_commands WHERE provider=? AND action='test_alert' ORDER BY id DESC LIMIT 1",(provider,)).fetchone()
+            providers.append(_bot_view(provider,settings,runtime,last_command))
+        return {"providers":providers,"active_providers":[provider for provider in BOT_PROVIDERS if settings.get(f"{provider}_bot_enabled")=="true"]}
+    finally:
+        con.close()
+
+
+@app.put("/api/admin/bots/{provider}")
+def update_bot(provider: Literal["telegram","max"], payload: BotConfigIn):
+    if payload.enabled and not _bot_token_configured(provider):
+        label="TELEGRAM_BOT_TOKEN" if provider=="telegram" else "MAX_BOT_TOKEN"
+        raise HTTPException(422,f"Нельзя включить {provider}: {label} не задан на сервере. Токен намеренно не хранится в панели.")
+    try:
+        values={
+            f"{provider}_bot_enabled":"true" if payload.enabled else "false",
+            f"{provider}_alerts_enabled":"true" if payload.alerts_enabled else "false",
+            f"{provider}_alert_min_severity":payload.alert_min_severity,
+            f"{provider}_admin_ids":_normalized_bot_ids(payload.admin_ids),
+            f"{provider}_operator_ids":_normalized_bot_ids(payload.operator_ids),
+            f"{provider}_viewer_ids":_normalized_bot_ids(payload.viewer_ids),
+            f"{provider}_alert_recipients":_normalized_bot_ids(payload.alert_recipients),
+        }
+        if provider=="telegram":
+            url=payload.webapp_url.strip()
+            if url and not url.startswith(("https://","http://localhost")):
+                raise HTTPException(422,"Telegram Mini App URL должен быть HTTPS (localhost разрешён только для локальной разработки)")
+            values["telegram_webapp_url"]=url
+    except ValueError as exc:
+        raise HTTPException(422,str(exc))
+    con=db()
+    try:
+        for key,value in values.items(): con.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,value))
+        # Keep legacy settings coherent for existing integrations and upgrades.
+        if provider=="telegram":
+            con.execute("INSERT INTO settings VALUES('telegram_enabled',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(values[f"{provider}_alerts_enabled"],))
+            con.execute("INSERT INTO settings VALUES('telegram_chat_ids',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(values[f"{provider}_alert_recipients"],))
+            con.execute("INSERT INTO settings VALUES('critical_alerts',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",("true" if payload.alert_min_severity=="critical" else "false",))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","bot_admin",f"{provider} bot configured: enabled={payload.enabled}, alerts={payload.alerts_enabled}"))
+        con.commit()
+        runtime=con.execute("SELECT provider,status,detail,enabled,updated_at FROM bot_runtime WHERE provider=?",(provider,)).fetchone()
+        last_command=con.execute("SELECT id,status,error,created_at,completed_at FROM bot_commands WHERE provider=? AND action='test_alert' ORDER BY id DESC LIMIT 1",(provider,)).fetchone()
+        settings=_bot_settings_map(con)
+        return _bot_view(provider,settings,runtime,last_command)
+    finally:
+        con.close()
+
+
+@app.post("/api/admin/bots/{provider}/test-alert",status_code=202)
+def request_bot_test_alert(provider: Literal["telegram","max"]):
+    if not _bot_token_configured(provider):
+        raise HTTPException(422,"У этого бота нет токена на сервере")
+    con=db()
+    try:
+        settings=_bot_settings_map(con)
+        if settings.get(f"{provider}_bot_enabled")!="true":
+            raise HTTPException(409,"Сначала включите бота и сохраните настройки")
+        cur=con.execute("INSERT INTO bot_commands(provider,action,payload,status,created_at) VALUES(?,?,?,?,?)",(provider,"test_alert",json.dumps({"text":"Тестовое сообщение из Admin панели ZMK Vision"},ensure_ascii=False),"pending",now_iso()))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","bot_admin",f"{provider} test alert queued: command={cur.lastrowid}"))
+        con.commit()
+        return {"id":cur.lastrowid,"provider":provider,"status":"pending","message":"Тест поставлен в очередь бота"}
+    finally:
+        con.close()
+
+
+@app.get("/api/bots/{provider}/runtime")
+def bot_runtime_config(provider: Literal["telegram","max"]):
+    con=db()
+    try:
+        settings=_bot_settings_map(con)
+        return {
+            "provider":provider,
+            "enabled":settings.get(f"{provider}_bot_enabled","false")=="true",
+            "alerts_enabled":settings.get(f"{provider}_alerts_enabled","false")=="true",
+            "alert_min_severity":settings.get(f"{provider}_alert_min_severity","high"),
+            "admin_ids":_parse_bot_ids(settings.get(f"{provider}_admin_ids")),
+            "operator_ids":_parse_bot_ids(settings.get(f"{provider}_operator_ids")),
+            "viewer_ids":_parse_bot_ids(settings.get(f"{provider}_viewer_ids")),
+            "alert_recipients":_parse_bot_ids(settings.get(f"{provider}_alert_recipients")),
+            "webapp_url":settings.get("telegram_webapp_url","") if provider=="telegram" else "",
+        }
+    finally:
+        con.close()
+
+
+@app.post("/api/bots/{provider}/heartbeat")
+def bot_heartbeat(provider: Literal["telegram","max"], payload: BotHeartbeatIn):
+    con=db(); con.execute("INSERT INTO bot_runtime(provider,status,detail,enabled,updated_at) VALUES(?,?,?,?,?) ON CONFLICT(provider) DO UPDATE SET status=excluded.status,detail=excluded.detail,enabled=excluded.enabled,updated_at=excluded.updated_at",(provider,payload.status,payload.detail,payload.enabled,now_iso())); con.commit(); con.close()
+    return {"provider":provider,"status":payload.status}
+
+
+@app.get("/api/bots/{provider}/commands")
+def bot_commands(provider: Literal["telegram","max"], limit:int=Query(10,ge=1,le=50)):
+    con=db()
+    try:
+        result=[]
+        for row in con.execute("SELECT id,action,payload,created_at FROM bot_commands WHERE provider=? AND status='pending' ORDER BY id LIMIT ?",(provider,limit)).fetchall():
+            try: payload=json.loads(row[2])
+            except (TypeError,ValueError,json.JSONDecodeError): payload={}
+            result.append({"id":row[0],"action":row[1],"payload":payload,"created_at":row[3]})
+        return {"commands":result}
+    finally:
+        con.close()
+
+
+@app.post("/api/bots/{provider}/commands/{command_id}/complete")
+def complete_bot_command(provider: Literal["telegram","max"], command_id:int, payload: BotCommandCompleteIn):
+    con=db()
+    try:
+        row=con.execute("SELECT id FROM bot_commands WHERE id=? AND provider=? AND status='pending'",(command_id,provider)).fetchone()
+        if not row: raise HTTPException(404,"Команда бота не найдена или уже завершена")
+        con.execute("UPDATE bot_commands SET status=?,error=?,completed_at=? WHERE id=?",(payload.status,payload.error,now_iso(),command_id))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO" if payload.status=="completed" else "ERROR","bot_admin",f"{provider} command {command_id}: {payload.status}"))
+        con.commit(); return {"id":command_id,"status":payload.status}
+    finally:
+        con.close()
+
+
 @app.get("/api/admin/users")
 def get_users(): return rows("SELECT id,name,login,role,active,created_at FROM users ORDER BY id")
 @app.post("/api/admin/users",status_code=201)
@@ -680,12 +1327,35 @@ def settings(): return {r["key"]:r["value"] for r in rows("SELECT * FROM setting
 @app.put("/api/settings/{key}")
 def update_setting(key:Literal["helmet_conf","vest_conf","phone_conf","smoking_conf","restricted_zone_conf","immobility_conf"],payload:SettingIn):
     con=db(); con.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,str(payload.value))); con.commit(); con.close(); return {"key":key,"value":payload.value}
+def _trial_preset_ids() -> set[str]:
+    """IDs allowed to run only after an explicit trial-mode request."""
+    return {str(p.get("id")) for p in MODEL_PRESETS if p.get("trial_activation")}
+
+
+def _is_trial_preset_source(source: str | None) -> bool:
+    return bool(source and source.startswith("preset:") and source.removeprefix("preset:") in _trial_preset_ids())
+
+
+def _model_meets_quality(precision: float | None, recall: float | None, limits: dict[str, float]) -> bool:
+    return bool(
+        precision is not None
+        and recall is not None
+        and precision >= limits.get("min_model_precision", 90)
+        and recall >= limits.get("min_model_recall", 85)
+    )
+
+
 @app.get("/api/models")
 def models():
     active=rows("SELECT value FROM settings WHERE key='active_model'")[0]["value"]
+    limits={r["key"]:float(r["value"]) for r in rows("SELECT key,value FROM settings WHERE key IN ('min_model_precision','min_model_recall')")}
     data=rows("SELECT name,format,status,precision,recall,trained_at,source,artifact_uri,checksum FROM model_registry ORDER BY id DESC")
-    for item in data: item["active"]=item["name"]==active
+    for item in data:
+        item["active"]=item["name"]==active
+        item["trial_eligible"]=_is_trial_preset_source(item.get("source"))
+        item["trial_mode"]=bool(item["active"] and item["trial_eligible"] and not _model_meets_quality(item.get("precision"),item.get("recall"),limits))
     return data
+
 
 @app.post("/api/models",status_code=201)
 def register_model(payload:ModelIn):
@@ -694,14 +1364,17 @@ def register_model(payload:ModelIn):
     except sqlite3.IntegrityError: con.close(); raise HTTPException(409,"Модель с таким именем уже существует")
     con.close(); return {"name":payload.name,"status":"ready","registered":True}
 
+
 def _preset_view(preset:dict) -> dict:
     name=preset["name"]
     existing=rows("SELECT name,status,precision,recall,source FROM model_registry WHERE name=?",(name,))
     return {**{k:v for k,v in preset.items() if k!="url"},"downloaded":bool(existing),"registered":bool(existing),"source":existing[0]["source"] if existing else None}
 
+
 @app.get("/api/models/presets")
 def model_presets():
     return {"presets":[_preset_view(p) for p in MODEL_PRESETS]}
+
 
 @app.post("/api/models/presets/{preset_id}/download",status_code=200)
 def download_model_preset(preset_id:str):
@@ -709,8 +1382,10 @@ def download_model_preset(preset_id:str):
     if not preset: raise HTTPException(404,"Такой пресет не найден")
     name=preset["name"]
     existing=rows("SELECT name,source,status FROM model_registry WHERE name=?",(name,))
-    if existing: return {"downloaded":False,"already":True,"model":name,"source":existing[0]["source"],"message":f"Модель {name} уже в реестре. Если файл отсутствует на диске, активация покажет ошибку."}
+    if existing: return {"downloaded":False,"already":True,"model":name,"source":existing[0]["source"],"trial_activation":bool(preset.get("trial_activation")),"message":f"Модель {name} уже в реестре. Если файл отсутствует на диске, активация покажет ошибку."}
     if not re.fullmatch(r"[A-Za-z0-9._-]{2,120}",name): raise HTTPException(422,"Недопустимое имя модели")
+    try: minimum_bytes=max(1,int(preset.get("min_bytes",1)))
+    except (TypeError,ValueError): minimum_bytes=1
     MODEL_DIR.mkdir(parents=True,exist_ok=True)
     ext=".pt"
     dest=MODEL_DIR/f"{name}{ext}"
@@ -723,8 +1398,13 @@ def download_model_preset(preset_id:str):
                 for chunk in resp.iter_bytes():
                     fh.write(chunk); total+=len(chunk)
                     if total>200_000_000: raise HTTPException(413,"Модель слишком большая")
+        if total<minimum_bytes:
+            raise HTTPException(502,"Скачанный файл модели слишком мал или повреждён")
         tmp.replace(dest)
-    except httpx.HTTPError as exc:
+    except HTTPException:
+        tmp.unlink(missing_ok=True)
+        raise
+    except (httpx.HTTPError,OSError) as exc:
         tmp.unlink(missing_ok=True)
         raise HTTPException(502,f"Не удалось скачать модель: {type(exc).__name__}") from exc
     digest=hashlib.sha256(dest.read_bytes()).hexdigest()
@@ -734,30 +1414,97 @@ def download_model_preset(preset_id:str):
     except sqlite3.IntegrityError:
         con.close(); dest.unlink(missing_ok=True); raise HTTPException(409,"Модель с таким именем уже существует")
     con.close()
-    return {"downloaded":True,"model":name,"artifact_uri":f"file://{dest}","size_bytes":total,"sha256":digest,"requires_validation":True,"message":f"Модель {name} скачана и зарегистрирована. Метрики не заданы — обучите на своих данных или укажите метрики валидации, затем активируйте."}
+    trial=bool(preset.get("trial_activation"))
+    message=("PPE-модель скачана. Нажмите «Включить PPE-тест», чтобы проверить её на своих камерах." if trial else f"Модель {name} скачана и зарегистрирована. Метрики не заданы — обучите на своих данных или укажите метрики валидации, затем активируйте.")
+    return {"downloaded":True,"model":name,"artifact_uri":f"file://{dest}","size_bytes":total,"sha256":digest,"requires_validation":True,"trial_activation":trial,"message":message}
+
 
 @app.get("/api/models/active/health")
 def active_model_health():
-    con=db(); active=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone(); model=con.execute("SELECT name,format,status,precision,recall,trained_at,source FROM model_registry WHERE name=?",(active[0],)).fetchone() if active else None
-    last=con.execute("SELECT timestamp,message FROM logs WHERE service='inference_gateway' ORDER BY id DESC LIMIT 1").fetchone(); limits={r[0]:float(r[1]) for r in con.execute("SELECT key,value FROM settings WHERE key IN ('min_model_precision','min_model_recall')").fetchall()}; con.close()
+    con=db()
+    try:
+        active=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()
+        model=con.execute("SELECT name,format,status,precision,recall,trained_at,source FROM model_registry WHERE name=?",(active[0],)).fetchone() if active else None
+        last=con.execute("SELECT timestamp,message FROM logs WHERE service='inference_gateway' ORDER BY id DESC LIMIT 1").fetchone()
+        limits={r[0]:float(r[1]) for r in con.execute("SELECT key,value FROM settings WHERE key IN ('min_model_precision','min_model_recall')").fetchall()}
+    finally:
+        con.close()
     if not model: raise HTTPException(503,"Активная модель отсутствует в реестре")
-    healthy=model[2]=="ready" and model[3] is not None and model[4] is not None and model[3]>=limits.get('min_model_precision',90) and model[4]>=limits.get('min_model_recall',85)
-    return {"healthy":healthy,"model":dict(model),"requirements":{"precision":limits.get('min_model_precision',90),"recall":limits.get('min_model_recall',85)},"last_inference":dict(last) if last else None}
+    healthy=model[2]=="ready" and _model_meets_quality(model[3],model[4],limits)
+    trial_mode=bool(not healthy and _is_trial_preset_source(model[6]))
+    return {"healthy":healthy,"trial_mode":trial_mode,"model":dict(model),"requirements":{"precision":limits.get('min_model_precision',90),"recall":limits.get('min_model_recall',85)},"last_inference":dict(last) if last else None}
+
+
+def _activate_model(name:str, *, allow_trial:bool=False):
+    started=time.perf_counter()
+    con=db()
+    try:
+        model=con.execute("SELECT status,precision,recall,source FROM model_registry WHERE name=?",(name,)).fetchone()
+        if not model: raise HTTPException(404,"Модель не найдена")
+        if model[0] != "ready": raise HTTPException(409,"Модель ещё не готова")
+        limits={r[0]:float(r[1]) for r in con.execute("SELECT key,value FROM settings WHERE key IN ('min_model_precision','min_model_recall')").fetchall()}
+        quality_ok=_model_meets_quality(model[1],model[2],limits)
+        trial_mode=not quality_ok and allow_trial and _is_trial_preset_source(model[3])
+        if not quality_ok and not trial_mode:
+            if model[1] is None or model[2] is None:
+                raise HTTPException(409,"У модели отсутствуют метрики валидации. Для PPE-пресета используйте отдельную кнопку «Включить PPE-тест».")
+            raise HTTPException(409,"Метрики модели ниже минимально допустимых")
+        con.execute("BEGIN IMMEDIATE")
+        old=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()[0]
+        if old==name:
+            con.execute("UPDATE settings SET value='false' WHERE key='active_model_disabled'")
+            con.commit()
+            return {"active_model":name,"previous_model":old,"hot_swap":False,"idempotent":True,"trial_mode":trial_mode,"control_plane_switch_ms":round((time.perf_counter()-started)*1000,2),"downtime_ms":0}
+        con.execute("UPDATE settings SET value=? WHERE key='active_model'",(name,))
+        # Keep a validated model selected before a PPE test so stopping the
+        # test restores the exact previous state instead of leaving an
+        # operator unexpectedly without analytics.
+        con.execute("UPDATE settings SET value=? WHERE key='ppe_trial_previous_model'",(old if trial_mode else "",))
+        con.execute("UPDATE settings SET value='false' WHERE key='active_model_disabled'")
+        level="WARNING" if trial_mode else "INFO"
+        mode="PPE trial" if trial_mode else "validated"
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),level,"model_manager",f"Control-plane hot-swap {old} -> {name} ({mode}) completed"))
+        con.commit()
+        return {"active_model":name,"previous_model":old,"hot_swap":True,"idempotent":False,"trial_mode":trial_mode,"control_plane_switch_ms":round((time.perf_counter()-started)*1000,2),"downtime_ms":0}
+    finally:
+        con.close()
+
 
 @app.post("/api/models/{name}/activate")
 def activate(name:str):
-    started=time.perf_counter(); con=db(); model=con.execute("SELECT status,precision,recall FROM model_registry WHERE name=?",(name,)).fetchone()
-    if not model: con.close(); raise HTTPException(404,"Модель не найдена")
-    if model[0] != "ready": con.close(); raise HTTPException(409,"Модель ещё не готова")
-    if model[1] is None or model[2] is None: con.close(); raise HTTPException(409,"У модели отсутствуют метрики валидации")
-    limits={r[0]:float(r[1]) for r in con.execute("SELECT key,value FROM settings WHERE key IN ('min_model_precision','min_model_recall')").fetchall()}
-    if model[1]<limits.get('min_model_precision',90) or model[2]<limits.get('min_model_recall',85): con.close(); raise HTTPException(409,"Метрики модели ниже минимально допустимых")
-    con.execute("BEGIN IMMEDIATE"); old=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()[0]
-    if old==name:
-        con.commit(); con.close(); return {"active_model":name,"previous_model":old,"hot_swap":False,"idempotent":True,"control_plane_switch_ms":round((time.perf_counter()-started)*1000,2),"downtime_ms":0}
-    con.execute("UPDATE settings SET value=? WHERE key='active_model'",(name,))
-    con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","model_manager",f"Control-plane hot-swap {old} -> {name} completed"))
-    con.commit(); con.close(); return {"active_model":name,"previous_model":old,"hot_swap":True,"idempotent":False,"control_plane_switch_ms":round((time.perf_counter()-started)*1000,2),"downtime_ms":0}
+    return _activate_model(name)
+
+
+@app.post("/api/models/{name}/activate-trial")
+def activate_trial_model(name:str):
+    """Explicitly enable only the selected PPE baseline for an on-site trial."""
+    return _activate_model(name,allow_trial=True)
+
+
+@app.post("/api/models/{name}/deactivate-trial")
+def deactivate_trial_model(name:str):
+    """Stop the explicit PPE trial and leave camera preview running."""
+    con=db()
+    try:
+        row=con.execute("SELECT source FROM model_registry WHERE name=?",(name,)).fetchone()
+        if not row: raise HTTPException(404,"Модель не найдена")
+        if not _is_trial_preset_source(row[0]): raise HTTPException(409,"Остановить через этот маршрут можно только PPE-тест")
+        active=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()[0]
+        if active != name:
+            return {"active_model":active,"stopped":False,"idempotent":True}
+        previous_row=con.execute("SELECT value FROM settings WHERE key='ppe_trial_previous_model'").fetchone()
+        previous=previous_row[0] if previous_row else ""
+        restored=""
+        if previous and con.execute("SELECT 1 FROM model_registry WHERE name=? AND status='ready'",(previous,)).fetchone():
+            restored=previous
+        con.execute("UPDATE settings SET value=? WHERE key='active_model'",(restored,))
+        con.execute("UPDATE settings SET value=? WHERE key='active_model_disabled'",("false" if restored else "true",))
+        con.execute("UPDATE settings SET value='' WHERE key='ppe_trial_previous_model'")
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"PPE trial stopped: {name}; restored={restored or 'none'}"))
+        con.commit()
+        return {"active_model":restored,"restored_model":restored or None,"stopped":True,"idempotent":False}
+    finally:
+        con.close()
 
 @app.delete("/api/models/{name}")
 def delete_model(name:str):
@@ -898,14 +1645,126 @@ def upload_dataset(name:str=Query(min_length=2,max_length=120),payload:bytes=Bod
         shutil.rmtree(workdir,ignore_errors=True)
 @app.delete("/api/datasets/{dataset_id}")
 def delete_dataset(dataset_id:int):
-    row=rows("SELECT id,name FROM datasets WHERE id=?",(dataset_id,))
-    if not row: raise HTTPException(404,"Датасет не найден")
-    name=row[0]["name"]
-    if rows("SELECT 1 FROM training_jobs WHERE dataset_name=? AND status IN ('queued','running')",(name,)):
-        raise HTTPException(409,"Датасет используется текущей задачей обучения")
-    con=db(); con.execute("DELETE FROM datasets WHERE id=?",(dataset_id,)); con.commit(); con.close()
-    shutil.rmtree(DATASET_DIR/name,ignore_errors=True)
-    return {"id":dataset_id,"deleted":True,"name":name}
+    """Delete a saved dataset and its files without hiding a failed removal.
+
+    A failed filesystem operation used to be ignored, so the UI could report a
+    successful deletion while the data still occupied the dataset volume.  Do
+    the filesystem step first and leave the registry entry intact on an error,
+    which gives the operator a retryable, honest result.
+    """
+    con=db()
+    try:
+        row=con.execute("SELECT id,name FROM datasets WHERE id=?",(dataset_id,)).fetchone()
+        if not row:
+            raise HTTPException(404,"Датасет не найден")
+        name=row["name"]
+        training=con.execute("SELECT id,target_name FROM training_jobs WHERE dataset_name=? AND status IN ('queued','running') ORDER BY id DESC LIMIT 1",(name,)).fetchone()
+        if training:
+            raise HTTPException(409,f"Датасет используется задачей обучения «{training['target_name']}» (№{training['id']}). Сначала отмените её или дождитесь завершения.")
+        capture=con.execute("SELECT id FROM dataset_capture_jobs WHERE name=? AND status IN ('queued','running') ORDER BY id DESC LIMIT 1",(name,)).fetchone()
+        if capture:
+            raise HTTPException(409,f"Датасет сейчас собирается (задача №{capture['id']}). Сначала отмените сбор.")
+
+        # Dataset names are slugified on input, and the API always constructs
+        # the path from that name rather than trusting the database path.
+        target=DATASET_DIR/name
+        try:
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            elif target.exists() or target.is_symlink():
+                # A stale file/symlink must not survive after its registry row
+                # is removed; unlinking a symlink never follows it.
+                target.unlink()
+        except OSError as exc:
+            raise HTTPException(500,f"Не удалось удалить файлы датасета: {exc.strerror or str(exc)}") from exc
+
+        con.execute("DELETE FROM datasets WHERE id=?",(dataset_id,))
+        # A deleted camera-captured dataset should be collectable again under
+        # the same name. Keep active jobs protected above, but clear terminal
+        # history records whose unique name would otherwise block it forever.
+        con.execute("DELETE FROM dataset_capture_jobs WHERE name=? AND status NOT IN ('queued','running')",(name,))
+        con.commit()
+        return {"id":dataset_id,"deleted":True,"name":name}
+    finally:
+        con.close()
+
+class DatasetCaptureIn(BaseModel):
+    camera_id:str=Field(min_length=1,max_length=64)
+    name:str=Field(min_length=2,max_length=120)
+    image_count:int=Field(default=100,ge=20,le=5000)
+    capture_fps:float=Field(default=2,ge=.1,le=20)
+
+async def collect_camera_dataset(job_id:int) -> None:
+    target:Path|None=None
+    try:
+        con=db(); job=con.execute("SELECT name,camera_id,target_count,capture_fps FROM dataset_capture_jobs WHERE id=?",(job_id,)).fetchone()
+        if not job: con.close(); return
+        con.execute("UPDATE dataset_capture_jobs SET status='running',stage='Ожидание live-кадров',updated_at=? WHERE id=?",(now_iso(),job_id)); con.commit(); con.close()
+        name,camera_id,target_count,capture_fps=job[0],job[1],job[2],job[3]
+        target=DATASET_DIR/name; images=target/'images'; images.mkdir(parents=True,exist_ok=False)
+        last_sequence=-1; captured=0; last_progress=0.; no_frame_since=time.monotonic()
+        interval=1/max(.1,float(capture_fps))
+        while captured<target_count:
+            with _live_frames_lock: frame=_live_frames.get(camera_id)
+            if frame and frame[0]!=last_sequence:
+                started=time.monotonic(); sequence,_,jpeg=frame
+                path=images/f'frame_{captured+1:06}.jpg'; temp=path.with_suffix('.tmp'); temp.write_bytes(jpeg); temp.replace(path)
+                last_sequence=sequence; captured+=1; no_frame_since=time.monotonic()
+                if captured==target_count or time.monotonic()-last_progress>=.5:
+                    con=db(); con.execute("UPDATE dataset_capture_jobs SET captured_count=?,stage='Сбор кадров',updated_at=? WHERE id=?",(captured,now_iso(),job_id)); con.commit(); con.close(); last_progress=time.monotonic()
+                await asyncio.sleep(max(0.,interval-(time.monotonic()-started)))
+                continue
+            if time.monotonic()-no_frame_since>45: raise RuntimeError('Нет live-кадров от камеры более 45 секунд')
+            await asyncio.sleep(.05)
+        con=db(); cur=con.execute("INSERT INTO datasets(name,path,image_count,class_count,created_at,kind,media_count,label_count) VALUES(?,?,?,?,?,?,?,?)",(name,str(target),captured,0,now_iso(),'images',captured,0)); dataset_id=cur.lastrowid
+        con.execute("UPDATE dataset_capture_jobs SET status='completed',captured_count=?,stage='Датасет готов',updated_at=? WHERE id=?",(captured,now_iso(),job_id)); con.commit(); con.close()
+        _=dataset_id
+    except asyncio.CancelledError:
+        con=db(); con.execute("UPDATE dataset_capture_jobs SET status='cancelled',stage='Отменено',updated_at=? WHERE id=?",(now_iso(),job_id)); con.commit(); con.close()
+        if target: shutil.rmtree(target,ignore_errors=True)
+        raise
+    except Exception as exc:  # noqa: BLE001 - show real capture error to operator.
+        con=db(); con.execute("UPDATE dataset_capture_jobs SET status='failed',stage='Ошибка',error=?,updated_at=? WHERE id=?",(str(exc)[:500],now_iso(),job_id)); con.commit(); con.close()
+        if target: shutil.rmtree(target,ignore_errors=True)
+    finally:
+        _dataset_capture_tasks.pop(job_id,None)
+
+@app.post("/api/datasets/capture",status_code=202)
+async def capture_dataset_from_camera(payload:DatasetCaptureIn):
+    name=_slugify(payload.name)
+    con=db(); camera=con.execute("SELECT enabled FROM cameras WHERE id=?",(payload.camera_id,)).fetchone()
+    if not camera: con.close(); raise HTTPException(404,'Камера не найдена')
+    if not camera[0]: con.close(); raise HTTPException(409,'Аналитика камеры отключена')
+    if con.execute("SELECT 1 FROM datasets WHERE name=?",(name,)).fetchone(): con.close(); raise HTTPException(409,'Датасет с таким именем уже существует')
+    previous_job=con.execute("SELECT id,status FROM dataset_capture_jobs WHERE name=?",(name,)).fetchone()
+    if previous_job:
+        previous_task=_dataset_capture_tasks.get(previous_job["id"])
+        if previous_job["status"] in {'queued','running'}:
+            con.close(); raise HTTPException(409,f'Сбор с таким именем уже выполняется (задача №{previous_job["id"]})')
+        # cancel_dataset_capture marks the database record first and the task
+        # removes its temporary directory moments later. Do not start another
+        # job with the same directory until that cleanup has actually ended.
+        if previous_task and not previous_task.done():
+            con.close(); raise HTTPException(409,'Предыдущий сбор ещё отменяется; повторите через несколько секунд')
+        # Terminal jobs are history, not a permanent reservation of a dataset
+        # name. This also lets an operator repeat a failed/cancelled collection.
+        con.execute("DELETE FROM dataset_capture_jobs WHERE name=?",(name,))
+    cur=con.execute("INSERT INTO dataset_capture_jobs(name,camera_id,target_count,capture_fps,status,captured_count,stage,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",(name,payload.camera_id,payload.image_count,payload.capture_fps,'queued',0,'В очереди',now_iso(),now_iso())); con.commit(); job_id=cur.lastrowid; con.close()
+    task=asyncio.create_task(collect_camera_dataset(job_id),name=f'dataset-capture-{job_id}'); _dataset_capture_tasks[job_id]=task
+    return {'id':job_id,'name':name,'camera_id':payload.camera_id,'target_count':payload.image_count,'capture_fps':payload.capture_fps,'status':'queued'}
+
+@app.get("/api/datasets/capture/jobs")
+def dataset_capture_jobs(): return rows("SELECT * FROM dataset_capture_jobs ORDER BY id DESC LIMIT 20")
+
+@app.post("/api/datasets/capture/jobs/{job_id}/cancel")
+def cancel_dataset_capture(job_id:int):
+    con=db(); row=con.execute("SELECT status FROM dataset_capture_jobs WHERE id=?",(job_id,)).fetchone()
+    if not row: con.close(); raise HTTPException(404,'Задача сбора не найдена')
+    if row[0] not in {'queued','running'}: con.close(); raise HTTPException(409,'Задача уже завершена')
+    con.execute("UPDATE dataset_capture_jobs SET status='cancelled',stage='Отменено оператором',updated_at=? WHERE id=?",(now_iso(),job_id)); con.commit(); con.close()
+    task=_dataset_capture_tasks.get(job_id)
+    if task: task.cancel()
+    return {'id':job_id,'status':'cancelled'}
 
 class DatasetPreviewIn(BaseModel):
     confidence:float|None=Field(default=None,ge=.05,le=.95)
@@ -918,7 +1777,7 @@ def preview_dataset(dataset_name:str,payload:DatasetPreviewIn|None=None):
     ds=row[0]
     if not Path(ds["path"]).is_dir(): raise HTTPException(503,"Файлы датасета не найдены на диске")
     if not TRAINING_WORKER_URL:
-        raise HTTPException(503,"Сервис обучения не подключён. Запустите Compose profile training")
+        raise HTTPException(503,"Сервис обучения не подключён. Проверьте контейнер training-worker")
     active=con_value("active_model","")
     artifact=None
     if active:
@@ -945,7 +1804,7 @@ async def run_training(job_id:int):
 
 @app.post("/api/training/jobs",status_code=202)
 async def start_training(payload:TrainingIn):
-    if not SEED_TEST_DATA and not TRAINING_WORKER_URL: raise HTTPException(503,"Сервис обучения не подключён. Запустите Compose profile training")
+    if not SEED_TEST_DATA and not TRAINING_WORKER_URL: raise HTTPException(503,"Сервис обучения не подключён. Проверьте контейнер training-worker")
     con=db(); cam=None; rtsp=""
     dataset_kind="yolo"
     if payload.source=="dataset":
@@ -1030,17 +1889,194 @@ def error_report_csv(hours:int=Query(24,ge=1,le=720)):
     since=(datetime.now(TZ)-timedelta(hours=hours)).isoformat(); data=sanitize_csv_rows(rows("SELECT timestamp,level,service,camera_id,message FROM logs WHERE level IN ('WARNING','ERROR','CRITICAL') AND timestamp>=? ORDER BY id DESC",(since,)))
     out=io.StringIO(); fields=['timestamp','level','service','camera_id','message']; w=csv.DictWriter(out,fieldnames=fields); w.writeheader(); w.writerows(data)
     return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=zmk-error-report.csv"})
+# Search is intentionally kept local and transparent: it never queries or exposes
+# RTSP URLs/artifact locations, but it understands the words operators use in
+# Russian and English.  SQLite LIKE is case-sensitive for Cyrillic on many
+# builds, so ranking happens after a bounded local read with casefolded text.
+_SEARCH_KIND_ALIASES: dict[str, tuple[str, ...]] = {
+    "camera": ("camera", "cameras", "cam", "камера", "камеры", "видео", "поток", "rtsp"),
+    "event": ("event", "events", "alert", "событие", "события", "нарушение", "нарушения", "тревога"),
+    "model": ("model", "models", "модель", "модели", "ai", "ии"),
+    "dataset": ("dataset", "datasets", "датасет", "датасеты", "набор", "разметка"),
+    "training": ("training", "train", "job", "обучение", "задача", "задачи"),
+}
+_SEARCH_EVENT_LABELS: dict[str, str] = {
+    "no_helmet": "Без каски",
+    "no_vest": "Без жилета",
+    "phone_usage": "Использование телефона",
+    "smoking": "Курение",
+    "restricted_zone": "Опасная зона",
+    "immobility": "Неподвижность",
+}
+_SEARCH_EVENT_ALIASES: dict[str, tuple[str, ...]] = {
+    "no_helmet": ("без каски", "каска", "каски", "каску", "каске", "helmet", "hard hat", "no helmet"),
+    "no_vest": ("без жилета", "жилет", "жилеты", "жилета", "жилету", "vest", "no vest"),
+    "phone_usage": ("телефон", "телефона", "phone", "mobile"),
+    "smoking": ("курение", "курит", "сигарета", "smoking"),
+    "restricted_zone": ("опасная зона", "запретная зона", "проход", "restricted zone"),
+    "immobility": ("неподвижность", "неподвижен", "лежит", "immobility"),
+}
+_SEARCH_SEVERITY_ALIASES: dict[str, tuple[str, ...]] = {
+    "critical": ("critical", "критический", "критические", "критично"),
+    "high": ("high", "высокий", "высокие"),
+    "medium": ("medium", "средний", "средние"),
+    "low": ("low", "низкий", "низкие"),
+}
+_SEARCH_REVIEW_ALIASES: dict[str, tuple[str, ...]] = {
+    "pending": ("pending", "ожидает", "ожидают", "требует внимания", "новое"),
+    "accepted": ("accepted", "принято", "приняты", "подтверждено", "проверено"),
+    "rejected": ("rejected", "не принято", "отклонено", "ложное", "ложные"),
+}
+_SEARCH_CAMERA_STATUS_ALIASES: dict[str, tuple[str, ...]] = {
+    "online": ("online", "онлайн", "в эфире", "работает"),
+    "offline": ("offline", "офлайн", "недоступна", "не в сети"),
+    "connecting": ("connecting", "подключение", "подключается"),
+    "recovering": ("recovering", "восстановление", "переподключение"),
+    "error": ("error", "ошибка"),
+    "unknown": ("unknown", "неизвестно"),
+}
+
+
+def _search_normalize(value: Any) -> str:
+    """Casefold Russian/English text, preserving only searchable word tokens."""
+    raw = str(value or "").casefold().replace("ё", "е").replace("_", " ").replace("-", " ")
+    return " ".join(re.findall(r"[\w]+", raw, flags=re.UNICODE))
+
+
+def _search_alias_text(value: str, aliases: dict[str, tuple[str, ...]]) -> str:
+    return " ".join((value, *aliases.get(value, ())))
+
+
+def _search_parse_query(raw: str) -> tuple[str, set[str] | None]:
+    """Support ergonomic prefixes such as camera:gate and модель:yolo."""
+    normalized = _search_normalize(raw)
+    if not normalized:
+        return "", None
+    alias_to_kind = {alias: kind for kind, aliases in _SEARCH_KIND_ALIASES.items() for alias in aliases}
+    match = re.match(r"^\s*([^:\s]+)\s*:\s*(.*)$", raw.casefold())
+    if match:
+        prefix = _search_normalize(match.group(1))
+        kind = alias_to_kind.get(prefix)
+        if kind:
+            return _search_normalize(match.group(2)), {kind}
+    tokens = normalized.split()
+    if len(tokens) > 1 and tokens[0] in alias_to_kind:
+        return " ".join(tokens[1:]), {alias_to_kind[tokens[0]]}
+    return normalized, None
+
+
+def _search_match(query: str, fields: list[tuple[str, Any]]) -> tuple[int, list[str]] | None:
+    """Return a deterministic relevance score or None if all query words miss.
+
+    Exact words and prefixes rank first.  A conservative SequenceMatcher fallback
+    makes one small typo (for example "касска") usable without pretending that an
+    unrelated record is a match.
+    """
+    tokens = [token for token in _search_normalize(query).split() if token]
+    normalized_fields = [(label, _search_normalize(value)) for label, value in fields if _search_normalize(value)]
+    document = " ".join(value for _, value in normalized_fields)
+    if not document:
+        return None
+    if not tokens:
+        return 1, []
+    words = tuple(dict.fromkeys(document.split()))
+    score = 0
+    for token in tokens:
+        if token in words:
+            score += 110
+        elif any(word.startswith(token) for word in words):
+            score += 82
+        elif token in document:
+            score += 58
+        elif len(token) >= 3:
+            nearby = (word for word in words if abs(len(word) - len(token)) <= max(2, len(token) // 3))
+            similarity = max((SequenceMatcher(None, token, word).ratio() for word in nearby), default=0.0)
+            if similarity >= 0.82:
+                score += int(28 + similarity * 42)
+            else:
+                return None
+        else:
+            return None
+    phrase = " ".join(tokens)
+    if phrase and phrase in document:
+        score += 90
+    matches = [label for label, value in normalized_fields if phrase in value or any(token in value for token in tokens)]
+    return score, matches[:2] or ["похожее совпадение"]
+
+
+def _search_subtitle_status(value: str, aliases: dict[str, tuple[str, ...]]) -> str:
+    labels = {
+        "online": "Онлайн", "offline": "Офлайн", "connecting": "Подключение", "recovering": "Восстановление", "error": "Ошибка", "unknown": "Неизвестно",
+        "critical": "Критический", "high": "Высокий", "medium": "Средний", "low": "Низкий",
+        "pending": "Требует внимания", "accepted": "Принято", "rejected": "Не принято",
+    }
+    return labels.get(value, value)
+
+
 @app.get("/api/search")
-def global_search(q:str=Query(min_length=2,max_length=100),limit:int=Query(20,ge=1,le=50)):
-    term=f"%{q.strip()}%"; con=db(); results=[]
-    for row in con.execute("SELECT id,name,zone,description,status FROM cameras WHERE name LIKE ? OR zone LIKE ? OR description LIKE ? LIMIT ?",(term,term,term,limit)).fetchall(): results.append({"kind":"camera","id":row[0],"title":row[1],"subtitle":f"{row[2]} · {row[4]}"})
-    remaining=max(0,limit-len(results))
-    if remaining:
-        for row in con.execute("SELECT id,type,camera_id,severity,timestamp FROM events WHERE type LIKE ? OR person_id LIKE ? OR note LIKE ? ORDER BY timestamp DESC LIMIT ?",(term,term,term,remaining)).fetchall(): results.append({"kind":"event","id":row[0],"title":row[1],"subtitle":f"{row[2]} · {row[3]} · {row[4]}"})
-    remaining=max(0,limit-len(results))
-    if remaining:
-        for row in con.execute("SELECT name,format,status,source FROM model_registry WHERE name LIKE ? OR source LIKE ? LIMIT ?",(term,term,remaining)).fetchall(): results.append({"kind":"model","id":row[0],"title":row[0],"subtitle":f"{row[1]} · {row[2]}"})
-    con.close(); return {"query":q,"results":results}
+def global_search(q: str = Query(min_length=1, max_length=100), limit: int = Query(20, ge=1, le=50)):
+    query, requested_kinds = _search_parse_query(q)
+    # A prefix alone (for example "camera:") is a useful browse command.
+    # Unprefixed punctuation-only input, however, has no meaningful result.
+    if not query and requested_kinds is None:
+        return {"query": q, "normalized_query": "", "results": []}
+    con = db()
+    candidates: list[tuple[int, int, dict[str, Any]]] = []
+    kind_rank = {"camera": 0, "event": 1, "model": 2, "dataset": 3, "training": 4}
+
+    def add(kind: str, item_id: str | int, title: str, subtitle: str, fields: list[tuple[str, Any]]) -> None:
+        if requested_kinds is not None and kind not in requested_kinds:
+            return
+        # Kind words make broad queries like "камера" or "модель" useful even
+        # when the record itself has an arbitrary operator-assigned name.
+        kind_words = " ".join(_SEARCH_KIND_ALIASES.get(kind, (kind,)))
+        match = _search_match(query, [("категория", kind_words), *fields])
+        if match is None:
+            return
+        score, matches = match
+        candidates.append((score, kind_rank[kind], {"kind": kind, "id": item_id, "title": title, "subtitle": subtitle, "matches": matches}))
+
+    try:
+        for row in con.execute("SELECT id,name,zone,description,status,fps FROM cameras ORDER BY updated_at DESC,id LIMIT 1000").fetchall():
+            status = str(row[4] or "unknown")
+            add("camera", row[0], row[1], f"{row[2] or 'Без зоны'} · {_search_subtitle_status(status, _SEARCH_CAMERA_STATUS_ALIASES)} · {float(row[5] or 0):.1f} FPS", [
+                ("название", row[1]), ("ID камеры", row[0]), ("зона", row[2]), ("описание", row[3]), ("статус", _search_alias_text(status, _SEARCH_CAMERA_STATUS_ALIASES)),
+            ])
+        for row in con.execute("""SELECT e.id,e.type,e.camera_id,e.severity,e.timestamp,e.person_id,e.note,e.review_status,c.name,c.zone
+            FROM events e LEFT JOIN cameras c ON c.id=e.camera_id ORDER BY e.timestamp DESC LIMIT 1200""").fetchall():
+            event_type = str(row[1] or "")
+            severity = str(row[3] or "")
+            review = str(row[7] or "pending")
+            label = _SEARCH_EVENT_LABELS.get(event_type, event_type.replace("_", " ") or "Событие")
+            camera_name = str(row[8] or row[2])
+            add("event", int(row[0]), label, f"{camera_name} · {_search_subtitle_status(severity, _SEARCH_SEVERITY_ALIASES)} · {_search_subtitle_status(review, _SEARCH_REVIEW_ALIASES)} · {row[4]}", [
+                ("тип события", _search_alias_text(event_type, _SEARCH_EVENT_ALIASES)), ("камера", camera_name), ("ID камеры", row[2]), ("зона", row[9]),
+                ("критичность", _search_alias_text(severity, _SEARCH_SEVERITY_ALIASES)), ("решение", _search_alias_text(review, _SEARCH_REVIEW_ALIASES)),
+                ("объект", row[5]), ("комментарий", row[6]), ("ID события", row[0]),
+            ])
+        active_row = con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()
+        active_model_name = str(active_row[0]) if active_row else ""
+        for row in con.execute("SELECT name,format,status,source,precision,recall FROM model_registry ORDER BY id DESC LIMIT 500").fetchall():
+            is_active = active_model_name == str(row[0])
+            subtitle = f"{row[1]} · {row[2]}" + (" · активна" if is_active else "")
+            add("model", row[0], row[0], subtitle, [
+                ("название", row[0]), ("формат", row[1]), ("статус", row[2]), ("источник", row[3]), ("активность", "активная используется" if is_active else "не активна"),
+            ])
+        for row in con.execute("SELECT id,name,kind,image_count,media_count,class_count FROM datasets ORDER BY id DESC LIMIT 500").fetchall():
+            amount = row[4] if str(row[2]) == "videos" else row[3]
+            add("dataset", int(row[0]), row[1], f"{row[2]} · {amount} кадров · {row[5]} классов", [
+                ("название", row[1]), ("тип", row[2]), ("кадры", amount), ("классы", row[5]),
+            ])
+        for row in con.execute("SELECT id,target_name,camera_id,dataset_name,status,stage,progress FROM training_jobs ORDER BY id DESC LIMIT 30").fetchall():
+            source = row[3] or row[2]
+            add("training", int(row[0]), row[1], f"{row[4]} · {row[6]}% · {row[5] or source}", [
+                ("модель", row[1]), ("камера или датасет", source), ("статус", row[4]), ("этап", row[5]), ("ID задачи", row[0]),
+            ])
+    finally:
+        con.close()
+    candidates.sort(key=lambda item: (-item[0], item[1], _search_normalize(item[2]["title"])))
+    results = [item for _, _, item in candidates[:limit]]
+    return {"query": q, "normalized_query": query, "results": results}
 
 def gpu_metrics():
     try:
@@ -1052,11 +2088,24 @@ def gpu_metrics():
         except pynvml.NVMLError: pass
 
 def system_health_data():
-    gpu=gpu_metrics(); con=db(); con.execute("SELECT 1").fetchone(); camera_count=con.execute("SELECT COUNT(*) FROM cameras WHERE enabled=1").fetchone()[0]; con.close()
+    gpu=gpu_metrics(); con=db(); con.execute("SELECT 1").fetchone(); camera_count=con.execute("SELECT COUNT(*) FROM cameras WHERE enabled=1").fetchone()[0]
+    settings=_bot_settings_map(con)
+    runtime={row[0]:row for row in con.execute("SELECT provider,status,updated_at FROM bot_runtime").fetchall()}
+    con.close()
     snap_dir=SNAPSHOT_DIR or (DB_PATH.parent/"snapshots")
     fresh=sum(1 for r in snap_dir.glob("*.jpg") if (time.time()-r.stat().st_mtime)<10) if snap_dir.exists() else 0
-    def status(flag:bool): return "healthy" if flag else "not_configured"
-    return {"cpu":round(psutil.cpu_percent(interval=.05),1),"ram":round(psutil.virtual_memory().percent,1),"disk":round(psutil.disk_usage(str(DB_PATH.parent)).percent,1),**gpu,"messenger_provider":MESSENGER_PROVIDER,"services":[{"name":"api","status":"healthy"},{"name":"database","status":"healthy"},{"name":"ingestion","status":status(bool(camera_count))},{"name":"inference","status":status(bool(fresh))}]}
+    worker=inference_worker_state()
+    if not camera_count: inference_status="not_configured"
+    elif not worker["connected"]: inference_status="error"
+    elif fresh: inference_status="healthy"
+    else: inference_status="degraded"
+    bot_services=[]
+    for provider in BOT_PROVIDERS:
+        row=runtime.get(provider); age=timestamp_age_seconds(row[2]) if row else None
+        enabled=settings.get(f"{provider}_bot_enabled")=="true"
+        status="healthy" if enabled and row and row[1]=="active" and age is not None and age<=20 else "disabled" if not enabled else "degraded"
+        bot_services.append({"name":f"bot-{provider}","status":status})
+    return {"cpu":round(psutil.cpu_percent(interval=.05),1),"ram":round(psutil.virtual_memory().percent,1),"disk":round(psutil.disk_usage(str(DB_PATH.parent)).percent,1),**gpu,"messenger_provider":_active_bot_provider(settings),"worker":worker,"services":[{"name":"api","status":"healthy"},{"name":"database","status":"healthy"},{"name":"ingestion","status":"healthy" if camera_count else "not_configured"},{"name":"inference","status":inference_status},*bot_services]}
 
 @app.get("/api/system-health")
 def system_health(): return system_health_data()
@@ -1068,9 +2117,18 @@ def csv_safe(value:Any):
 def sanitize_csv_rows(data:list[dict[str,Any]]): return [{k:csv_safe(v) for k,v in row.items()} for row in data]
 
 @app.get("/api/reports/events.csv")
-def report_csv():
-    data=sanitize_csv_rows(rows("SELECT timestamp,camera_id,type,severity,confidence,person_id,acknowledged,note FROM events ORDER BY timestamp DESC"))
-    out=io.StringIO(); w=csv.DictWriter(out,fieldnames=data[0].keys() if data else []); w.writeheader(); w.writerows(data)
+def report_csv(severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None,camera_id:str|None=None,q:str|None=Query(default=None,max_length=100)):
+    """Export exactly the event slice an operator is reviewing."""
+    ack=int(acknowledged) if acknowledged is not None else None
+    term=(q or "").strip()
+    like=f"%{term}%" if term else None
+    data=sanitize_csv_rows(rows("""SELECT e.timestamp,e.camera_id,e.type,e.severity,e.confidence,e.person_id,e.acknowledged,e.review_status,e.reviewed_at,e.note FROM events e
+        LEFT JOIN cameras c ON c.id=e.camera_id
+        WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?) AND (? IS NULL OR e.review_status=?) AND (? IS NULL OR e.camera_id=?)
+          AND (? IS NULL OR e.camera_id LIKE ? OR e.person_id LIKE ? OR e.type LIKE ? OR c.name LIKE ? OR c.zone LIKE ?)
+        ORDER BY e.timestamp DESC""",(severity,severity,event_type,event_type,ack,ack,review_status,review_status,camera_id,camera_id,like,like,like,like,like,like)))
+    fields=['timestamp','camera_id','type','severity','confidence','person_id','acknowledged','review_status','reviewed_at','note']
+    out=io.StringIO(); w=csv.DictWriter(out,fieldnames=fields); w.writeheader(); w.writerows(data)
     return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=zmk-events.csv"})
 @app.get("/api/stream")
 async def stream():

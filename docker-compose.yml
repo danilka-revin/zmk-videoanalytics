@@ -13,17 +13,28 @@ services:
       MODEL_DIR: /models
       ZMK_API_KEY: ${ZMK_API_KEY:-}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
+      # Upgrade legacy 20 FPS camera limits unless explicitly disabled.
+      CAMERA_HIGH_FPS_MODE: ${CAMERA_HIGH_FPS_MODE:-true}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
       MESSENGER_PROVIDER: ${MESSENGER_PROVIDER:-none}
-      TRAINING_WORKER_URL: ${TRAINING_WORKER_URL:-}
+      # Training worker is part of the default stack and remains available in
+      # CPU mode when NVIDIA is absent; docker-compose.gpu.yml adds GPUs.
+      TRAINING_WORKER_URL: ${TRAINING_WORKER_URL:-http://training-worker:8010}
       ZMK_WORKER_TOKEN: ${ZMK_WORKER_TOKEN:-}
+      ZMK_WORKER_TOKEN_FILE: ${ZMK_WORKER_TOKEN_FILE:-/models/.worker-token}
       UPDATE_SERVICE_URL: ${UPDATE_SERVICE_URL:-http://updater:8020}
       ZMK_UPDATE_TOKEN: ${ZMK_UPDATE_TOKEN:-}
-      RTSP_CAM_01: ${RTSP_CAM_01:-rtsp://camera-01/stream}
+      # Optional first-camera bootstrap; keep empty when configuring cameras in UI.
+      RTSP_CAM_01: ${RTSP_CAM_01:-}
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ADMIN_IDS: ${TELEGRAM_ADMIN_IDS:-}
       TELEGRAM_OPERATOR_IDS: ${TELEGRAM_OPERATOR_IDS:-}
       TELEGRAM_VIEWER_IDS: ${TELEGRAM_VIEWER_IDS:-}
+      TELEGRAM_WEBAPP_URL: ${TELEGRAM_WEBAPP_URL:-http://localhost:5173/telegram}
+      MAX_BOT_TOKEN: ${MAX_BOT_TOKEN:-}
+      MAX_ADMIN_IDS: ${MAX_ADMIN_IDS:-}
+      MAX_OPERATOR_IDS: ${MAX_OPERATOR_IDS:-}
+      MAX_VIEWER_IDS: ${MAX_VIEWER_IDS:-}
     restart: unless-stopped
     healthcheck:
       test:
@@ -44,8 +55,6 @@ services:
     restart: unless-stopped
   telegram-bot:
     build: ./services/telegram_bot
-    profiles:
-    - telegram
     environment:
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ADMIN_IDS: ${TELEGRAM_ADMIN_IDS:-}
@@ -60,8 +69,6 @@ services:
     restart: unless-stopped
   max-bot:
     build: ./services/max_bot
-    profiles:
-    - max
     environment:
       MAX_BOT_TOKEN: ${MAX_BOT_TOKEN:-}
       MAX_ADMIN_IDS: ${MAX_ADMIN_IDS:-}
@@ -81,8 +88,35 @@ services:
       ZMK_API_URL: http://api:8000
       ZMK_API_KEY: ${ZMK_API_KEY:-}
       ZMK_WORKER_TOKEN: ${ZMK_WORKER_TOKEN:-}
+      # Keep this in sync with API so a custom shared-token path works too.
+      ZMK_WORKER_TOKEN_FILE: ${ZMK_WORKER_TOKEN_FILE:-/models/.worker-token}
       INFERENCE_DEVICE: ${INFERENCE_DEVICE:-auto}
       INFERENCE_CONF: ${INFERENCE_CONF:-0.5}
+      # ffmpeg is resilient to damaged RTP/H.264 streams; set opencv only for
+      # troubleshooting a known-good local camera.
+      CAMERA_DECODER: ${CAMERA_DECODER:-ffmpeg}
+      # Forward every RTSP knob declared in .env. Previously these values
+      # were documented but never reached the worker container.
+      RTSP_TRANSPORT: ${RTSP_TRANSPORT:-auto}
+      RTSP_BUFFER_SIZE: ${RTSP_BUFFER_SIZE:-}
+      RTSP_STIMEOUT: ${RTSP_STIMEOUT:-5000000}
+      RTSP_TIMEOUT_OPTION: ${RTSP_TIMEOUT_OPTION:-timeout}
+      RTSP_OPEN_TIMEOUT_MS: ${RTSP_OPEN_TIMEOUT_MS:-8000}
+      RTSP_READ_TIMEOUT_MS: ${RTSP_READ_TIMEOUT_MS:-8000}
+      RTSP_KEYFRAME_GRACE_SECONDS: ${RTSP_KEYFRAME_GRACE_SECONDS:-15}
+      # Keep only a small RTP jitter buffer for near-live MJPEG preview.
+      RTSP_MAX_DELAY_US: ${RTSP_MAX_DELAY_US:-100000}
+      OFFLINE_AFTER_FRAMES: ${OFFLINE_AFTER_FRAMES:-3}
+      RTSP_RECONNECT_SECONDS: ${RTSP_RECONNECT_SECONDS:-5}
+      CAMERA_CONTROL_POLL_SECONDS: ${CAMERA_CONTROL_POLL_SECONDS:-2}
+      CAMERA_TELEMETRY_SECONDS: ${CAMERA_TELEMETRY_SECONDS:-5}
+      CAMERA_SNAPSHOT_SECONDS: ${CAMERA_SNAPSHOT_SECONDS:-3}
+      # Actual MJPEG preview rate sent to the browser (source-limited, up to 60 FPS).
+      CAMERA_LIVE_FPS: ${CAMERA_LIVE_FPS:-60}
+      # AI is sampled separately so model speed does not throttle the preview.
+      CAMERA_INFERENCE_FPS: ${CAMERA_INFERENCE_FPS:-8}
+      CAMERA_HIGH_FPS_MODE: ${CAMERA_HIGH_FPS_MODE:-true}
+      CAMERA_HEARTBEAT_SECONDS: ${CAMERA_HEARTBEAT_SECONDS:-5}
     volumes:
     - model-data:/models
     depends_on:
@@ -91,8 +125,8 @@ services:
     restart: unless-stopped
   training-worker:
     build: ./services/training_worker
-    profiles:
-    - training
+    # Always-on: reports CPU/GPU availability through /health and accepts jobs
+    # whenever an operator starts training.
     environment:
       ZMK_API_URL: http://api:8000
       ZMK_API_KEY: ${ZMK_API_KEY:-}
@@ -107,6 +141,15 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    healthcheck:
+      test:
+      - CMD
+      - python
+      - -c
+      - import urllib.request; urllib.request.urlopen('http://localhost:8010/health')
+      interval: 15s
+      timeout: 5s
+      retries: 3
     restart: unless-stopped
   updater:
     build: ./services/updater

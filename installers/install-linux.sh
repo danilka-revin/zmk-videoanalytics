@@ -15,6 +15,9 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }
+run_privileged(){
+  if [[ "${EUID}" -eq 0 ]]; then "$@"; else command -v sudo >/dev/null 2>&1 || fail "sudo is required to install Docker"; sudo "$@"; fi
+}
 required=(docker-compose.yml .env.example backend/Dockerfile frontend/Dockerfile services/telegram_bot/Dockerfile services/max_bot/Dockerfile services/training_worker/Dockerfile services/inference_worker/Dockerfile)
 for file in "${required[@]}"; do [[ -f "$file" ]] || fail "Missing $file. Download and extract the complete release archive, not only the installer."; done
 
@@ -55,14 +58,14 @@ esac
 echo -e "\n=== ZMK Vision installer for Ubuntu/Debian ==="
 if [[ "$(uname -s)" != "Linux" ]]; then fail "This installer supports Linux only"; fi
 if ! command -v apt-get >/dev/null 2>&1; then fail "Automatic installation supports Ubuntu/Debian (apt). Install Docker manually on this distribution."; fi
-if ! command -v curl >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y ca-certificates curl; fi
+if ! command -v curl >/dev/null 2>&1; then run_privileged apt-get update && run_privileged apt-get install -y ca-certificates curl; fi
 if ! command -v docker >/dev/null 2>&1; then
   echo "Installing Docker Engine and Compose plugin..."
-  sudo apt-get update
-  sudo apt-get install -y ca-certificates curl docker.io
-  sudo apt-get install -y docker-compose-v2 || sudo apt-get install -y docker-compose-plugin
-  sudo systemctl enable --now docker
-  sudo usermod -aG docker "$USER" || true
+  run_privileged apt-get update
+  run_privileged apt-get install -y ca-certificates curl docker.io
+  run_privileged apt-get install -y docker-compose-v2 || run_privileged apt-get install -y docker-compose-plugin
+  run_privileged systemctl enable --now docker
+  if [[ "${EUID}" -ne 0 ]]; then run_privileged usermod -aG docker "$USER" || true; fi
 fi
 
 run_config || fail "Настройка не завершена"
@@ -72,8 +75,10 @@ chmod 600 .env 2>/dev/null || true
 command -v docker >/dev/null 2>&1 || fail "Docker CLI is unavailable"
 DC=(docker compose)
 if ! docker info >/dev/null 2>&1; then
-  sudo systemctl start docker 2>/dev/null || true
-  if ! docker info >/dev/null 2>&1; then DC=(sudo docker compose); fi
+  run_privileged systemctl start docker 2>/dev/null || true
+  if ! docker info >/dev/null 2>&1; then
+    if [[ "${EUID}" -eq 0 ]]; then DC=(docker compose); else DC=(sudo docker compose); fi
+  fi
 fi
 "${DC[@]}" version >/dev/null || fail "Docker Compose plugin is unavailable"
 
@@ -86,7 +91,6 @@ else
   echo "NVIDIA Container Runtime не найден: workers запустятся в CPU fallback без ошибки"
 fi
 
-"${DC[@]}" --profile telegram --profile max stop telegram-bot max-bot >/dev/null 2>&1 || true
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml or .env validation failed"
 if ! "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose startup failed"; fi
 if ! wait_http http://localhost:8000/api/health 120; then "${DC[@]}" logs --tail=100 api; fail "API health check failed"; fi

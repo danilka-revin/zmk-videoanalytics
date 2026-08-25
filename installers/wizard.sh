@@ -9,8 +9,12 @@
 # =====================================================================
 
 set_env(){
+  # Escape sed replacement metacharacters so an RTSP password containing
+  # &, | or a backslash is stored literally rather than corrupting .env.
   local key="$1" value="$2" escaped
-  escaped="${value//|/\\|}"
+  escaped="${value//\\/\\\\}"
+  escaped="${escaped//&/\\&}"
+  escaped="${escaped//|/\\|}"
   if grep -q "^${key}=" .env; then sed -i "s|^${key}=.*|${key}=${escaped}|" .env; else printf '%s=%s\n' "$key" "$value" >> .env; fi
 }
 
@@ -22,10 +26,10 @@ run_config(){
     MESSENGER="${MESSENGER_PROVIDER:-none}"
   else
     echo ""
-    echo "Выберите мессенджер для уведомлений:"
+    echo "Выберите провайдера для первичной настройки (после запуска оба бота управляются в Admin → Боты):"
     echo "  1 — Telegram"
     echo "  2 — MAX"
-    echo "  0 — без бота"
+    echo "  0 — настрою ботов позже в Admin панели"
     read -r -p "Ваш выбор [0/1/2]: " CHOICE
     case "$CHOICE" in
       1) MESSENGER=telegram;;
@@ -44,8 +48,7 @@ run_config(){
       if ! [[ "$ADMIN" =~ ^[0-9]+(,[0-9]+)*$ ]]; then echo "Ошибка: Telegram admin ID должен состоять из цифр через запятую"; return 1; fi
       if [[ -n "$WEBAPP" && "$WEBAPP" != https://* ]]; then echo "Ошибка: Mini App URL должен быть https"; return 1; fi
       set_env TELEGRAM_BOT_TOKEN "$TOKEN"; set_env TELEGRAM_ADMIN_IDS "$ADMIN"; set_env TELEGRAM_WEBAPP_URL "$WEBAPP"
-      set_env MAX_BOT_TOKEN ""; set_env MESSENGER_PROVIDER "telegram"
-      PROFILE=(--profile telegram)
+      set_env MESSENGER_PROVIDER "telegram"
       ;;
     max)
       if [[ -n "${NONINTERACTIVE:-}" ]]; then TOKEN="${MAX_BOT_TOKEN:-}"; ADMIN="${MAX_ADMIN_IDS:-}"
@@ -53,29 +56,49 @@ run_config(){
       if ! [[ "$TOKEN" =~ ^[A-Za-z0-9._:-]{20,500}$ ]]; then echo "Ошибка: неверный формат MAX token"; return 1; fi
       if ! [[ "$ADMIN" =~ ^[0-9]+(,[0-9]+)*$ ]]; then echo "Ошибка: MAX admin ID должен состоять из цифр через запятую"; return 1; fi
       set_env MAX_BOT_TOKEN "$TOKEN"; set_env MAX_ADMIN_IDS "$ADMIN"
-      set_env TELEGRAM_BOT_TOKEN ""; set_env MESSENGER_PROVIDER "max"
-      PROFILE=(--profile max)
+      set_env MESSENGER_PROVIDER "max"
       ;;
     none)
-      set_env TELEGRAM_BOT_TOKEN ""; set_env MAX_BOT_TOKEN ""; set_env MESSENGER_PROVIDER "none"
+      # Do not erase existing provider secrets: after the stack is running,
+      # enablement and all operational bot settings live in Admin → Боты.
+      set_env MESSENGER_PROVIDER "none"
       ;;
     *) echo "MESSENGER_PROVIDER must be telegram, max or none"; return 1;;
   esac
 
-  if [[ -n "${NONINTERACTIVE:-}" ]]; then TRAINING="${ENABLE_TRAINING:-false}"; else read -r -p "Включить реальное YOLO auto-training на NVIDIA GPU? [y/N]: " TRAINING; fi
-  if [[ "$TRAINING" =~ ^([yY]|true|1)$ ]]; then
-    command -v nvidia-smi >/dev/null 2>&1 || echo "WARNING: nvidia-smi не найден; установите NVIDIA driver и Container Toolkit"
-    set_env TRAINING_WORKER_URL "http://training-worker:8010"
-    PROFILE+=(--profile training)
-  else
-    set_env TRAINING_WORKER_URL ""
-  fi
+  # Training worker is always started. It reports GPU availability itself and
+  # runs on CPU when NVIDIA Container Toolkit is not installed.
+  set_env TRAINING_WORKER_URL "http://training-worker:8010"
 
   if [[ -n "${NONINTERACTIVE:-}" ]]; then INFERENCE="${ENABLE_INFERENCE:-false}"; else read -r -p "Включить реальный RTSP YOLO inference worker? [y/N]: " INFERENCE; fi
   if [[ "$INFERENCE" =~ ^([yY]|true|1)$ ]]; then
     PROFILE+=(--profile inference)
-    # Worker token is auto-provisioned by the backend on the shared volume, so
-    # we don't need to set it here; but if set explicitly, keep it.
+    # Camera configuration is collected once here and saved into .env. The
+    # input is hidden so credentials are not echoed into terminal scrollback.
+    if [[ -n "${NONINTERACTIVE:-}" ]]; then
+      CAMERA_RTSP="${RTSP_CAM_01:-}"
+      CAMERA_DEVICE="${INFERENCE_DEVICE:-cpu}"
+      CAMERA_TRANSPORT="${RTSP_TRANSPORT:-tcp}"
+    else
+      echo ""
+      echo "Настройка RTSP-камеры (можно оставить пустым и добавить через панель):"
+      read -r -s -p "RTSP URL камеры: " CAMERA_RTSP; echo
+      read -r -p "Устройство inference [cpu/auto/0, по умолчанию cpu]: " CAMERA_DEVICE
+      read -r -p "RTSP transport [tcp/udp/auto, по умолчанию tcp]: " CAMERA_TRANSPORT
+      CAMERA_DEVICE="${CAMERA_DEVICE:-cpu}"
+      CAMERA_TRANSPORT="${CAMERA_TRANSPORT:-tcp}"
+    fi
+    if [[ -n "$CAMERA_RTSP" && ! "$CAMERA_RTSP" =~ ^rtsps?://[^[:space:]]+$ ]]; then
+      echo "Ошибка: RTSP URL должен начинаться с rtsp:// или rtsps:// и не содержать пробелов"
+      return 1
+    fi
+    case "$CAMERA_DEVICE" in cpu|auto|0|[0-9]) ;; *) echo "Ошибка: INFERENCE_DEVICE должен быть cpu, auto или номер GPU"; return 1;; esac
+    case "$CAMERA_TRANSPORT" in tcp|udp|auto) ;; *) echo "Ошибка: RTSP transport должен быть tcp, udp или auto"; return 1;; esac
+    [[ -n "$CAMERA_RTSP" ]] && set_env RTSP_CAM_01 "$CAMERA_RTSP"
+    set_env INFERENCE_DEVICE "$CAMERA_DEVICE"
+    set_env RTSP_TRANSPORT "$CAMERA_TRANSPORT"
+    set_env RTSP_TIMEOUT_OPTION "${RTSP_TIMEOUT_OPTION:-timeout}"
+    # Worker token is auto-provisioned by the backend on the shared volume.
   fi
 
   if [[ -z "${ZMK_UPDATE_TOKEN:-}" ]]; then
