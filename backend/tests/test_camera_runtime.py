@@ -140,3 +140,20 @@ def test_event_evidence_frame_is_saved_listed_and_cleaned_with_camera(monkeypatc
         assert deleted.status_code == 200, deleted.text
         assert not main.event_frame_path_for(event_id).exists()
         assert client.get(f"/api/events/{event_id}/frame").status_code == 404
+
+
+def test_event_review_columns_migrate_legacy_rows(tmp_path, monkeypatch):
+    legacy = tmp_path / "legacy-events.db"
+    con = main.sqlite3.connect(legacy)
+    con.execute("CREATE TABLE events(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, camera_id TEXT NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL, confidence REAL NOT NULL, person_id TEXT, external_id TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '')")
+    con.execute("INSERT INTO events(timestamp,camera_id,type,severity,confidence,acknowledged,note) VALUES(?,?,?,?,?,?,?)", (main.now_iso(), "cam_legacy", "no_helmet", "high", .9, 1, "old review"))
+    con.commit(); con.close()
+    monkeypatch.setattr(main, "DB_PATH", legacy)
+    monkeypatch.setattr(main, "SEED_TEST_DATA", False)
+    main.init_db()
+    con = main.sqlite3.connect(legacy)
+    columns = {row[1] for row in con.execute("PRAGMA table_info(events)")}
+    migrated = con.execute("SELECT review_status,reviewed_at,note FROM events WHERE id=1").fetchone()
+    con.close()
+    assert {"review_status", "reviewed_at"} <= columns
+    assert migrated[0] == "accepted" and migrated[1] == "" and migrated[2] == "old review"

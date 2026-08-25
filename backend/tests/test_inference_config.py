@@ -63,6 +63,7 @@ def test_bulk_acknowledgement_preserves_operator_note():
         events = {event['id']: event for event in c.get('/api/events?limit=100').json()}
         assert all(events[event_id]['acknowledged'] == 1 for event_id in ids)
         assert all(events[event_id]['note'] == 'Проверено сменным мастером' for event_id in ids)
+        assert all(events[event_id]['review_status'] == 'accepted' for event_id in ids)
         assert c.post('/api/events/ack-bulk', json={'event_ids': [], 'note': ''}).status_code == 422
 
 
@@ -78,3 +79,23 @@ def test_event_csv_export_respects_server_side_filters():
         assert response.status_code == 200
         assert 'smoking' in response.text
         assert 'no_helmet' not in response.text
+
+
+
+def test_event_can_be_rejected_individually_or_in_bulk():
+    with TestClient(app) as c:
+        pending = [event for event in c.get('/api/events?limit=10').json() if event['review_status'] == 'pending']
+        assert len(pending) >= 2
+        first, second = pending[:2]
+        single = c.post(f"/api/events/{first['id']}/reject", json={'note': 'Ложное срабатывание'})
+        assert single.status_code == 200, single.text
+        assert single.json()['review_status'] == 'rejected'
+        bulk = c.post('/api/events/reject-bulk', json={'event_ids': [second['id']], 'note': 'Работы по обслуживанию'})
+        assert bulk.status_code == 200, bulk.text
+        assert bulk.json()['rejected_ids'] == [second['id']]
+        events = {event['id']: event for event in c.get('/api/events?limit=100').json()}
+        assert events[first['id']]['review_status'] == 'rejected'
+        assert events[first['id']]['acknowledged'] == 1
+        assert events[first['id']]['note'] == 'Ложное срабатывание'
+        assert events[second['id']]['review_status'] == 'rejected'
+        assert events[second['id']]['note'] == 'Работы по обслуживанию'

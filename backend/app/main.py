@@ -192,7 +192,7 @@ def init_db():
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript("""
     CREATE TABLE IF NOT EXISTS cameras(id TEXT PRIMARY KEY, name TEXT NOT NULL, zone TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rtsp_url TEXT NOT NULL DEFAULT '', fps_limit REAL NOT NULL DEFAULT 8, status TEXT NOT NULL DEFAULT 'unknown', fps REAL NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, telemetry_at TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '', restart_requested_at TEXT NOT NULL DEFAULT '');
-    CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, camera_id TEXT NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL, confidence REAL NOT NULL, person_id TEXT, external_id TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, note TEXT NOT NULL DEFAULT '', FOREIGN KEY(camera_id) REFERENCES cameras(id));
+    CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, camera_id TEXT NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL, confidence REAL NOT NULL, person_id TEXT, external_id TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, review_status TEXT NOT NULL DEFAULT 'pending', reviewed_at TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '', FOREIGN KEY(camera_id) REFERENCES cameras(id));
     CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, level TEXT NOT NULL, service TEXT NOT NULL, message TEXT NOT NULL, camera_id TEXT);
     CREATE TABLE IF NOT EXISTS worker_status(name TEXT PRIMARY KEY, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', camera_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -220,10 +220,16 @@ def init_db():
         if column not in dataset_columns: con.execute(f"ALTER TABLE datasets ADD COLUMN {column} {ddl}")
     event_columns={r[1] for r in con.execute("PRAGMA table_info(events)").fetchall()}
     if "external_id" not in event_columns: con.execute("ALTER TABLE events ADD COLUMN external_id TEXT")
+    if "review_status" not in event_columns:
+        con.execute("ALTER TABLE events ADD COLUMN review_status TEXT NOT NULL DEFAULT 'pending'")
+        con.execute("UPDATE events SET review_status=CASE WHEN acknowledged=1 THEN 'accepted' ELSE 'pending' END")
+    if "reviewed_at" not in event_columns: con.execute("ALTER TABLE events ADD COLUMN reviewed_at TEXT NOT NULL DEFAULT ''")
+    con.execute("UPDATE events SET review_status='pending' WHERE review_status NOT IN ('pending','accepted','rejected') OR review_status='' OR review_status IS NULL")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_events_external_id ON events(external_id) WHERE external_id IS NOT NULL")
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_timestamp ON events(timestamp DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_camera_timestamp ON events(camera_id,timestamp DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_severity_ack ON events(severity,acknowledged)")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_events_review_status ON events(review_status,timestamp DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_logs_timestamp_level ON logs(timestamp DESC,level)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_training_status ON training_jobs(status,created_at DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_capture_jobs_status ON dataset_capture_jobs(status,created_at DESC)")
@@ -321,7 +327,7 @@ async def security_middleware(request: Request, call_next):
         admin_read=path.startswith(("/api/admin/","/api/logs","/api/settings"))
         operator_only=path.startswith("/api/reports/")
         viewer_write=telegram_role=="viewer" and request.method!="GET"
-        operator_write=telegram_role=="operator" and request.method!="GET" and not (path.startswith("/api/events/") and (path.endswith("/ack") or path=="/api/events/ack-bulk"))
+        operator_write=telegram_role=="operator" and request.method!="GET" and not (path.startswith("/api/events/") and (path.endswith(("/ack","/reject")) or path in {"/api/events/ack-bulk","/api/events/reject-bulk"}))
         if (telegram_role!="admin" and (admin_write or admin_read)) or (telegram_role=="viewer" and operator_only) or viewer_write or operator_write:
             from fastapi.responses import JSONResponse
             return JSONResponse({"detail":"Insufficient Telegram role"},status_code=403)
@@ -846,11 +852,11 @@ def diagnostics():
     return {"generated_at":now_iso(),"system":system_health_data(),"worker":inference_worker_state(),"cameras":camera_results}
 
 @app.get("/api/events")
-def events(limit:int=Query(50,ge=1,le=500),severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None):
+def events(limit:int=Query(50,ge=1,le=500),severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None):
     ack=int(acknowledged) if acknowledged is not None else None
     data=rows("""SELECT e.*,c.name camera_name,c.zone FROM events e JOIN cameras c ON c.id=e.camera_id
-        WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?)
-        ORDER BY e.timestamp DESC LIMIT ?""",(severity,severity,event_type,event_type,ack,ack,limit))
+        WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?) AND (? IS NULL OR e.review_status=?)
+        ORDER BY e.timestamp DESC LIMIT ?""",(severity,severity,event_type,event_type,ack,ack,review_status,review_status,limit))
     for item in data: item["has_frame"]=event_frame_path_for(int(item["id"])).is_file()
     return data
 
@@ -862,31 +868,50 @@ def event_frame(event_id:int):
     if not target.is_file(): raise HTTPException(404,"Кадр события ещё не сохранён")
     return FileResponse(target,media_type="image/jpeg",headers={"Cache-Control":"no-store"})
 
-@app.post("/api/events/ack-bulk")
-def ack_events_bulk(payload:BulkAckIn):
-    """Acknowledge a reviewed batch in one atomic operator action."""
+def _bulk_review_events(payload:BulkAckIn,review_status:Literal["accepted","rejected"],default_note:str) -> dict:
+    """Apply one review decision to a validated group of event IDs."""
     event_ids=payload.event_ids
     marks=",".join("?" for _ in event_ids)
+    note=payload.note.strip() or default_note
     con=db()
     try:
-        rows_found=con.execute(f"SELECT id,acknowledged FROM events WHERE id IN ({marks})",event_ids).fetchall()  # nosec B608 - placeholders only
-        found={int(row[0]):int(row[1]) for row in rows_found}
+        rows_found=con.execute(f"SELECT id,review_status FROM events WHERE id IN ({marks})",event_ids).fetchall()  # nosec B608 - placeholders only
+        found={int(row[0]):str(row[1] or "pending") for row in rows_found}
         missing=[event_id for event_id in event_ids if event_id not in found]
-        pending=[event_id for event_id in event_ids if found.get(event_id)==0]
-        if pending:
-            pending_marks=",".join("?" for _ in pending)
-            con.execute(f"UPDATE events SET acknowledged=1,note=? WHERE id IN ({pending_marks})",(payload.note,*pending))  # nosec B608 - placeholders only
-        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","event_manager",f"Bulk acknowledged events={len(pending)} already={len(event_ids)-len(pending)-len(missing)} missing={len(missing)}"))
+        updated=[event_id for event_id in event_ids if found.get(event_id)!=review_status]
+        already=[event_id for event_id in event_ids if found.get(event_id)==review_status]
+        if updated:
+            update_marks=",".join("?" for _ in updated)
+            con.execute(f"UPDATE events SET acknowledged=1,review_status=?,reviewed_at=?,note=? WHERE id IN ({update_marks})",(review_status,now_iso(),note,*updated))  # nosec B608 - placeholders only
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","event_manager",f"Bulk review status={review_status} updated={len(updated)} already={len(already)} missing={len(missing)}"))
         con.commit()
-        return {"acknowledged_ids":pending,"already_acknowledged_ids":[event_id for event_id in event_ids if found.get(event_id)==1],"missing_ids":missing,"note":payload.note}
+        return {"updated_ids":updated,"already_ids":already,"missing_ids":missing,"review_status":review_status,"note":note}
     finally:
         con.close()
 
+@app.post("/api/events/ack-bulk")
+def ack_events_bulk(payload:BulkAckIn):
+    result=_bulk_review_events(payload,"accepted","Проверено оператором")
+    return {**result,"acknowledged_ids":result["updated_ids"],"already_acknowledged_ids":result["already_ids"]}
+
+@app.post("/api/events/reject-bulk")
+def reject_events_bulk(payload:BulkAckIn):
+    result=_bulk_review_events(payload,"rejected","Не принято оператором")
+    return {**result,"rejected_ids":result["updated_ids"],"already_rejected_ids":result["already_ids"]}
+
 @app.post("/api/events/{event_id}/ack")
 def ack(event_id:int,payload:AckIn):
-    con=db(); cur=con.execute("UPDATE events SET acknowledged=1,note=? WHERE id=?",(payload.note,event_id)); con.commit(); con.close()
+    note=payload.note.strip() or "Проверено оператором"
+    con=db(); cur=con.execute("UPDATE events SET acknowledged=1,review_status='accepted',reviewed_at=?,note=? WHERE id=?",(now_iso(),note,event_id)); con.commit(); con.close()
     if not cur.rowcount: raise HTTPException(404,"Событие не найдено")
-    return {"id":event_id,"acknowledged":True}
+    return {"id":event_id,"acknowledged":True,"review_status":"accepted","note":note}
+
+@app.post("/api/events/{event_id}/reject")
+def reject_event(event_id:int,payload:AckIn):
+    note=payload.note.strip() or "Не принято оператором"
+    con=db(); cur=con.execute("UPDATE events SET acknowledged=1,review_status='rejected',reviewed_at=?,note=? WHERE id=?",(now_iso(),note,event_id)); con.commit(); con.close()
+    if not cur.rowcount: raise HTTPException(404,"Событие не найдено")
+    return {"id":event_id,"acknowledged":True,"review_status":"rejected","note":note}
 @app.post("/api/inference/detections")
 def ingest_detections(payload:DetectionBatch):
     """Validated contract from inference workers to the event subsystem."""
@@ -1593,17 +1618,17 @@ def csv_safe(value:Any):
 def sanitize_csv_rows(data:list[dict[str,Any]]): return [{k:csv_safe(v) for k,v in row.items()} for row in data]
 
 @app.get("/api/reports/events.csv")
-def report_csv(severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,camera_id:str|None=None,q:str|None=Query(default=None,max_length=100)):
+def report_csv(severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None,camera_id:str|None=None,q:str|None=Query(default=None,max_length=100)):
     """Export exactly the event slice an operator is reviewing."""
     ack=int(acknowledged) if acknowledged is not None else None
     term=(q or "").strip()
     like=f"%{term}%" if term else None
-    data=sanitize_csv_rows(rows("""SELECT e.timestamp,e.camera_id,e.type,e.severity,e.confidence,e.person_id,e.acknowledged,e.note FROM events e
+    data=sanitize_csv_rows(rows("""SELECT e.timestamp,e.camera_id,e.type,e.severity,e.confidence,e.person_id,e.acknowledged,e.review_status,e.reviewed_at,e.note FROM events e
         LEFT JOIN cameras c ON c.id=e.camera_id
-        WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?) AND (? IS NULL OR e.camera_id=?)
+        WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?) AND (? IS NULL OR e.review_status=?) AND (? IS NULL OR e.camera_id=?)
           AND (? IS NULL OR e.camera_id LIKE ? OR e.person_id LIKE ? OR e.type LIKE ? OR c.name LIKE ? OR c.zone LIKE ?)
-        ORDER BY e.timestamp DESC""",(severity,severity,event_type,event_type,ack,ack,camera_id,camera_id,like,like,like,like,like,like)))
-    fields=['timestamp','camera_id','type','severity','confidence','person_id','acknowledged','note']
+        ORDER BY e.timestamp DESC""",(severity,severity,event_type,event_type,ack,ack,review_status,review_status,camera_id,camera_id,like,like,like,like,like,like)))
+    fields=['timestamp','camera_id','type','severity','confidence','person_id','acknowledged','review_status','reviewed_at','note']
     out=io.StringIO(); w=csv.DictWriter(out,fieldnames=fields); w.writeheader(); w.writerows(data)
     return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=zmk-events.csv"})
 @app.get("/api/stream")
