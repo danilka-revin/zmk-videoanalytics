@@ -343,6 +343,22 @@ def telegram_webapp_role(init_data:str)->str|None:
         user=json.loads(values.get("user","{}")); role=_bot_role_for_user("telegram",int(user.get("id",0))); return role if role in {"viewer","operator","admin"} else None
     except (ValueError,TypeError,json.JSONDecodeError): return None
 
+@app.get("/api/session")
+def session_info(request: Request):
+    """Minimal authenticated identity for the Telegram Mini App UI."""
+    init_data=request.headers.get("X-Telegram-Init-Data","")
+    role=telegram_webapp_role(init_data)
+    api_key_ok=bool(API_KEY and hmac.compare_digest(request.headers.get("X-API-Key",""),API_KEY))
+    user={}
+    if role:
+        try:
+            values=dict(parse_qsl(init_data,keep_blank_values=True))
+            raw=json.loads(values.get("user","{}"))
+            user={"id":int(raw.get("id",0)),"name":str(raw.get("first_name") or raw.get("username") or "Telegram")[:80]}
+        except (TypeError,ValueError,json.JSONDecodeError):
+            user={}
+    return {"telegram":bool(role),"authenticated":bool(role or api_key_ok or not API_KEY),"role":role or ("api_key" if api_key_ok else "local"),"user":user}
+
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
     """Optional API-key protection, size/rate limits and baseline response headers."""

@@ -50,6 +50,9 @@ def test_telegram_mini_app_signature_and_role_permissions():
             viewer = {'X-Telegram-Init-Data':telegram_init_data(main.TELEGRAM_BOT_TOKEN,200)}
             assert c.get('/api/dashboard', headers=admin).status_code == 200
             assert c.get('/api/dashboard', headers=viewer).status_code == 200
+            session=c.get('/api/session', headers=admin)
+            assert session.status_code == 200
+            assert session.json()['telegram'] is True and session.json()['role'] == 'admin' and session.json()['user']['id'] == 100
             assert c.get('/api/admin/config', headers=viewer).status_code == 403
             assert c.get('/api/dashboard', headers={'X-Telegram-Init-Data':'broken'}).status_code == 401
     finally:
