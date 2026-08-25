@@ -13,6 +13,8 @@ services:
       MODEL_DIR: /models
       ZMK_API_KEY: ${ZMK_API_KEY:-}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
+      # Upgrade legacy 20 FPS camera limits unless explicitly disabled.
+      CAMERA_HIGH_FPS_MODE: ${CAMERA_HIGH_FPS_MODE:-true}
       CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
       MESSENGER_PROVIDER: ${MESSENGER_PROVIDER:-none}
       # Training worker is part of the default stack and remains available in
@@ -108,8 +110,11 @@ services:
       CAMERA_CONTROL_POLL_SECONDS: ${CAMERA_CONTROL_POLL_SECONDS:-2}
       CAMERA_TELEMETRY_SECONDS: ${CAMERA_TELEMETRY_SECONDS:-5}
       CAMERA_SNAPSHOT_SECONDS: ${CAMERA_SNAPSHOT_SECONDS:-3}
-      # Actual MJPEG preview rate sent to the browser (capped by camera fps_limit).
-      CAMERA_LIVE_FPS: ${CAMERA_LIVE_FPS:-20}
+      # Actual MJPEG preview rate sent to the browser (source-limited, up to 60 FPS).
+      CAMERA_LIVE_FPS: ${CAMERA_LIVE_FPS:-60}
+      # AI is sampled separately so model speed does not throttle the preview.
+      CAMERA_INFERENCE_FPS: ${CAMERA_INFERENCE_FPS:-8}
+      CAMERA_HIGH_FPS_MODE: ${CAMERA_HIGH_FPS_MODE:-true}
       CAMERA_HEARTBEAT_SECONDS: ${CAMERA_HEARTBEAT_SECONDS:-5}
     volumes:
     - model-data:/models

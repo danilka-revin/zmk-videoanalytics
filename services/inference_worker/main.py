@@ -99,9 +99,17 @@ KEYFRAME_RETRY_SECONDS = 0.2
 # Small RTP jitter buffer for a near-live stream without reordering seconds of video.
 RTSP_MAX_DELAY_US = _bounded_int("RTSP_MAX_DELAY_US", 100_000, 0, 2_000_000)
 FFMPEG_FRAME_MAX_BYTES = _bounded_int("FFMPEG_FRAME_MAX_BYTES", 5_000_000, 100_000, 20_000_000)
-# Browser MJPEG live preview rate. 0 disables the stream while keeping periodic
-# persistent snapshots; otherwise it is capped by the camera's configured FPS.
-LIVE_PREVIEW_FPS = _bounded_float("CAMERA_LIVE_FPS", 20.0, 0.0, 30.0)
+# Browser MJPEG preview follows the source as closely as the host permits.
+# The actual rate is still bounded by the camera/NVR and never fabricated.
+LIVE_PREVIEW_FPS = _bounded_float("CAMERA_LIVE_FPS", 60.0, 0.0, 60.0)
+# ML is intentionally sampled separately from the preview. A slow CPU model
+# must not drag a 25/30/50 FPS camera wall down to inference speed.
+INFERENCE_FPS = _bounded_float("CAMERA_INFERENCE_FPS", 8.0, 0.1, 30.0)
+HIGH_FPS_MODE = os.getenv("CAMERA_HIGH_FPS_MODE", "true").strip().lower() not in {"0", "false", "no", "off"}
+if HIGH_FPS_MODE and LIVE_PREVIEW_FPS <= 20:
+    # Preserve a deliberate low setting by disabling CAMERA_HIGH_FPS_MODE;
+    # otherwise transparently upgrade the former 20 FPS project default.
+    LIVE_PREVIEW_FPS = 60.0
 EVENT_CLASSES = {
     "no_helmet",
     "no_vest",
@@ -134,6 +142,15 @@ class ModelBox:
     semantic: str
     confidence: float
     index: int
+
+
+@dataclass(frozen=True)
+class InferenceVisual:
+    """Latest real detector output, reused only on matching-size live frames."""
+
+    shape: tuple[int, int]
+    boxes: list[ModelBox]
+    helmet_violations: list[tuple[ModelBox, ModelBox | None, bool]]
 
 
 def normalise_model_label(value: object) -> str:
@@ -362,7 +379,7 @@ class CameraConfig:
             camera_id=str(raw["id"]),
             name=str(raw.get("name") or raw["id"]),
             rtsp_url=str(raw["rtsp_url"]),
-            fps_limit=max(0.1, float(raw.get("fps_limit") or 8)),
+            fps_limit=max(0.1, min(60.0, float(raw.get("fps_limit") or 30))),
             restart_token=str(raw.get("restart_requested_at") or ""),
         )
 
@@ -389,6 +406,11 @@ class CameraSession:
     opened_at: float = 0.0
     received_first_frame: bool = False
     frame_task: asyncio.Task[None] | None = None
+    # The preview decoder stays independent from the ML task. This keeps live
+    # MJPEG fluid even when a CPU/GPU inference pass takes longer than a frame.
+    inference_task: asyncio.Task[InferenceVisual | None] | None = None
+    next_inference_at: float = 0.0
+    latest_visual: InferenceVisual | None = None
     restart_pending: bool = False
     ffmpeg: asyncio.subprocess.Process | None = None
     ffmpeg_buffer: bytearray = field(default_factory=bytearray)
@@ -553,13 +575,23 @@ class Runtime:
         self._release(session.capture)
         session.capture = None
         self._stop_ffmpeg(session)
+        if session.inference_task is not None and not session.inference_task.done():
+            session.inference_task.cancel()
+        session.inference_task = None
+        session.latest_visual = None
 
     @staticmethod
     def _frame_task_finished(session: CameraSession) -> bool:
         return session.frame_task is None or session.frame_task.done()
 
+    @staticmethod
+    def _inference_task_finished(session: CameraSession) -> bool:
+        return session.inference_task is None or session.inference_task.done()
+
     def _release_when_safe(self, session: CameraSession) -> bool:
         """Never release a VideoCapture while a native read is in progress."""
+        if session.inference_task is not None and not session.inference_task.done():
+            session.inference_task.cancel()
         if not self._frame_task_finished(session):
             if session not in self._deferred_releases:
                 self._deferred_releases.append(session)
@@ -656,6 +688,11 @@ class Runtime:
                 session.last_live_at = 0
                 session.opened_at = 0
                 session.received_first_frame = False
+                session.next_inference_at = 0
+                session.latest_visual = None
+                if session.inference_task is not None and not session.inference_task.done():
+                    session.inference_task.cancel()
+                session.inference_task = None
                 if self._frame_task_finished(session):
                     self._release_session(session)
                 else:
@@ -676,6 +713,12 @@ class Runtime:
             self._model_task = None
             self.model = None
             self.model_name = ""
+            for session in self.sessions.values():
+                if session.inference_task is not None and not session.inference_task.done():
+                    session.inference_task.cancel()
+                session.inference_task = None
+                session.latest_visual = None
+                session.next_inference_at = 0
             if not self._no_model_announced:
                 self._log("no active model; camera preview and telemetry remain enabled", force=True)
                 self._no_model_announced = True
@@ -708,6 +751,12 @@ class Runtime:
             return
         self.model = None
         self.model_name = ""
+        for session in self.sessions.values():
+            if session.inference_task is not None and not session.inference_task.done():
+                session.inference_task.cancel()
+            session.inference_task = None
+            session.latest_visual = None
+            session.next_inference_at = 0
         self._model_loading_name = wanted_name
         self._model_task = asyncio.create_task(self._load_model_async(dict(info)), name=f"model-load-{wanted_name}")
         self._log(f"loading active model {wanted_name} in background", force=True)
@@ -1015,7 +1064,7 @@ class Runtime:
         except (httpx.HTTPError,OSError,RuntimeError,TypeError,ValueError) as exc:
             self._log(f"event evidence upload failed for {session.config.camera_id}: {redact_error(exc)}")
 
-    async def _infer(self, session: CameraSession, image: Any) -> Any | None:
+    async def _infer(self, session: CameraSession, image: Any) -> InferenceVisual | None:
         if self.model is None or not self.model_name:
             return
         try:
@@ -1040,6 +1089,7 @@ class Runtime:
         try:
             names = getattr(result, "names", None) or getattr(self.model, "names", {})
             declared = model_semantics(names)
+            shape=(int(image.shape[0]),int(image.shape[1]))
             raw: list[ModelBox] = []
             values = zip(
                 result.boxes.xyxy.cpu().tolist(),
@@ -1106,7 +1156,22 @@ class Runtime:
                 await self._publish_event_evidence(session,receipt,annotated if annotated is not None else image)
             except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
                 self._log(f"detections rejected: {redact_error(exc)}")
-        return annotated
+        return InferenceVisual(shape,raw,helmet_violations)
+
+    def _collect_inference_result(self, session: CameraSession) -> None:
+        task=session.inference_task
+        if task is None or not task.done():
+            return
+        session.inference_task=None
+        try:
+            visual=task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:  # noqa: BLE001 - inference must not stop preview.
+            self._log(f"inference task failed; fast preview continues: {redact_error(exc)}")
+            return
+        if visual is not None:
+            session.latest_visual=visual
 
     async def frame(self, camera: dict[str, Any] | CameraConfig) -> None:
         """Read one frame. Scheduling is performed by run(), so tests and
@@ -1155,13 +1220,32 @@ class Runtime:
         session.received_first_frame = True
         session.frames_in_window += 1
         await self._report(session, "online", latency, "", force=session.status != "online")
-        annotated = await self._infer(session, image)
-        # When AI is active, stream the detector-rendered frame so the operator
-        # sees person/helmet/no-helmet boxes on the actual camera feed. If no
-        # model or overlay is available, preserve the original low-latency view.
-        preview = annotated if annotated is not None else image
+        # Publish the decoded source frame immediately. The latest completed
+        # detector boxes are painted onto matching-size frames without waiting
+        # for a new YOLO pass, so preview FPS follows the RTSP source rather
+        # than the much slower inference cadence.
+        self._collect_inference_result(session)
+        preview=image
+        visual=session.latest_visual
+        try:
+            if visual is not None and visual.shape==tuple(image.shape[:2]):
+                preview=draw_detection_overlay(image,visual.boxes,visual.helmet_violations) or image
+        except (AttributeError,TypeError,ValueError):
+            preview=image
         await self._publish_live(session, preview)
         await self._publish_snapshot(session, preview)
+
+        now=time.monotonic()
+        if self.model is not None and self.model_name and session.inference_task is None and now>=session.next_inference_at:
+            try:
+                inference_image=image.copy()
+            except AttributeError:
+                inference_image=image
+            session.next_inference_at=now+1/INFERENCE_FPS
+            session.inference_task=asyncio.create_task(
+                self._infer(session,inference_image),
+                name=f"camera-inference-{session.config.camera_id}",
+            )
 
     async def run(self) -> None:
         print(
@@ -1182,6 +1266,7 @@ class Runtime:
                         self._next_control_poll = time.monotonic() + CONTROL_POLL_SECONDS
 
                     for session in list(self.sessions.values()):
+                        self._collect_inference_result(session)
                         task = session.frame_task
                         if task is not None:
                             if not task.done():
@@ -1225,6 +1310,8 @@ class Runtime:
             # Do not cancel/release a native OpenCV call in flight. Docker
             # process termination is safer than racing FFmpeg from Python.
             for session in [*self.sessions.values(), *self._deferred_releases]:
+                if session.inference_task is not None and not session.inference_task.done():
+                    session.inference_task.cancel()
                 if self._frame_task_finished(session):
                     self._release_session(session)
             if self._model_task is not None and not self._model_task.done():

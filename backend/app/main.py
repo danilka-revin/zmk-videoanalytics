@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field, field_validator
 APP_VERSION = "2.12.0"
 TZ = timezone(timedelta(hours=7))
 CAMERA_TELEMETRY_STALE_SECONDS = 30
+HIGH_FPS_MODE = os.getenv("CAMERA_HIGH_FPS_MODE", "true").strip().lower() not in {"0","false","no","off"}
 SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") else None
 # Event evidence is persisted beside the SQLite database by default. It is
 # populated only by the internal inference worker after a real event is accepted.
@@ -205,8 +206,11 @@ def init_db():
         if column not in camera_columns: con.execute(f"ALTER TABLE cameras ADD COLUMN {column} {ddl}")
     con.execute("UPDATE cameras SET created_at=updated_at WHERE created_at='' OR created_at IS NULL")
     # A live MJPEG browser stream has a deliberate upper bound: keep stored
-    # legacy values consistent with the UI/API maximum of 20 FPS.
-    con.execute("UPDATE cameras SET fps_limit=20 WHERE fps_limit>20")
+    # legacy values consistent with the UI/API maximum of 60 FPS.
+    con.execute("UPDATE cameras SET fps_limit=60 WHERE fps_limit>60")
+    # Previous releases capped every camera at 20 FPS. High-FPS mode upgrades
+    # the known legacy 8/20 FPS defaults to 60 while the UI still exposes a per-camera choice.
+    if HIGH_FPS_MODE: con.execute("UPDATE cameras SET fps_limit=60 WHERE fps_limit IN (8,20)")
     model_columns={r[1] for r in con.execute("PRAGMA table_info(model_registry)").fetchall()}
     for column,ddl in {"artifact_uri":"TEXT NOT NULL DEFAULT ''","checksum":"TEXT NOT NULL DEFAULT ''"}.items():
         if column not in model_columns: con.execute(f"ALTER TABLE model_registry ADD COLUMN {column} {ddl}")
@@ -424,7 +428,7 @@ def bootstrap_env_camera(con: sqlite3.Connection) -> None:
     else:
         con.execute(
             "INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,restart_requested_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (camera_id, "Камера 01", "Без зоны", "Добавлена из RTSP_CAM_01", rtsp_url, 8, "connecting", 0, 0, 1, timestamp, timestamp, "", timestamp),
+            (camera_id, "Камера 01", "Без зоны", "Добавлена из RTSP_CAM_01", rtsp_url, 30, "connecting", 0, 0, 1, timestamp, timestamp, "", timestamp),
         )
     con.execute(
         "INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",
@@ -437,7 +441,7 @@ class CameraIn(BaseModel):
     zone:str=Field(default="Без зоны",min_length=1,max_length=80)
     description:str=Field(default="",max_length=500)
     rtsp_url:str=Field(default="",max_length=2048)
-    fps_limit:float=Field(default=8,ge=.1,le=20)
+    fps_limit:float=Field(default=30,ge=.1,le=60)
     enabled:bool=True
     @field_validator("rtsp_url")
     @classmethod
@@ -448,7 +452,7 @@ class CameraUpdate(BaseModel):
     zone:str=Field(default="Без зоны",min_length=1,max_length=80)
     description:str=Field(default="",max_length=500)
     rtsp_url:str|None=Field(default=None,max_length=2048)
-    fps_limit:float=Field(default=8,ge=.1,le=20)
+    fps_limit:float=Field(default=30,ge=.1,le=60)
     enabled:bool=True
     @field_validator("rtsp_url")
     @classmethod

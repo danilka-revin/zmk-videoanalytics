@@ -238,7 +238,7 @@ def test_ppe_boxes_are_drawn_into_the_published_camera_preview(worker_mod):
     rectangles, labels, live = [], [], []
     worker_mod.cv2.rectangle = lambda image, *args: rectangles.append(args) or image
     worker_mod.cv2.putText = lambda image, text, *args: labels.append(text) or image
-    _FakeCap.results = [(True, _FakeImage())]
+    _FakeCap.results = [(True, _FakeImage()), (True, _FakeImage())]
     runtime = worker_mod.Runtime()
     runtime.model = PpeModel()
     runtime.model_name = "ppe-person-helmet-yolo11"
@@ -250,12 +250,61 @@ def test_ppe_boxes_are_drawn_into_the_published_camera_preview(worker_mod):
     runtime.post_internal = post_internal
     runtime.post_internal_jpeg = post_internal_jpeg
     runtime.post = post
-    asyncio.run(runtime.frame(_camera()))
+
+    async def scenario():
+        await runtime.frame(_camera())  # raw high-FPS frame schedules AI
+        task = runtime.sessions["cam_01"].inference_task
+        assert task is not None
+        await task
+        await runtime.frame(_camera())  # latest completed boxes paint next frame
+
+    asyncio.run(scenario())
 
     assert live and live[0][0].endswith("/live-frame")
     assert len(rectangles) >= 2
     assert any(text.startswith("PERSON") for text in labels)
     assert any(text.startswith("HELMET") for text in labels)
+
+
+def test_live_preview_does_not_wait_for_slow_ai_inference(worker_mod):
+    class Tensor:
+        def __init__(self, value): self.value = value
+        def cpu(self): return self
+        def tolist(self): return self.value
+
+    result = types.SimpleNamespace(boxes=types.SimpleNamespace(xyxy=Tensor([]), cls=Tensor([]), conf=Tensor([])))
+
+    class SlowModel:
+        def __init__(self): self.names = {0: "Human"}
+        def predict(self, *_args, **_kwargs):
+            time.sleep(.16)
+            return [result]
+
+    worker_mod.LIVE_PREVIEW_FPS = 60
+    _FakeCap.results = [(True, _FakeImage())]
+    runtime = worker_mod.Runtime()
+    runtime.model = SlowModel()
+    runtime.model_name = "slow-model"
+    live = []
+
+    async def post_internal(*_args, **_kwargs): return None
+    async def post_internal_jpeg(path, image): live.append((path, image))
+
+    runtime.post_internal = post_internal
+    runtime.post_internal_jpeg = post_internal_jpeg
+
+    async def scenario():
+        started = time.monotonic()
+        await runtime.frame(_camera())
+        elapsed = time.monotonic() - started
+        task = runtime.sessions["cam_01"].inference_task
+        assert task is not None and not task.done()
+        await task
+        return elapsed
+
+    elapsed = asyncio.run(scenario())
+    assert elapsed < .10, f"preview waited {elapsed:.3f}s for AI"
+    assert live and live[0][0].endswith("/live-frame")
 
 
 def test_ppe_preset_refuses_artifact_without_person_and_helmet_labels(worker_mod, tmp_path, monkeypatch):
@@ -445,6 +494,7 @@ def test_compose_forwards_all_camera_runtime_settings():
     env = compose["services"]["inference-worker"]["environment"]
     api_env = compose["services"]["api"]["environment"]
     assert "ZMK_WORKER_TOKEN_FILE" in api_env
+    assert "CAMERA_HIGH_FPS_MODE" in api_env
     for variable in (
         "ZMK_WORKER_TOKEN_FILE",
         "CAMERA_DECODER",
@@ -462,6 +512,8 @@ def test_compose_forwards_all_camera_runtime_settings():
         "CAMERA_TELEMETRY_SECONDS",
         "CAMERA_SNAPSHOT_SECONDS",
         "CAMERA_LIVE_FPS",
+        "CAMERA_INFERENCE_FPS",
+        "CAMERA_HIGH_FPS_MODE",
         "CAMERA_HEARTBEAT_SECONDS",
     ):
         assert variable in env
