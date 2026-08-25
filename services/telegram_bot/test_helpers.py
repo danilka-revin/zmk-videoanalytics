@@ -1,3 +1,4 @@
+import asyncio
 import os
 
 os.environ.setdefault('TELEGRAM_ADMIN_IDS','100')
@@ -35,3 +36,25 @@ def test_admin_managed_token_overrides_env_fallback(tmp_path, monkeypatch):
     monkeypatch.setenv('ZMK_BOT_TOKEN_DIR',str(tmp_path))
     (tmp_path/'telegram.token').write_text('admin-token\n',encoding='utf-8')
     assert bot_main.bot_token()=='admin-token'
+
+
+def test_camera_keyboard_and_snapshot_delivery(monkeypatch):
+    cameras = [{"id":"cam_01","name":"Проходная","zone":"Склад","status":"online","fps":12,"snapshot_age_seconds":2}]
+    keyboard = bot_main._camera_keyboard(cameras)
+    assert any(button.callback_data == "camera:cam_01" for row in keyboard.inline_keyboard for button in row)
+
+    class Message:
+        def __init__(self): self.photos=[]; self.answers=[]
+        async def answer(self, *args, **kwargs): self.answers.append((args,kwargs))
+        async def answer_photo(self, *args, **kwargs): self.photos.append((args,kwargs))
+
+    async def fake_api(method, path, **_kwargs):
+        if path == "/api/cameras": return cameras
+        if path == "/api/cameras/cam_01/snapshot": return b"\xff\xd8frame\xff\xd9"
+        raise AssertionError(path)
+
+    monkeypatch.setattr(bot_main, "api", fake_api)
+    message = Message()
+    asyncio.run(bot_main._send_camera_snapshot(message, "cam_01"))
+    assert message.photos
+    assert "Проходная" in message.photos[0][1]["caption"]

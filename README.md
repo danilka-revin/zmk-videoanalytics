@@ -276,7 +276,8 @@ inference: camera cam_... opened via TCP
 | Команда | Назначение | Минимальная роль |
 |---|---|---|
 | `/status` | Состояние платформы | viewer |
-| `/cameras` | Список камер | viewer |
+| `/cameras` | Список камер; Telegram показывает кнопки кадров, MAX — ID для команды | viewer |
+| `/camera <camera_id>` | Последний реальный JPEG-кадр камеры | viewer |
 | `/events` | Последние события | viewer |
 | `/health` | CPU, RAM, GPU и сервисы | viewer |
 | `/logs` | Ошибки и предупреждения | operator |

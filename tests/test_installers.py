@@ -34,6 +34,7 @@ def test_linux_installers_pass_shell_parser_and_dry_check():
         assert 'COMPOSE_PARALLEL_LIMIT=1' in script
         assert 'buildx prune -af' in script
         assert 'ZMK VISION' in script
+        assert '███████' in script
         assert 'VIDEO ANALYTICS CONTROL PLATFORM' in script
         assert 'SERVICE STATUS' in script
         assert 'API HEALTH CHECK' in script

@@ -1,3 +1,4 @@
+import asyncio
 import os
 from types import SimpleNamespace
 
@@ -37,3 +38,25 @@ def test_admin_managed_token_overrides_env_fallback(tmp_path, monkeypatch):
     (tmp_path / "max.token").write_text("admin-token\n", encoding="utf-8")
     import main as bot_main
     assert bot_main.bot_token() == "admin-token"
+
+
+def test_camera_snapshot_delivery(monkeypatch):
+    cameras = [{"id":"cam_01","name":"Проходная","zone":"Склад","status":"online","fps":12,"snapshot_age_seconds":2}]
+
+    class Message:
+        def __init__(self): self.answers=[]
+        async def answer(self, *args, **kwargs): self.answers.append((args, kwargs))
+
+    event = SimpleNamespace(message=Message())
+
+    async def fake_api(method, path, **_kwargs):
+        if path == "/api/cameras": return cameras
+        if path == "/api/cameras/cam_01/snapshot": return b"\xff\xd8frame\xff\xd9"
+        raise AssertionError(path)
+
+    import main as bot_main
+    monkeypatch.setattr(bot_main, "api", fake_api)
+    asyncio.run(bot_main._send_camera_snapshot(event, "cam_01"))
+    assert event.message.answers
+    assert "Проходная" in event.message.answers[0][0][0]
+    assert event.message.answers[0][1]["attachments"]

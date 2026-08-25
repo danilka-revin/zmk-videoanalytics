@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -143,6 +144,44 @@ def event_text(item: dict[str, Any]) -> str:
     return f"• {title} · {item.get('camera_name', item['camera_id'])} · {round(item['confidence'] * 100)}% · {item['severity']}"
 
 
+_CAMERA_ID=re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _camera_caption(camera: dict[str, Any]) -> str:
+    status="🟢 Онлайн" if camera.get("status")=="online" else "🔴 Офлайн"
+    age=camera.get("snapshot_age_seconds")
+    freshness="свежий кадр" if isinstance(age,(int,float)) and age<15 else f"кадр {int(age)} сек назад" if isinstance(age,(int,float)) else "кадр без времени"
+    return f"📷 {camera.get('name') or camera.get('id')}\n{camera.get('zone') or 'Без зоны'} · {camera.get('id')}\n{status} · {camera.get('fps',0)} FPS · {freshness}"
+
+
+async def _send_camera_snapshot(event: MessageCreated, camera_id: str) -> None:
+    if not _CAMERA_ID.fullmatch(camera_id):
+        await event.message.answer("Некорректный ID камеры.")
+        return
+    cameras=await api("GET","/api/cameras")
+    camera=next((item for item in cameras if str(item.get("id"))==camera_id),None)
+    if not camera:
+        await event.message.answer("Камера не найдена.")
+        return
+    try:
+        image=await api("GET",f"/api/cameras/{camera_id}/snapshot")
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code==404:
+            await event.message.answer(_camera_caption(camera)+"\n\n⚠️ Свежий кадр ещё не получен от inference-worker.")
+            return
+        raise
+    if not isinstance(image,(bytes,bytearray)):
+        await event.message.answer("Не удалось получить кадр камеры.")
+        return
+    with tempfile.NamedTemporaryFile(prefix=f"zmk-{camera_id}-",suffix=".jpg",delete=False) as handle:
+        handle.write(bytes(image))
+        path=Path(handle.name)
+    try:
+        await event.message.answer(_camera_caption(camera),attachments=[InputMedia(str(path))])
+    finally:
+        path.unlink(missing_ok=True)
+
+
 @dp.message_created(Command("start"))
 async def start(event: MessageCreated):
     if not await guard(event):
@@ -150,7 +189,7 @@ async def start(event: MessageCreated):
     await event.message.answer(
         "ZMK Vision для MAX\n"
         f"Роль: {role_for(user_id(event))}\n\n"
-        "/status /cameras /events /health\n"
+        "/status /cameras /camera <camera_id> /events /health\n"
         "/logs /report /models /thresholds\n"
         "/switch_model /set_threshold /train /cancel_training /alert_test"
     )
@@ -172,7 +211,22 @@ async def cameras(event: MessageCreated):
     if not await guard(event):
         return
     data = await api("GET", "/api/cameras")
-    await event.message.answer("📷 Камеры\n\n" + "\n".join(f"{'🟢' if c['status'] == 'online' else '🔴'} {c['name']} · {c['zone']} · {c['fps']} FPS" for c in data))
+    if not data:
+        await event.message.answer("📷 Камеры\n\nКамеры ещё не добавлены.")
+        return
+    lines=[f"{'🟢' if c.get('status') == 'online' else '🔴'} {c.get('name') or c.get('id')} · {c.get('zone') or 'Без зоны'} · {c.get('fps',0)} FPS\n  Кадр: /camera {c.get('id')}" for c in data]
+    await event.message.answer("📷 Камеры\n\n" + "\n".join(lines))
+
+
+@dp.message_created(Command("camera"))
+async def camera_cmd(event: MessageCreated):
+    if not await guard(event):
+        return
+    values=args(event)
+    if len(values)!=1:
+        await event.message.answer("Использование: /camera cam_01\nСписок ID: /cameras")
+        return
+    await _send_camera_snapshot(event,values[0])
 
 
 @dp.message_created(Command("events"))

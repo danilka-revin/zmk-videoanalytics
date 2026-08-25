@@ -5,6 +5,7 @@ import asyncio
 import html
 import logging
 import os
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -133,6 +134,64 @@ def event_text(e: dict[str, Any]) -> str:
     labels={"no_helmet":"Без каски","no_vest":"Без жилета","phone_usage":"Телефон","smoking":"Курение","restricted_zone":"Опасная зона","immobility":"Неподвижность"}
     return f"• <b>{html.escape(labels.get(e['type'],e['type']))}</b> · {html.escape(str(e.get('camera_name',e['camera_id'])))} · {round(e['confidence']*100)}% · {html.escape(str(e['severity']))}"
 
+_CAMERA_ID=re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def _camera_caption(camera: dict[str, Any]) -> str:
+    name=html.escape(str(camera.get("name") or camera.get("id") or "Камера"))
+    zone=html.escape(str(camera.get("zone") or "Без зоны"))
+    camera_id=html.escape(str(camera.get("id") or ""))
+    status="🟢 Онлайн" if camera.get("status")=="online" else "🔴 Офлайн"
+    age=camera.get("snapshot_age_seconds")
+    freshness="свежий кадр" if isinstance(age,(int,float)) and age<15 else f"кадр {int(age)} сек назад" if isinstance(age,(int,float)) else "кадр без времени"
+    return f"<b>📷 {name}</b>\n{zone} · <code>{camera_id}</code>\n{status} · {camera.get('fps',0)} FPS · {freshness}"
+
+
+def _camera_keyboard(cameras: list[dict[str, Any]]) -> InlineKeyboardMarkup:
+    rows=[]
+    for camera in cameras[:40]:
+        camera_id=str(camera.get("id") or "")
+        if not _CAMERA_ID.fullmatch(camera_id):
+            continue
+        name=str(camera.get("name") or camera_id).replace("\n"," ").strip()
+        label=("🟢 " if camera.get("status")=="online" else "🔴 ")+name[:38]
+        rows.append([InlineKeyboardButton(text=label,callback_data=f"camera:{camera_id}")])
+    rows.append([InlineKeyboardButton(text="🔄 Обновить камеры",callback_data="cameras")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _send_camera_list(message: Message) -> None:
+    cameras=await api("GET","/api/cameras")
+    if not cameras:
+        await message.answer("<b>📷 Камеры</b>\n\nКамеры ещё не добавлены.")
+        return
+    lines=[f"{'🟢' if c.get('status')=='online' else '🔴'} <b>{html.escape(str(c.get('name') or c.get('id')))}</b> · <code>{html.escape(str(c.get('id')))}</code> · {html.escape(str(c.get('zone') or 'Без зоны'))}" for c in cameras]
+    suffix="\n\nВыберите камеру ниже — бот пришлёт последний реальный кадр." if any(_CAMERA_ID.fullmatch(str(c.get("id") or "")) for c in cameras) else ""
+    await message.answer("<b>📷 Камеры</b>\n\n"+"\n".join(lines)+suffix,reply_markup=_camera_keyboard(cameras))
+
+
+async def _send_camera_snapshot(message: Message, camera_id: str) -> None:
+    if not _CAMERA_ID.fullmatch(camera_id):
+        await message.answer("Некорректный ID камеры.")
+        return
+    cameras=await api("GET","/api/cameras")
+    camera=next((item for item in cameras if str(item.get("id"))==camera_id),None)
+    if not camera:
+        await message.answer("Камера не найдена.",reply_markup=_camera_keyboard(cameras))
+        return
+    try:
+        image=await api("GET",f"/api/cameras/{camera_id}/snapshot")
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code==404:
+            await message.answer(_camera_caption(camera)+"\n\n⚠️ Свежий кадр ещё не получен от inference-worker.",reply_markup=_camera_keyboard(cameras))
+            return
+        raise
+    if not isinstance(image,(bytes,bytearray)):
+        await message.answer("Не удалось получить кадр камеры.")
+        return
+    await message.answer_photo(BufferedInputFile(bytes(image),filename=f"zmk-{camera_id}.jpg"),caption=_camera_caption(camera),reply_markup=_camera_keyboard(cameras))
+
+
 async def guard(message: Message, minimum: str = "viewer") -> bool:
     if not RUNTIME.enabled: return False
     uid = message.from_user.id if message.from_user else 0
@@ -148,7 +207,7 @@ async def start(message: Message):
 @router.message(Command("help"))
 async def help_cmd(message: Message):
     if not await guard(message): return
-    await message.answer("/status — состояние\n/cameras — камеры\n/events — события\n/logs — ошибки\n/report — CSV\n/models — модели\n/switch_model &lt;name&gt; — hot-swap (admin)\n/thresholds — пороги AI\n/set_threshold &lt;metric&gt; &lt;value&gt; — изменить порог\n/train &lt;camera_id&gt; — дообучение\n/cancel_training &lt;job_id&gt; — отменить обучение\n/users — пользователи\n/alert_test — тест тревоги\n/health — сервисы", reply_markup=menu(message.from_user.id))
+    await message.answer("/status — состояние\n/cameras — список и кнопки кадров\n/camera &lt;camera_id&gt; — последний кадр\n/events — события\n/logs — ошибки\n/report — CSV\n/models — модели\n/switch_model &lt;name&gt; — hot-swap (admin)\n/thresholds — пороги AI\n/set_threshold &lt;metric&gt; &lt;value&gt; — изменить порог\n/train &lt;camera_id&gt; — дообучение\n/cancel_training &lt;job_id&gt; — отменить обучение\n/users — пользователи\n/alert_test — тест тревоги\n/health — сервисы", reply_markup=menu(message.from_user.id))
 
 @router.message(Command("status"))
 async def status(message: Message):
@@ -158,9 +217,16 @@ async def status(message: Message):
 @router.message(Command("cameras"))
 async def cameras(message: Message):
     if not await guard(message): return
-    data=await api("GET","/api/cameras")
-    text="<b>📷 Камеры</b>\n\n"+"\n".join(f"{'🟢' if c['status']=='online' else '🔴'} <b>{html.escape(str(c['name']))}</b> · {html.escape(str(c['zone']))} · {c['fps']} FPS" for c in data)
-    await message.answer(text)
+    await _send_camera_list(message)
+
+@router.message(Command("camera"))
+async def camera_cmd(message: Message, command: CommandObject):
+    if not await guard(message): return
+    camera_id=(command.args or "").strip()
+    if not camera_id:
+        await message.answer("Использование: <code>/camera cam_01</code>\nИли используйте /cameras и выберите кнопку.")
+        return
+    await _send_camera_snapshot(message,camera_id)
 
 @router.message(Command("events"))
 async def events(message: Message):
@@ -245,6 +311,23 @@ async def health_cmd(message: Message):
     h=await api("GET","/api/system-health")
     await message.answer("<b>🩺 System health</b>\n\n"+f"CPU {h['cpu']}% · RAM {h['ram']}% · GPU {h['gpu']}% · VRAM {h['vram']}% · Disk {h['disk']}%\nМессенджер: {h.get('messenger_provider','none')}\n"+"\n".join(f"🟢 {html.escape(str(x['name']))}: {html.escape(str(x['status']))}" for x in h['services']))
 
+@router.callback_query(F.data.startswith("camera:"))
+async def camera_snapshot_callback(query: CallbackQuery):
+    if not RUNTIME.enabled:
+        await query.answer("Бот отключён оператором",show_alert=True)
+        return
+    if not query.from_user or not allowed(query.from_user.id):
+        await query.answer("Нет доступа",show_alert=True)
+        return
+    camera_id=(query.data or "").removeprefix("camera:")
+    if not _CAMERA_ID.fullmatch(camera_id):
+        await query.answer("Некорректная камера",show_alert=True)
+        return
+    await query.answer("Получаю кадр…")
+    if query.message:
+        await _send_camera_snapshot(query.message,camera_id)
+
+
 @router.callback_query(F.data.in_({"status","cameras","events","errors","models","health","report"}))
 async def callbacks(query: CallbackQuery):
     if not RUNTIME.enabled: await query.answer("Бот отключён оператором",show_alert=True); return
@@ -253,7 +336,7 @@ async def callbacks(query: CallbackQuery):
     await query.answer(); message=query.message
     if query.data=="status": await message.answer(dashboard_text(await api("GET","/api/dashboard")),reply_markup=menu(query.from_user.id))
     elif query.data=="cameras":
-        data=await api("GET","/api/cameras"); await message.answer("<b>📷 Камеры</b>\n\n"+"\n".join(f"{'🟢' if c['status']=='online' else '🔴'} <b>{html.escape(str(c['name']))}</b> · {c['fps']} FPS" for c in data))
+        await _send_camera_list(message)
     elif query.data=="events":
         data=await api("GET","/api/events?limit=10"); await message.answer("<b>🚨 События</b>\n\n"+"\n".join(event_text(x) for x in data))
     elif query.data=="errors":

@@ -111,6 +111,16 @@ start_stack(){
   COMPOSE_PARALLEL_LIMIT=1 "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans
 }
 
+print_zmk_logo(){
+  printf '%s\n' \
+    ' ███████╗███╗   ███╗██╗  ██╗    ██╗   ██╗██╗███████╗██╗ ██████╗ ███╗   ██╗' \
+    ' ╚══███╔╝████╗ ████║██║ ██╔╝    ██║   ██║██║██╔════╝██║██╔═══██╗████╗  ██║' \
+    '   ███╔╝ ██╔████╔██║█████╔╝     ██║   ██║██║███████╗██║██║   ██║██╔██╗ ██║' \
+    '  ███╔╝  ██║╚██╔╝██║██╔═██╗     ╚██╗ ██╔╝██║╚════██║██║██║   ██║██║╚██╗██║' \
+    ' ███████╗██║ ╚═╝ ██║██║  ██╗     ╚████╔╝ ██║███████║██║╚██████╔╝██║ ╚████║' \
+    ' ╚══════╝╚═╝     ╚═╝╚═╝  ╚═╝      ╚═══╝  ╚═╝╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝'
+}
+
 print_launch_summary(){
   local version ref revision profile compose_display launch_command
   version=$(tr -d '[:space:]' < VERSION 2>/dev/null || printf 'DEV')
@@ -125,6 +135,7 @@ print_launch_summary(){
   launch_command="${HOME}/.local/bin/zmk-vision"
   [[ -x "$launch_command" ]] || launch_command="./start.sh (launcher is created by bootstrap)"
   printf '\n%s\n' '================================================================'
+  print_zmk_logo
   printf '%s\n' '                           ZMK VISION'
   printf '%s\n' '                 VIDEO ANALYTICS CONTROL PLATFORM'
   printf '%s\n' '================================================================'
