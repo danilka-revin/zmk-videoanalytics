@@ -51,8 +51,12 @@ if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
   changes=$(git -C "$ZMK_INSTALL_DIR" status --porcelain --untracked-files=no)
   [[ -z "$changes" ]] || fail "Tracked local changes found. They were not overwritten; commit or stash them first."
   info "Downloading ${ZMK_REF} from GitHub..."
+  # An explicit `git fetch origin <branch>` records the commit in FETCH_HEAD
+  # but does not necessarily create origin/<branch> in shallow checkouts.
+  # Checking out FETCH_HEAD works for main as well as slash-containing feature
+  # branches (e.g. arena/...) and keeps the one-command launcher repeatable.
   git -C "$ZMK_INSTALL_DIR" fetch --depth=1 origin "$ZMK_REF"
-  git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" "origin/$ZMK_REF"
+  git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" FETCH_HEAD
 else
   [[ ! -e "$ZMK_INSTALL_DIR" ]] || fail "Target exists but is not a git checkout: $ZMK_INSTALL_DIR"
   info "Downloading a fresh copy of ${ZMK_REF} from GitHub..."

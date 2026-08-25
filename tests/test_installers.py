@@ -33,6 +33,10 @@ def test_bootstrap_launcher_and_rtsp_wizard_escape_credentials(tmp_path):
     bootstrap = (ROOT/'installers/bootstrap-linux.sh').read_text()
     for required in ['git clone', 'ZMK_REF', 'ZMK_INSTALL_DIR', 'zmk-vision', '/dev/tty', 'NONINTERACTIVE=1', 'ENABLE_INFERENCE=true']:
         assert required in bootstrap
+    # Explicit shallow fetches populate FETCH_HEAD, but do not guarantee a
+    # remote-tracking origin/<slash-containing-branch> ref. The repeat launcher
+    # must therefore check out the fetched commit directly.
+    assert 'checkout -B "$ZMK_REF" FETCH_HEAD' in bootstrap
 
     # An RTSP password may include & or |. The wizard must preserve it rather
     # than interpreting it as a sed replacement expression.
@@ -47,6 +51,45 @@ def test_bootstrap_launcher_and_rtsp_wizard_escape_credentials(tmp_path):
         check=True,
     )
     assert result.stdout.strip() == f'RTSP_CAM_01={value}'
+
+
+def test_shallow_fetch_of_feature_branch_checks_out_fetch_head(tmp_path):
+    """Git only sets FETCH_HEAD for an explicit shallow branch fetch.
+
+    This reproduces the one-command updater's branch-switch path without a
+    network dependency.  `origin/arena/...` is intentionally absent, while
+    `checkout -B <branch> FETCH_HEAD` succeeds.
+    """
+    def git(*args, cwd):
+        return subprocess.run(['git', *args], cwd=cwd, text=True, capture_output=True, check=True)
+
+    remote = tmp_path / 'remote.git'
+    source = tmp_path / 'source'
+    clone = tmp_path / 'clone'
+    git('init', '--bare', str(remote), cwd=tmp_path)
+    git('init', '-b', 'main', str(source), cwd=tmp_path)
+    git('config', 'user.email', 'test@example.invalid', cwd=source)
+    git('config', 'user.name', 'Test', cwd=source)
+    (source / 'version.txt').write_text('main\n')
+    git('add', '.', cwd=source); git('commit', '-m', 'main', cwd=source)
+    git('remote', 'add', 'origin', str(remote), cwd=source)
+    git('push', '-u', 'origin', 'main', cwd=source)
+    git('checkout', '-b', 'arena/test-launcher', cwd=source)
+    (source / 'version.txt').write_text('feature\n')
+    git('commit', '-am', 'feature', cwd=source)
+    expected = git('rev-parse', 'HEAD', cwd=source).stdout.strip()
+    git('push', 'origin', 'arena/test-launcher', cwd=source)
+
+    git('clone', '--depth=1', '--branch', 'main', f'file://{remote}', str(clone), cwd=tmp_path)
+    git('fetch', '--depth=1', 'origin', 'arena/test-launcher', cwd=clone)
+    missing_tracking = subprocess.run(
+        ['git', 'show-ref', '--verify', '--quiet', 'refs/remotes/origin/arena/test-launcher'],
+        cwd=clone,
+        check=False,
+    )
+    assert missing_tracking.returncode != 0
+    git('checkout', '-B', 'arena/test-launcher', 'FETCH_HEAD', cwd=clone)
+    assert git('rev-parse', 'HEAD', cwd=clone).stdout.strip() == expected
 
 
 def test_windows_wrapper_and_powershell_structure():
