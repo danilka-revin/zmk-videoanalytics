@@ -63,6 +63,11 @@ if MESSENGER_PROVIDER not in {"none", "telegram", "max"}: MESSENGER_PROVIDER = "
 TRAINING_WORKER_URL = os.getenv("TRAINING_WORKER_URL", "").rstrip("/")
 DATASET_DIR = Path(os.getenv("DATASET_DIR", "")) if os.getenv("DATASET_DIR") else (DB_PATH.parent / "datasets")
 MODEL_DIR = Path(os.getenv("MODEL_DIR", "")) if os.getenv("MODEL_DIR") else (DB_PATH.parent / "models")
+# Uploads are streamed to the shared model volume instead of being accumulated
+# in API memory. Keep an explicit, operator-configurable ceiling because model
+# artifacts can legitimately be hundreds of megabytes.
+try: MODEL_UPLOAD_MAX_BYTES=max(1_000_000,min(2_000_000_000,int(os.getenv("MODEL_UPLOAD_MAX_BYTES","2_000_000_000"))))
+except ValueError: MODEL_UPLOAD_MAX_BYTES=2_000_000_000
 WORKER_TOKEN_FILE = Path(os.getenv("ZMK_WORKER_TOKEN_FILE", "")) if os.getenv("ZMK_WORKER_TOKEN_FILE") else (MODEL_DIR / ".worker-token")
 
 def provision_worker_token(token_file: Path, env_token: str | None = None) -> str:
@@ -359,9 +364,13 @@ async def security_middleware(request: Request, call_next):
             from fastapi.responses import JSONResponse
             return JSONResponse({"detail":"Insufficient Telegram role"},status_code=403)
     length=request.headers.get("content-length")
-    # Dataset uploads carry a local zip archive, commonly larger than the
-    # JSON cap, so allow a generous size on that path only.
-    cap=512_000_000 if path.startswith("/api/datasets") and request.method=="POST" else 2_000_000
+    # Dataset ZIPs and model artifacts are streamed directly to persistent
+    # volumes and can be substantially larger than normal JSON API payloads.
+    # The handlers enforce the same ceiling again while reading chunks, which
+    # also covers clients using chunked transfer without Content-Length.
+    if path=="/api/models/upload" and request.method=="POST": cap=MODEL_UPLOAD_MAX_BYTES
+    elif path.startswith("/api/datasets") and request.method=="POST": cap=512_000_000
+    else: cap=2_000_000
     try: too_large=bool(length and int(length)>cap)
     except ValueError: too_large=True
     if too_large:
@@ -1472,6 +1481,111 @@ def register_model(payload:ModelIn):
     con.close(); return {"name":payload.name,"status":"ready","registered":True}
 
 
+MODEL_UPLOAD_EXTENSIONS={
+    "ONNX":{".onnx"},
+    "ONNX FP16":{".onnx"},
+    "TensorRT":{".engine",".plan",".trt"},
+    "TensorRT FP16":{".engine",".plan",".trt"},
+    "PyTorch":{".pt",".pth"},
+}
+
+
+def _uploaded_model_file_info(model_format: str, filename: str) -> tuple[str,str]:
+    """Return a safe original display name and compatible model extension."""
+    raw=(filename or "").replace("\\","/").rsplit("/",1)[-1]
+    extension=Path(raw).suffix.lower()
+    allowed=MODEL_UPLOAD_EXTENSIONS.get(model_format,set())
+    if not raw or extension not in allowed:
+        expected=", ".join(sorted(allowed)) or "подходящий файл"
+        raise HTTPException(422,f"Для формата {model_format} выберите файл: {expected}")
+    # Never persist a browser-provided path/identifier as-is in the registry.
+    safe_name=re.sub(r"[^A-Za-z0-9._-]+","_",raw).strip("._")[:180]
+    return safe_name or f"model{extension}",extension
+
+
+@app.post("/api/models/upload",status_code=201)
+async def upload_model_file(
+    request: Request,
+    name: str=Query(min_length=2,max_length=120,pattern=r"^[a-zA-Z0-9._-]+$"),
+    model_format: Literal["ONNX","ONNX FP16","TensorRT","TensorRT FP16","PyTorch"]=Query(alias="format"),
+    precision: float=Query(ge=0,le=100),
+    recall: float=Query(ge=0,le=100),
+    filename: str=Query(min_length=1,max_length=255),
+):
+    """Stream a locally selected model into MODEL_DIR and register it atomically.
+
+    The browser submits raw bytes rather than multipart form data, avoiding an
+    extra dependency and allowing large files to be written chunk-by-chunk to
+    the shared model volume.  The client-controlled filename only contributes
+    a validated extension; the persisted filename is always derived from the
+    validated model name.
+    """
+    source_filename,extension=_uploaded_model_file_info(model_format,filename)
+    if rows("SELECT 1 FROM model_registry WHERE name=?",(name,)):
+        raise HTTPException(409,"Модель с таким именем уже существует")
+    try:
+        MODEL_DIR.mkdir(parents=True,exist_ok=True)
+        target=MODEL_DIR/f"{name}{extension}"
+        if target.exists():
+            raise HTTPException(409,"Файл с таким именем уже есть в хранилище моделей; выберите другое имя модели")
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(503,"Хранилище моделей недоступно для записи") from exc
+
+    temporary=MODEL_DIR/f".{name}-{uuid.uuid4().hex}{extension}.upload"
+    digest=hashlib.sha256()
+    total=0
+    try:
+        with temporary.open("xb") as stream:
+            async for chunk in request.stream():
+                if not chunk:
+                    continue
+                total+=len(chunk)
+                if total>MODEL_UPLOAD_MAX_BYTES:
+                    limit_mb=max(1,(MODEL_UPLOAD_MAX_BYTES+999_999)//1_000_000)
+                    raise HTTPException(413,f"Модель слишком большая (лимит {limit_mb} МБ)")
+                digest.update(chunk)
+                stream.write(chunk)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if not total:
+            raise HTTPException(422,"Файл модели пуст")
+        # link() creates the final name only if it does not exist; unlike
+        # replace(), this can never overwrite a concurrent upload or artifact.
+        try:
+            os.link(temporary,target)
+        except FileExistsError:
+            raise HTTPException(409,"Файл с таким именем уже есть в хранилище моделей; выберите другое имя модели")
+        except OSError as exc:
+            raise HTTPException(503,"Не удалось сохранить файл модели") from exc
+    except HTTPException:
+        temporary.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        temporary.unlink(missing_ok=True)
+        raise HTTPException(503,"Не удалось записать файл модели") from exc
+    finally:
+        temporary.unlink(missing_ok=True)
+
+    checksum=digest.hexdigest()
+    source=f"upload:{source_filename}"
+    con=db()
+    try:
+        con.execute("INSERT INTO model_registry(name,format,status,precision,recall,trained_at,source,artifact_uri,checksum) VALUES(?,?,?,?,?,?,?,?,?)",(name,model_format,"ready",precision,recall,now_iso(),source,f"file://{target}",checksum))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","model_manager",f"Model uploaded: {name}, format={model_format}, size={total}"))
+        con.commit()
+    except sqlite3.IntegrityError:
+        target.unlink(missing_ok=True)
+        raise HTTPException(409,"Модель с таким именем уже существует")
+    except sqlite3.Error as exc:
+        target.unlink(missing_ok=True)
+        raise HTTPException(503,"Не удалось зарегистрировать загруженную модель") from exc
+    finally:
+        con.close()
+    return {"name":name,"status":"ready","registered":True,"uploaded":True,"artifact_uri":f"file://{target}","checksum":checksum,"size_bytes":total,"source":source}
+
+
 def _preset_view(preset:dict) -> dict:
     name=preset["name"]
     existing=rows("SELECT name,status,precision,recall,source FROM model_registry WHERE name=?",(name,))
@@ -1615,8 +1729,11 @@ def deactivate_trial_model(name:str):
 
 @app.delete("/api/models/{name}")
 def delete_model(name:str):
-    """Remove a model from the registry (and its artifact file if it is a
-    locally-downloaded preset). Refuses to delete the currently active model."""
+    """Remove a model from the registry and its managed preset/upload artifact.
+
+    Manually registered external ``file://`` URIs are left untouched; only
+    files created by this service inside MODEL_DIR are eligible for deletion.
+    """
     if not re.fullmatch(r"[A-Za-z0-9._-]{2,120}",name or ""): raise HTTPException(422,"Недопустимое имя модели")
     con=db(); row=con.execute("SELECT status,source,artifact_uri FROM model_registry WHERE name=?",(name,)).fetchone()
     if not row: con.close(); raise HTTPException(404,"Модель не найдена")
@@ -1629,7 +1746,7 @@ def delete_model(name:str):
     con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"Model deleted: {name} (source={source})"))
     con.commit(); con.close()
     removed_file=False
-    if source and source.startswith("preset:") and artifact_uri.startswith("file://"):
+    if source and source.startswith(("preset:","upload:")) and artifact_uri.startswith("file://"):
         try:
             artifact=Path(artifact_uri.removeprefix("file://")).resolve()
             base=MODEL_DIR.resolve()

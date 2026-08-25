@@ -73,6 +73,7 @@ def test_compose_and_environment_are_consistent():
     assert compose['services']['web']['build'] == './frontend'
     assert 'healthcheck' in compose['services']['api']
     assert compose['services']['api']['environment']['VIDEOANALYTICS_DB'] == '/app/data/videoanalytics.db'
+    assert compose['services']['api']['environment']['MODEL_UPLOAD_MAX_BYTES'] == '${MODEL_UPLOAD_MAX_BYTES:-2000000000}'
     assert compose['services']['api']['ports'] == ['127.0.0.1:8000:8000']
     # Both messenger workers stay available and idle safely until the Admin → Боты
     # control plane enables a provider; this makes UI toggles real without Docker CLI use.
@@ -101,10 +102,11 @@ def test_compose_and_environment_are_consistent():
     assert "img-src 'self' data: blob:" in nginx
     assert '/mjpeg$' in nginx and 'proxy_buffering off' in nginx
     assert 'location ^~ /telegram' in nginx and 'https://web.telegram.org' in nginx
+    assert 'location = /api/models/upload' in nginx and 'client_max_body_size 2g' in nginx and 'proxy_request_buffering off' in nginx
     lines = [x for x in (ROOT/'.env.example').read_text().splitlines() if x and not x.startswith('#')]
     keys = [x.split('=',1)[0] for x in lines]
     assert len(keys) == len(set(keys))
-    assert {'MESSENGER_PROVIDER','ZMK_API_KEY','TELEGRAM_BOT_TOKEN','MAX_BOT_TOKEN','MAX_ADMIN_IDS','POSTGRES_PASSWORD','MINIO_ROOT_PASSWORD'} <= set(keys)
+    assert {'MESSENGER_PROVIDER','ZMK_API_KEY','TELEGRAM_BOT_TOKEN','MAX_BOT_TOKEN','MAX_ADMIN_IDS','MODEL_UPLOAD_MAX_BYTES','POSTGRES_PASSWORD','MINIO_ROOT_PASSWORD'} <= set(keys)
 
 
 def test_release_contains_installation_assets():

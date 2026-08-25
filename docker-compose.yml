@@ -14,6 +14,8 @@ services:
       VIDEOANALYTICS_DB: /app/data/videoanalytics.db
       DATASET_DIR: /datasets
       MODEL_DIR: /models
+      # Maximum size of a locally uploaded model artifact (2 GB by default).
+      MODEL_UPLOAD_MAX_BYTES: ${MODEL_UPLOAD_MAX_BYTES:-2000000000}
       ZMK_API_KEY: ${ZMK_API_KEY:-}
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
       # Upgrade legacy 20 FPS camera limits unless explicitly disabled.
