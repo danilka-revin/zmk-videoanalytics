@@ -83,8 +83,10 @@ fi
 
 if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -qi nvidia; then
   export COMPOSE_FILE="docker-compose.yml:docker-compose.gpu.yml"
+  COMPUTE_MODE="GPU / NVIDIA"
   echo "NVIDIA Container Runtime найден: GPU включён"
 else
+  COMPUTE_MODE="CPU FALLBACK"
   echo "NVIDIA runtime не найден: workers используют CPU fallback"
 fi
 
@@ -109,14 +111,50 @@ start_stack(){
   COMPOSE_PARALLEL_LIMIT=1 "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans
 }
 
+print_launch_summary(){
+  local version ref revision profile compose_display launch_command
+  version=$(tr -d '[:space:]' < VERSION 2>/dev/null || printf 'DEV')
+  if command -v git >/dev/null 2>&1 && [[ -d .git ]]; then
+    ref=$(git branch --show-current 2>/dev/null || printf 'DETACHED')
+    revision=$(git rev-parse --short HEAD 2>/dev/null || printf 'UNKNOWN')
+  else
+    ref="RELEASE ARCHIVE"; revision="N/A"
+  fi
+  profile="${PROFILE[*]:-DEFAULT SERVICES}"
+  compose_display=$(printf '%q ' "${DC[@]}" "${PROFILE[@]}")
+  launch_command="${HOME}/.local/bin/zmk-vision"
+  [[ -x "$launch_command" ]] || launch_command="./start.sh (launcher is created by bootstrap)"
+  printf '\n%s\n' '================================================================'
+  printf '%s\n' '                           ZMK VISION'
+  printf '%s\n' '                 VIDEO ANALYTICS CONTROL PLATFORM'
+  printf '%s\n' '================================================================'
+  printf ' STATUS              : RUNNING\n'
+  printf ' VERSION             : %s\n' "$version"
+  printf ' SOURCE BRANCH       : %s (%s)\n' "$ref" "$revision"
+  printf ' PROJECT DIRECTORY   : %s\n' "$ROOT"
+  printf ' COMPUTE MODE        : %s\n' "$COMPUTE_MODE"
+  printf ' COMPOSE PROFILES    : %s\n' "$profile"
+  printf '%s\n' '----------------------------------------------------------------'
+  printf ' WEB PANEL           : http://localhost:5173\n'
+  printf ' TELEGRAM MINI APP   : http://localhost:5173/telegram\n'
+  printf ' API DOCUMENTATION   : http://localhost:8000/docs\n'
+  printf ' API HEALTH CHECK    : http://localhost:8000/api/health\n'
+  printf '%s\n' '----------------------------------------------------------------'
+  printf ' UPDATE / START      : %s\n' "$launch_command"
+  printf ' PROJECT START       : ./start.sh\n'
+  printf ' LIVE LOGS           : %slogs -f\n' "$compose_display"
+  printf ' AI WORKER LOGS      : %slogs -f inference-worker\n' "$compose_display"
+  printf ' STOP SERVICES       : %sdown\n' "$compose_display"
+  printf '%s\n' '----------------------------------------------------------------'
+  printf '%s\n' ' SERVICE STATUS'
+  "${DC[@]}" "${PROFILE[@]}" ps 2>/dev/null || true
+  printf '%s\n\n' '================================================================'
+}
+
 echo "[start] Обновляю образы и запускаю сервисы ZMK Vision..."
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml или .env не прошли валидацию"
 start_stack || { "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose startup failed after BuildKit cache recovery"; }
 if ! wait_http http://localhost:8000/api/health 120; then "${DC[@]}" logs --tail=100 api; fail "API health check failed"; fi
 if ! wait_http http://localhost:5173 120; then "${DC[@]}" logs --tail=100 web; fail "Web health check failed"; fi
 
-echo ""
-echo "ZMK Vision запущено."
-echo "Панель:  http://localhost:5173"
-echo "API:     http://localhost:8000/docs"
-echo "Повторный запуск/обновление: ${HOME}/.local/bin/zmk-vision  (или ./start.sh)"
+print_launch_summary
