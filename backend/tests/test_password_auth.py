@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 def enable_password_auth(monkeypatch):
     monkeypatch.setattr(main, "PASSWORD_AUTH_ENABLED", True)
-    monkeypatch.setattr(main, "INITIAL_APP_PASSWORD", "1243")
+    monkeypatch.setattr(main, "INITIAL_APP_PASSWORD", "1234")
     main._auth_attempts.clear()
 
 
@@ -18,19 +18,49 @@ def test_password_gate_login_change_and_logout(monkeypatch):
         status = client.get("/api/auth/status").json()
         assert status["enabled"] is True and status["authenticated"] is False
         assert client.post("/api/auth/login", json={"password": "wrong"}).status_code == 401
-        login = client.post("/api/auth/login", json={"password": "1243"})
+        login = client.post("/api/auth/login", json={"password": "1234"})
         assert login.status_code == 200, login.text
         assert login.json()["must_change"] is True
         assert client.get("/api/dashboard").status_code == 403
 
-        changed = client.put("/api/auth/password", json={"current_password": "1243", "new_password": "new-password-42"})
+        changed = client.put("/api/auth/password", json={"current_password": "1234", "new_password": "new-password-42"})
         assert changed.status_code == 200, changed.text
         assert changed.json()["changed"] is True
         assert client.get("/api/dashboard").status_code == 200
         assert client.post("/api/auth/logout").status_code == 200
         assert client.get("/api/dashboard").status_code == 401
-        assert client.post("/api/auth/login", json={"password": "1243"}).status_code == 401
+        assert client.post("/api/auth/login", json={"password": "1234"}).status_code == 401
         assert client.post("/api/auth/login", json={"password": "new-password-42"}).status_code == 200
+
+
+def test_legacy_first_password_is_corrected_without_touching_changed_password(monkeypatch):
+    enable_password_auth(monkeypatch)
+    assert main._resolve_initial_app_password("1243") == "1234"
+    assert main._resolve_initial_app_password("operator-secret") == "operator-secret"
+
+    with TestClient(main.app) as client:
+        con = main.db()
+        con.execute("UPDATE settings SET value=? WHERE key='auth_password_hash'", (main._hash_password("1243"),))
+        con.execute("UPDATE settings SET value='true' WHERE key='auth_password_must_change'")
+        con.execute("DELETE FROM settings WHERE key='auth_initial_password_version'")
+        main._initialize_or_upgrade_auth_password(con)
+        con.commit()
+        con.close()
+
+        assert client.post("/api/auth/login", json={"password": "1243"}).status_code == 401
+        assert client.post("/api/auth/login", json={"password": "1234"}).status_code == 200
+
+        # A password that was already changed by its owner is never rewritten
+        # by the compatibility migration, even if an old version marker is absent.
+        con = main.db()
+        con.execute("UPDATE settings SET value=? WHERE key='auth_password_hash'", (main._hash_password("owner-selected-password"),))
+        con.execute("UPDATE settings SET value='false' WHERE key='auth_password_must_change'")
+        con.execute("DELETE FROM settings WHERE key='auth_initial_password_version'")
+        main._initialize_or_upgrade_auth_password(con)
+        persisted = con.execute("SELECT value FROM settings WHERE key='auth_password_hash'").fetchone()[0]
+        con.commit()
+        con.close()
+        assert main._password_matches("owner-selected-password", persisted)
 
 
 def test_bot_service_token_keeps_messenger_control_plane_working(monkeypatch):
@@ -52,8 +82,8 @@ def test_email_binding_and_recovery_code_resets_password(monkeypatch):
     monkeypatch.setattr(main, "_smtp_ready", lambda: True)
     monkeypatch.setattr(main, "_send_recovery_email", fake_send)
     with TestClient(main.app) as client:
-        assert client.post("/api/auth/login", json={"password": "1243"}).status_code == 200
-        assert client.put("/api/auth/password", json={"current_password": "1243", "new_password": "recovery-start-password"}).status_code == 200
+        assert client.post("/api/auth/login", json={"password": "1234"}).status_code == 200
+        assert client.put("/api/auth/password", json={"current_password": "1234", "new_password": "recovery-start-password"}).status_code == 200
         bound = client.put("/api/auth/email", json={"email": "owner@example.test", "password": "recovery-start-password"})
         assert bound.status_code == 200, bound.text
         assert bound.json()["email"] == "o***@example.test"

@@ -132,6 +132,7 @@ def test_compose_and_environment_are_consistent():
     assert compose['services']['api']['environment']['VIDEOANALYTICS_DB'] == '/app/data/videoanalytics.db'
     assert compose['services']['api']['environment']['MODEL_UPLOAD_MAX_BYTES'] == '${MODEL_UPLOAD_MAX_BYTES:-2000000000}'
     assert compose['services']['api']['environment']['ZMK_PASSWORD_AUTH'] == '${ZMK_PASSWORD_AUTH:-true}'
+    assert compose['services']['api']['environment']['ZMK_INITIAL_PASSWORD'] == '${ZMK_INITIAL_PASSWORD:-1234}'
     assert compose['services']['api']['environment']['ZMK_BOT_API_TOKEN_FILE'] == '/bot-tokens/.api-token'
     assert compose['services']['api']['ports'] == ['127.0.0.1:8000:8000']
     # Both messenger workers stay available and idle safely until the Admin → Боты

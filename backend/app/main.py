@@ -52,7 +52,19 @@ DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().paren
 STARTED = time.time()
 API_KEY = os.getenv("ZMK_API_KEY", "").strip()
 PASSWORD_AUTH_ENABLED=os.getenv("ZMK_PASSWORD_AUTH","false").strip().lower() not in {"0","false","no","off"}
-INITIAL_APP_PASSWORD=os.getenv("ZMK_INITIAL_PASSWORD",str(1243))
+DEFAULT_INITIAL_APP_PASSWORD="1234"
+LEGACY_INITIAL_APP_PASSWORD="1243"
+AUTH_INITIAL_PASSWORD_VERSION="2"
+
+def _resolve_initial_app_password(value: str | None) -> str:
+    """Keep the first-login default stable across older copied .env files."""
+    # 1243 was published as the first password in the preceding release. Treat
+    # it as the corrected default rather than preserving the typo indefinitely.
+    if value in {None,"",LEGACY_INITIAL_APP_PASSWORD}:
+        return DEFAULT_INITIAL_APP_PASSWORD
+    return value
+
+INITIAL_APP_PASSWORD=_resolve_initial_app_password(os.getenv("ZMK_INITIAL_PASSWORD"))
 AUTH_COOKIE_NAME="zmk_session"
 try: AUTH_SESSION_HOURS=max(1,min(720,int(os.getenv("ZMK_AUTH_SESSION_HOURS","12") or 12)))
 except ValueError: AUTH_SESSION_HOURS=12
@@ -204,6 +216,33 @@ def _password_matches(password: str, encoded: str) -> bool:
         return hmac.compare_digest(actual,expected)
     except (TypeError,ValueError,binascii.Error):
         return False
+
+
+def _initialize_or_upgrade_auth_password(con: sqlite3.Connection) -> None:
+    """Create the initial password once and correct the previous 1243 default.
+
+    The hash is normally immutable until the account owner changes or resets
+    it.  The sole migration path is an unversioned database that still has the
+    prior public setup password and is marked as requiring its first change.
+    This lets an upgrade fix an older copied `.env` without touching a password
+    the owner has already chosen.
+    """
+    password_row=con.execute("SELECT value FROM settings WHERE key='auth_password_hash'").fetchone()
+    if not password_row or not str(password_row[0]).strip():
+        con.execute("INSERT INTO settings(key,value) VALUES('auth_password_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(_hash_password(INITIAL_APP_PASSWORD),))
+        con.execute("INSERT INTO settings(key,value) VALUES('auth_initial_password_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(AUTH_INITIAL_PASSWORD_VERSION,))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","auth","Initial local password initialized; change it after first login"))
+        return
+
+    version_row=con.execute("SELECT value FROM settings WHERE key='auth_initial_password_version'").fetchone()
+    if version_row and str(version_row[0]).strip():
+        return
+    must_change_row=con.execute("SELECT value FROM settings WHERE key='auth_password_must_change'").fetchone()
+    must_change=bool(must_change_row and str(must_change_row[0]).strip().lower()=="true")
+    if must_change and _password_matches(LEGACY_INITIAL_APP_PASSWORD,str(password_row[0])):
+        con.execute("UPDATE settings SET value=? WHERE key='auth_password_hash'",(_hash_password(INITIAL_APP_PASSWORD),))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","auth","Legacy initial password corrected; change it after first login"))
+    con.execute("INSERT INTO settings(key,value) VALUES('auth_initial_password_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(AUTH_INITIAL_PASSWORD_VERSION,))
 
 
 def _auth_setting(key: str, default: str = "") -> str:
@@ -420,10 +459,7 @@ def init_db():
         "rtsp_reconnect_seconds":"5", "event_cooldown_seconds":"30"
     }
     for key,value in config_defaults.items(): con.execute("INSERT OR IGNORE INTO settings VALUES(?,?)",(key,value))
-    password_row=con.execute("SELECT value FROM settings WHERE key='auth_password_hash'").fetchone()
-    if not password_row or not str(password_row[0]).strip():
-        con.execute("INSERT INTO settings(key,value) VALUES('auth_password_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(_hash_password(INITIAL_APP_PASSWORD),))
-        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","auth","Initial local password initialized; change it after first login"))
+    _initialize_or_upgrade_auth_password(con)
     con.execute("DELETE FROM auth_sessions WHERE expires_at<=?",(now_iso(),))
     con.execute("DELETE FROM auth_recovery_codes WHERE expires_at<=? OR used_at!=''",(now_iso(),))
     disabled_row=con.execute("SELECT value FROM settings WHERE key='active_model_disabled'").fetchone()
