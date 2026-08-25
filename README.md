@@ -126,7 +126,7 @@ docker compose up --build
 curl -fsSL https://raw.githubusercontent.com/danilka-revin/zmk-videoanalytics/main/installers/bootstrap-linux.sh | bash
 ```
 
-Bootstrap также создаёт короткую команду `~/.local/bin/zmk-vision`: она скачивает свежий Git ref и запускает проект повторно. После первого запуска для обычного старта достаточно `~/zmk-vision/start.sh`: он проверяет GitHub Releases, сохраняет конфигурацию и запускает Docker. Не вставляйте RTSP URL в командную строку или чат — bootstrap спрашивает его скрыто.
+Bootstrap также создаёт короткую команду `~/.local/bin/zmk-vision`: она скачивает свежий Git ref, пересобирает образы и запускает проект повторно. Это единственная команда для следующих обновлений и стартов. При известной ошибке Docker BuildKit `parent snapshot ... does not exist` launcher очищает только кэш сборки и повторяет запуск последовательно — данные, модели и Docker volumes не удаляются. После первого запуска можно также использовать `~/zmk-vision/start.sh`. Не вставляйте RTSP URL в командную строку или чат — bootstrap спрашивает его скрыто.
 
 ### Windows 10/11
 

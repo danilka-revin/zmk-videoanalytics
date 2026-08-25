@@ -72,10 +72,11 @@ PROFILE=()
 if [[ -f .zmk-profiles ]]; then mapfile -t PROFILE < .zmk-profiles; fi
 
 DC=(docker compose)
+DOCKER=(docker)
 if ! docker info >/dev/null 2>&1; then
   run_privileged systemctl start docker 2>/dev/null || true
   if ! docker info >/dev/null 2>&1; then
-    if [[ "${EUID}" -eq 0 ]]; then DC=(docker compose); else DC=(sudo docker compose); fi
+    if [[ "${EUID}" -eq 0 ]]; then DC=(docker compose); else DC=(sudo docker compose); DOCKER=(sudo docker); fi
   fi
 fi
 "${DC[@]}" version >/dev/null 2>&1 || fail "Docker Compose plugin is unavailable."
@@ -89,9 +90,28 @@ fi
 
 wait_http(){ local url="$1" s="${2:-120}" i; for ((i=0;i<s/2;i++)); do curl -fsS --max-time 3 "$url" >/dev/null 2>&1 && return 0; sleep 2; done; return 1; }
 
-echo "[start] Запускаю сервисы ZMK Vision..."
+repair_build_cache(){
+  # BuildKit's occasional "parent snapshot ... does not exist" is cache
+  # corruption, not a project/data error. Remove only disposable build cache;
+  # never touch named volumes, data, models or bot tokens.
+  echo "[start] Docker BuildKit не собрал образы. Очищаю только кэш сборки и повторяю один раз..."
+  "${DOCKER[@]}" builder prune -af >/dev/null 2>&1 || true
+  "${DOCKER[@]}" buildx prune -af >/dev/null 2>&1 || true
+  run_privileged systemctl restart docker 2>/dev/null || true
+}
+
+start_stack(){
+  if "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
+    return 0
+  fi
+  repair_build_cache
+  # Serial service builds avoid a second concurrent snapshot/export race.
+  COMPOSE_PARALLEL_LIMIT=1 "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans
+}
+
+echo "[start] Обновляю образы и запускаю сервисы ZMK Vision..."
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml или .env не прошли валидацию"
-"${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans || "${DC[@]}" "${PROFILE[@]}" logs --tail=100
+start_stack || { "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose startup failed after BuildKit cache recovery"; }
 if ! wait_http http://localhost:8000/api/health 120; then "${DC[@]}" logs --tail=100 api; fail "API health check failed"; fi
 if ! wait_http http://localhost:5173 120; then "${DC[@]}" logs --tail=100 web; fail "Web health check failed"; fi
 
@@ -99,4 +119,4 @@ echo ""
 echo "ZMK Vision запущено."
 echo "Панель:  http://localhost:5173"
 echo "API:     http://localhost:8000/docs"
-echo "Повторный запуск: ./start.sh"
+echo "Повторный запуск/обновление: ${HOME}/.local/bin/zmk-vision  (или ./start.sh)"

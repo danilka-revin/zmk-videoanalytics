@@ -74,10 +74,11 @@ run_config || fail "Настройка не завершена"
 chmod 600 .env 2>/dev/null || true
 command -v docker >/dev/null 2>&1 || fail "Docker CLI is unavailable"
 DC=(docker compose)
+DOCKER=(docker)
 if ! docker info >/dev/null 2>&1; then
   run_privileged systemctl start docker 2>/dev/null || true
   if ! docker info >/dev/null 2>&1; then
-    if [[ "${EUID}" -eq 0 ]]; then DC=(docker compose); else DC=(sudo docker compose); fi
+    if [[ "${EUID}" -eq 0 ]]; then DC=(docker compose); else DC=(sudo docker compose); DOCKER=(sudo docker); fi
   fi
 fi
 "${DC[@]}" version >/dev/null || fail "Docker Compose plugin is unavailable"
@@ -91,8 +92,23 @@ else
   echo "NVIDIA Container Runtime не найден: workers запустятся в CPU fallback без ошибки"
 fi
 
+repair_build_cache(){
+  echo "Docker BuildKit не собрал образы. Очищаю только кэш сборки и повторяю один раз..."
+  "${DOCKER[@]}" builder prune -af >/dev/null 2>&1 || true
+  "${DOCKER[@]}" buildx prune -af >/dev/null 2>&1 || true
+  run_privileged systemctl restart docker 2>/dev/null || true
+}
+
+start_stack(){
+  if "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
+    return 0
+  fi
+  repair_build_cache
+  COMPOSE_PARALLEL_LIMIT=1 "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans
+}
+
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml or .env validation failed"
-if ! "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose startup failed"; fi
+start_stack || { "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose startup failed after BuildKit cache recovery"; }
 if ! wait_http http://localhost:8000/api/health 120; then "${DC[@]}" logs --tail=100 api; fail "API health check failed"; fi
 if ! wait_http http://localhost:5173 120; then "${DC[@]}" logs --tail=100 web; fail "Web health check failed"; fi
 
@@ -100,4 +116,4 @@ echo ""
 echo "ZMK Vision installed and verified successfully."
 echo "Dashboard: http://localhost:5173"
 echo "API docs:  http://localhost:8000/docs"
-echo "Next starts: ./start.sh  (checks for updates automatically)"
+echo "Next starts/updates: ~/.local/bin/zmk-vision  (or ./start.sh)"

@@ -27,6 +27,12 @@ def test_linux_installers_pass_shell_parser_and_dry_check():
     start = (ROOT/'start.sh').read_text()
     assert 'installers/wizard.sh' in start and 'run_config' in start and '--setup' in start
     assert '.zmk-profiles' in start
+    # The one-command launcher retries a known BuildKit snapshot-cache failure
+    # without pruning persistent project volumes.
+    for script in (start, (ROOT/'installers/install-linux.sh').read_text()):
+        assert 'builder prune -af' in script
+        assert 'COMPOSE_PARALLEL_LIMIT=1' in script
+        assert 'buildx prune -af' in script
 
 
 def test_bootstrap_launcher_and_rtsp_wizard_escape_credentials(tmp_path):
