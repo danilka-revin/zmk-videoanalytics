@@ -571,6 +571,16 @@ class ModelIn(BaseModel):
     source:str=Field(default="external",max_length=200)
     artifact_uri:str=Field(min_length=1,max_length=1000)
     checksum:str=Field(default="",max_length=128,pattern=r"^[a-fA-F0-9]*$")
+class ModelBulkDeleteIn(BaseModel):
+    names:list[str]=Field(min_length=1,max_length=200)
+    deactivate_active:bool=True
+    @field_validator("names")
+    @classmethod
+    def validate_names(cls,value:list[str]):
+        unique=list(dict.fromkeys(value))
+        if any(not re.fullmatch(r"[A-Za-z0-9._-]{2,120}",name or "") for name in unique):
+            raise ValueError("Недопустимое имя модели")
+        return unique
 class TrainingProgress(BaseModel):
     status:Literal["queued","running","completed","failed","cancelled"]
     progress:int=Field(ge=0,le=100)
@@ -1838,13 +1848,8 @@ def deactivate_test_model(name:str):
         if con is not None:
             con.close()
 
-@app.delete("/api/models/{name}")
-def delete_model(name:str, deactivate:bool=False):
-    """Remove a model and optionally stop it first when it is currently active.
-
-    The ordinary route still refuses accidental deletion of an active model.
-    The Web panel sends ``deactivate=true`` only after an explicit confirmation.
-    """
+def _delete_model(name:str, *, deactivate:bool=False):
+    """Remove a model and optionally stop it first when it is currently active."""
     if not re.fullmatch(r"[A-Za-z0-9._-]{2,120}",name or ""): raise HTTPException(422,"Недопустимое имя модели")
     con=db(); row=con.execute("SELECT status,source,artifact_uri FROM model_registry WHERE name=?",(name,)).fetchone()
     if not row: con.close(); raise HTTPException(404,"Модель не найдена")
@@ -1883,6 +1888,30 @@ def delete_model(name:str, deactivate:bool=False):
         except (OSError,ValueError):
             removed_file=False
     return {"name":name,"deleted":True,"removed_artifact_file":removed_file,"source":source,"deactivated_active":deactivated_active,"active_model":active_after or None}
+
+
+@app.delete("/api/models/{name}")
+def delete_model(name:str, deactivate:bool=False):
+    """Delete one model; an active model needs explicit deactivation consent."""
+    return _delete_model(name,deactivate=deactivate)
+
+
+@app.post("/api/models/delete-bulk")
+def delete_models_bulk(payload:ModelBulkDeleteIn):
+    """Delete a selected group while reporting every blocked item explicitly.
+
+    Each model is handled independently so a training job or missing record
+    does not hide successful deletions from the operator.
+    """
+    deleted=[]
+    failed=[]
+    for name in payload.names:
+        try:
+            deleted.append(_delete_model(name,deactivate=payload.deactivate_active))
+        except HTTPException as exc:
+            failed.append({"name":name,"status":exc.status_code,"detail":str(exc.detail)})
+    return {"deleted":deleted,"failed":failed,"requested":len(payload.names)}
+
 
 IMAGE_EXTS={".jpg",".jpeg",".png",".bmp",".webp",".tif",".tiff"}
 VIDEO_EXTS={".mp4",".avi",".mov",".mkv",".m4v",".webm",".mpg",".mpeg",".wmv"}
