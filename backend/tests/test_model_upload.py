@@ -56,6 +56,25 @@ def test_uploads_local_model_to_shared_volume_registers_checksum_and_deletes_it(
         assert not target.exists()
 
 
+def test_camera_test_can_run_uploaded_model_below_quality_gate(model_dir):
+    with TestClient(main.app) as client:
+        uploaded = client.post(
+            "/api/models/upload",
+            params=upload_params(name="camera-test", precision="40", recall="35"), content=b"onnx-data",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        assert client.post("/api/models/camera-test/activate").status_code == 409
+        tested = client.post("/api/models/camera-test/activate-test")
+        assert tested.status_code == 200, tested.text
+        assert tested.json()["test_mode"] is True
+        model = next(item for item in client.get("/api/models").json() if item["name"] == "camera-test")
+        assert model["active"] is True and model["test_mode"] is True
+        # Validate the selected test mode through the public health endpoint.
+        health = client.get("/api/models/active/health")
+        assert health.status_code == 200 and health.json()["test_mode"] is True
+
+
 def test_activation_rejects_uploaded_model_when_shared_artifact_disappeared(model_dir):
     with TestClient(main.app) as client:
         uploaded = client.post(

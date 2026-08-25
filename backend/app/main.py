@@ -258,7 +258,7 @@ def init_db():
     legacy_telegram_enabled=bool(legacy_telegram_enabled_row and legacy_telegram_enabled_row[0]=='true')
     legacy_critical_alerts=bool(legacy_critical_alerts_row and legacy_critical_alerts_row[0]=='true')
     config_defaults={
-        "active_model":"", "active_model_disabled":"false", "ppe_trial_previous_model":"", "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
+        "active_model":"", "active_model_disabled":"false", "ppe_trial_previous_model":"", "model_test_mode":"false", "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
         "retention_days":"90", "archive_quality":"90", "archive_clip_seconds":"10",
         "inference_fps":"8", "inference_device":"cuda:0", "batch_size":"4", "nms_iou":"0.45",
         "helmet_conf":"0.85", "vest_conf":"0.80", "phone_conf":"0.78", "smoking_conf":"0.80", "restricted_zone_conf":"0.82", "immobility_conf":"0.80", "min_model_precision":"90", "min_model_recall":"85",
@@ -284,6 +284,7 @@ def init_db():
         # No model is active after an explicitly stopped PPE trial. Do not
         # resurrect a ready model merely because the API/container restarted.
         con.execute("UPDATE settings SET value='' WHERE key='active_model'")
+        con.execute("UPDATE settings SET value='false' WHERE key='model_test_mode'")
     else:
         active_row=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()
         # An empty value means the operator has not selected a model. Never
@@ -296,6 +297,7 @@ def init_db():
                 fallback=con.execute("SELECT name FROM model_registry WHERE status='ready' ORDER BY id DESC LIMIT 1").fetchone()
                 value=fallback[0] if fallback else ""
                 con.execute("INSERT INTO settings(key,value) VALUES('active_model',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(value,))
+                con.execute("UPDATE settings SET value='false' WHERE key='model_test_mode'")
                 if fallback: con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"Active model repaired to {fallback[0]}"))
     bootstrap_env_camera(con)
     apply_retention(con)
@@ -904,7 +906,12 @@ def inference_heartbeat(payload:InferenceHeartbeat):
 @app.get("/api/internal/active-model")
 def internal_active_model():
     data=rows("SELECT m.name,m.format,m.artifact_uri,m.checksum,m.source FROM model_registry m JOIN settings s ON s.key='active_model' AND s.value=m.name WHERE m.status='ready'")
-    return data[0] if data else None
+    if not data:
+        return None
+    # Test mode still loads and paints real boxes, but worker suppresses event
+    # delivery so an unvalidated model cannot create production alerts.
+    data[0]["test_mode"]=con_value("model_test_mode","false")=="true"
+    return data[0]
 
 import re as _re
 
@@ -1489,6 +1496,7 @@ def _model_runtime_view(name: str, active: bool, worker: dict[str,Any]) -> dict[
 @app.get("/api/models")
 def models():
     active=rows("SELECT value FROM settings WHERE key='active_model'")[0]["value"]
+    test_mode=con_value("model_test_mode","false")=="true"
     limits={r["key"]:float(r["value"]) for r in rows("SELECT key,value FROM settings WHERE key IN ('min_model_precision','min_model_recall')")}
     worker=inference_worker_state()
     data=rows("SELECT name,format,status,precision,recall,trained_at,source,artifact_uri,checksum FROM model_registry ORDER BY id DESC")
@@ -1496,6 +1504,7 @@ def models():
         item["active"]=item["name"]==active
         item["trial_eligible"]=_is_trial_preset_source(item.get("source"))
         item["trial_mode"]=bool(item["active"] and item["trial_eligible"] and not _model_meets_quality(item.get("precision"),item.get("recall"),limits))
+        item["test_mode"]=bool(item["active"] and test_mode)
         item["runtime"]=_model_runtime_view(str(item["name"]),bool(item["active"]),worker)
     return data
 
@@ -1680,8 +1689,9 @@ def active_model_health():
     if not model: raise HTTPException(503,"Активная модель отсутствует в реестре")
     healthy=model[2]=="ready" and _model_meets_quality(model[3],model[4],limits)
     trial_mode=bool(not healthy and _is_trial_preset_source(model[6]))
+    test_mode=con_value("model_test_mode","false")=="true"
     runtime=_model_runtime_view(str(model[0]),True,inference_worker_state())
-    return {"healthy":healthy,"trial_mode":trial_mode,"model":dict(model),"runtime":runtime,"requirements":{"precision":limits.get('min_model_precision',90),"recall":limits.get('min_model_recall',85)},"last_inference":dict(last) if last else None}
+    return {"healthy":healthy,"trial_mode":trial_mode,"test_mode":test_mode,"model":dict(model),"runtime":runtime,"requirements":{"precision":limits.get('min_model_precision',90),"recall":limits.get('min_model_recall',85)},"last_inference":dict(last) if last else None}
 
 
 def _ensure_managed_model_artifact(source: str | None, artifact_uri: str | None) -> None:
@@ -1699,7 +1709,7 @@ def _ensure_managed_model_artifact(source: str | None, artifact_uri: str | None)
         raise HTTPException(409,"Файл модели отсутствует в общем хранилище. Загрузите модель заново.")
 
 
-def _activate_model(name:str, *, allow_trial:bool=False):
+def _activate_model(name:str, *, allow_trial:bool=False, allow_test:bool=False):
     started=time.perf_counter()
     con=db()
     try:
@@ -1710,27 +1720,33 @@ def _activate_model(name:str, *, allow_trial:bool=False):
         limits={r[0]:float(r[1]) for r in con.execute("SELECT key,value FROM settings WHERE key IN ('min_model_precision','min_model_recall')").fetchall()}
         quality_ok=_model_meets_quality(model[1],model[2],limits)
         trial_mode=not quality_ok and allow_trial and _is_trial_preset_source(model[3])
-        if not quality_ok and not trial_mode:
+        # A camera test is explicit and visibly marked in the UI. It lets an
+        # operator inspect a newly uploaded model's real boxes before claiming
+        # its supplied metrics are good enough for production alarms.
+        test_mode=trial_mode or allow_test
+        if not quality_ok and not test_mode:
             if model[1] is None or model[2] is None:
-                raise HTTPException(409,"У модели отсутствуют метрики валидации. Для PPE-пресета используйте отдельную кнопку «Включить PPE-тест».")
-            raise HTTPException(409,"Метрики модели ниже минимально допустимых")
+                raise HTTPException(409,"У модели отсутствуют метрики валидации. Нажмите «Тест на камере», чтобы проверить её без production-активации.")
+            raise HTTPException(409,"Метрики модели ниже минимально допустимых. Для проверки на камере используйте тестовый запуск.")
         con.execute("BEGIN IMMEDIATE")
         old=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()[0]
         if old==name:
             con.execute("UPDATE settings SET value='false' WHERE key='active_model_disabled'")
+            con.execute("UPDATE settings SET value=? WHERE key='model_test_mode'",("true" if test_mode else "false",))
             con.commit()
-            return {"active_model":name,"previous_model":old,"hot_swap":False,"idempotent":True,"trial_mode":trial_mode,"control_plane_switch_ms":round((time.perf_counter()-started)*1000,2),"downtime_ms":0}
+            return {"active_model":name,"previous_model":old,"hot_swap":False,"idempotent":True,"trial_mode":trial_mode,"test_mode":test_mode,"control_plane_switch_ms":round((time.perf_counter()-started)*1000,2),"downtime_ms":0}
         con.execute("UPDATE settings SET value=? WHERE key='active_model'",(name,))
         # Keep a validated model selected before a PPE test so stopping the
         # test restores the exact previous state instead of leaving an
         # operator unexpectedly without analytics.
         con.execute("UPDATE settings SET value=? WHERE key='ppe_trial_previous_model'",(old if trial_mode else "",))
+        con.execute("UPDATE settings SET value=? WHERE key='model_test_mode'",("true" if test_mode else "false",))
         con.execute("UPDATE settings SET value='false' WHERE key='active_model_disabled'")
-        level="WARNING" if trial_mode else "INFO"
-        mode="PPE trial" if trial_mode else "validated"
+        level="WARNING" if test_mode else "INFO"
+        mode="PPE trial" if trial_mode else "camera test" if test_mode else "validated"
         con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),level,"model_manager",f"Control-plane hot-swap {old} -> {name} ({mode}) completed"))
         con.commit()
-        return {"active_model":name,"previous_model":old,"hot_swap":True,"idempotent":False,"trial_mode":trial_mode,"control_plane_switch_ms":round((time.perf_counter()-started)*1000,2),"downtime_ms":0}
+        return {"active_model":name,"previous_model":old,"hot_swap":True,"idempotent":False,"trial_mode":trial_mode,"test_mode":test_mode,"control_plane_switch_ms":round((time.perf_counter()-started)*1000,2),"downtime_ms":0}
     finally:
         con.close()
 
@@ -1744,6 +1760,12 @@ def activate(name:str):
 def activate_trial_model(name:str):
     """Explicitly enable only the selected PPE baseline for an on-site trial."""
     return _activate_model(name,allow_trial=True)
+
+
+@app.post("/api/models/{name}/activate-test")
+def activate_test_model(name:str):
+    """Run any ready model on cameras as an explicitly non-production test."""
+    return _activate_model(name,allow_test=True)
 
 
 @app.post("/api/models/{name}/deactivate-trial")
@@ -1764,6 +1786,7 @@ def deactivate_trial_model(name:str):
             restored=previous
         con.execute("UPDATE settings SET value=? WHERE key='active_model'",(restored,))
         con.execute("UPDATE settings SET value=? WHERE key='active_model_disabled'",("false" if restored else "true",))
+        con.execute("UPDATE settings SET value='false' WHERE key='model_test_mode'")
         con.execute("UPDATE settings SET value='' WHERE key='ppe_trial_previous_model'")
         con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"PPE trial stopped: {name}; restored={restored or 'none'}"))
         con.commit()
@@ -1801,6 +1824,7 @@ def delete_model(name:str, deactivate:bool=False):
         active_after=restored
         con.execute("UPDATE settings SET value=? WHERE key='active_model'",(active_after,))
         con.execute("UPDATE settings SET value=? WHERE key='active_model_disabled'",("false" if active_after else "true",))
+        con.execute("UPDATE settings SET value='false' WHERE key='model_test_mode'")
         con.execute("UPDATE settings SET value='' WHERE key='ppe_trial_previous_model'")
     con.execute("DELETE FROM model_registry WHERE name=?",(name,))
     con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"Model deleted: {name} (source={source}, deactivated={deactivated_active})"))

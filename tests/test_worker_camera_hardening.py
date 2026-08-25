@@ -211,6 +211,36 @@ def test_ppe_inference_posts_no_helmet_event_for_the_matching_person(worker_mod)
     assert detection["person_id"].startswith("cam_01-person-")
 
 
+def test_camera_test_mode_draws_boxes_without_sending_production_events(worker_mod):
+    class Tensor:
+        def __init__(self, value): self.value = value
+        def cpu(self): return self
+        def tolist(self): return self.value
+
+    result = types.SimpleNamespace(boxes=types.SimpleNamespace(
+        xyxy=Tensor([[1, 1, 18, 19]]), cls=Tensor([0]), conf=Tensor([.96]),
+    ))
+
+    class TestModel:
+        def __init__(self): self.names = {0: "no_vest"}
+        def predict(self, *_args, **_kwargs): return [result]
+
+    runtime = worker_mod.Runtime()
+    runtime.model = TestModel()
+    runtime.model_name = "unvalidated-local"
+    runtime.model_test_mode = True
+    posted = []
+
+    async def post(path, data): posted.append((path, data))
+    runtime.post = post
+    session = worker_mod.CameraSession(config=worker_mod.CameraConfig.from_api(_camera()))
+
+    visual = asyncio.run(runtime._infer(session, _FakeImage()))
+
+    assert visual is not None and visual.boxes
+    assert posted == []
+
+
 def test_accepted_event_gets_an_annotated_evidence_frame(worker_mod):
     class Tensor:
         def __init__(self, value): self.value = value

@@ -442,6 +442,8 @@ class Runtime:
         self._inference_lock = asyncio.Lock()
         self.model: Any | None = None
         self.model_name = ""
+        # Explicit camera tests draw boxes but never deliver detections/events.
+        self.model_test_mode = False
         self.device = DEVICE_SETTING
         self._model_task: asyncio.Task[tuple[str, Any, str]] | None = None
         self._model_loading_name = ""
@@ -671,7 +673,7 @@ class Runtime:
             return
         status = "running" if self.sessions else "idle"
         model_name, model_status, model_error = self._model_runtime()
-        detail = f"cameras={len(self.sessions)} model={model_name or 'none'} state={model_status}"
+        detail = f"cameras={len(self.sessions)} model={model_name or 'none'} state={model_status} test={str(self.model_test_mode).lower()}"
         if model_error:
             detail += f" error={model_error}"
         try:
@@ -731,6 +733,7 @@ class Runtime:
             self._model_task = None
             self.model = None
             self.model_name = ""
+            self.model_test_mode = False
             self._model_loading_name = ""
             self._model_error = ""
             for session in self.sessions.values():
@@ -745,14 +748,17 @@ class Runtime:
             return
 
         wanted_name = str(info["name"])
+        requested_test_mode = bool(info.get("test_mode"))
         self._no_model_announced = False
         if self.model_name == wanted_name and self.model is not None:
+            self.model_test_mode = requested_test_mode
             self._model_loading_name = wanted_name
             self._model_error = ""
             return
 
         if self._model_task is not None:
             if not self._model_task.done():
+                self.model_test_mode = requested_test_mode
                 return
             task = self._model_task
             self._model_task = None
@@ -784,6 +790,7 @@ class Runtime:
             session.latest_visual = None
             session.next_inference_at = 0
         self._model_loading_name = wanted_name
+        self.model_test_mode = requested_test_mode
         self._model_error = ""
         self._model_task = asyncio.create_task(self._load_model_async(dict(info)), name=f"model-load-{wanted_name}")
         self._log(f"loading active model {wanted_name} in background", force=True)
@@ -1182,7 +1189,7 @@ class Runtime:
             self._log(f"overlay render failed; raw preview continues: {redact_error(exc)}")
             annotated=None
 
-        if detections:
+        if detections and not self.model_test_mode:
             try:
                 receipt=await self.post("/api/inference/detections", {"detections": detections})
                 await self._publish_event_evidence(session,receipt,annotated if annotated is not None else image)
