@@ -603,6 +603,68 @@ def dashboard():
         trend.append({"label":end.strftime("%H:00"),"value":n})
     con.close(); gpu=gpu_metrics(); return {"cameras":{"total":total,"online":online},"events24h":events24,"critical_unacked":critical,"avg_fps":round(avg[0],1),"avg_latency_ms":round(avg[1]),"gpu_load":gpu["gpu"],"gpu_temp":gpu["gpu_temp"],"messenger_provider":MESSENGER_PROVIDER,"active_model":model[0] if model else None,"precision":model[1] if model else None,"recall":model[2] if model else None,"trend":trend}
 
+EVENT_LABELS={"no_helmet":"Без каски","no_vest":"Без жилета","phone_usage":"Телефон","smoking":"Курение","restricted_zone":"Опасная зона","immobility":"Неподвижность"}
+REVIEW_LABELS={"pending":"Требуют внимания","accepted":"Приняты","rejected":"Не приняты"}
+
+def _analytics_timestamp(value:str) -> datetime|None:
+    try:
+        parsed=datetime.fromisoformat(value)
+        return (parsed if parsed.tzinfo else parsed.replace(tzinfo=TZ)).astimezone(TZ)
+    except (TypeError,ValueError):
+        return None
+
+def build_overview_analytics(hours:int,bucket:Literal["auto","hour","day"]="auto") -> dict[str,Any]:
+    """Build real, zero-filled event analytics for the requested period."""
+    now=datetime.now(TZ)
+    since=now-timedelta(hours=hours)
+    granularity="hour" if bucket=="hour" or (bucket=="auto" and hours<=48) else "day"
+    if granularity=="hour":
+        cursor=since.replace(minute=0,second=0,microsecond=0); step=timedelta(hours=1); label=lambda stamp:stamp.strftime("%d.%m %H:%M")
+    else:
+        cursor=since.replace(hour=0,minute=0,second=0,microsecond=0); step=timedelta(days=1); label=lambda stamp:stamp.strftime("%d.%m")
+    bucket_rows:dict[str,dict[str,Any]]={}
+    while cursor<=now:
+        key=cursor.isoformat()
+        bucket_rows[key]={"start":key,"label":label(cursor),"total":0,"critical":0,"pending":0,"accepted":0,"rejected":0,"confidence_sum":0.0}
+        cursor+=step
+    con=db()
+    raw=con.execute("""SELECT e.timestamp,e.type,e.severity,e.confidence,e.review_status,e.acknowledged,e.camera_id,c.name camera_name,c.zone
+        FROM events e LEFT JOIN cameras c ON c.id=e.camera_id WHERE e.timestamp>=? ORDER BY e.timestamp""",(since.isoformat(),)).fetchall()
+    con.close()
+    types:dict[str,int]={}; cameras:dict[str,dict[str,Any]]={}; review={"pending":0,"accepted":0,"rejected":0}; severity={"critical":0,"high":0,"medium":0,"low":0}
+    total_confidence=0.0; total=0
+    for row in raw:
+        stamp=_analytics_timestamp(row[0])
+        if stamp is None or stamp<since or stamp>now: continue
+        key=(stamp.replace(minute=0,second=0,microsecond=0) if granularity=="hour" else stamp.replace(hour=0,minute=0,second=0,microsecond=0)).isoformat()
+        slot=bucket_rows.get(key)
+        status=row[4] if row[4] in REVIEW_LABELS else ("accepted" if row[5] else "pending")
+        if slot:
+            slot["total"]+=1; slot[status]+=1; slot["confidence_sum"]+=float(row[3])
+            if row[2]=="critical": slot["critical"]+=1
+        review[status]+=1; severity[row[2]]=severity.get(row[2],0)+1; types[row[1]]=types.get(row[1],0)+1
+        camera=cameras.setdefault(row[6],{"camera_id":row[6],"name":row[7] or row[6],"zone":row[8] or "—","total":0,"critical":0,"pending":0,"accepted":0,"rejected":0})
+        camera["total"]+=1; camera[status]+=1
+        if row[2]=="critical": camera["critical"]+=1
+        total+=1; total_confidence+=float(row[3])
+    buckets=[]
+    for slot in bucket_rows.values():
+        count=slot.pop("confidence_sum")
+        slot["avg_confidence"]=round(count/max(1,slot["total"]),3)
+        buckets.append(slot)
+    return {"generated_at":now_iso(),"hours":hours,"bucket":granularity,"period":{"from":since.isoformat(),"to":now.isoformat()},"totals":{"events":total,"critical":severity.get("critical",0),"pending":review["pending"],"accepted":review["accepted"],"rejected":review["rejected"],"avg_confidence":round(total_confidence/max(1,total),3)},"buckets":buckets,"types":[{"id":key,"label":EVENT_LABELS.get(key,key),"value":value} for key,value in sorted(types.items(),key=lambda item:(-item[1],item[0]))],"cameras":sorted(cameras.values(),key=lambda item:(-item["total"],item["name"]))[:12],"review":[{"id":key,"label":REVIEW_LABELS[key],"value":value} for key,value in review.items()],"severity":[{"id":key,"label":key.upper(),"value":value} for key,value in severity.items() if value]}
+
+@app.get("/api/analytics/overview")
+def overview_analytics(hours:int=Query(24,ge=1,le=2160),bucket:Literal["auto","hour","day"]="auto"):
+    return build_overview_analytics(hours,bucket)
+
+@app.get("/api/reports/analytics.csv")
+def overview_analytics_csv(hours:int=Query(24,ge=1,le=2160),bucket:Literal["auto","hour","day"]="auto"):
+    analytics=build_overview_analytics(hours,bucket)
+    fields=["start","label","total","critical","pending","accepted","rejected","avg_confidence"]
+    out=io.StringIO(); writer=csv.DictWriter(out,fieldnames=fields); writer.writeheader(); writer.writerows(sanitize_csv_rows(analytics["buckets"]))
+    return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":f"attachment; filename=zmk-analytics-{hours}h.csv"})
+
 @app.get("/api/internal/cameras")
 def internal_cameras(): return rows("SELECT id,name,rtsp_url,fps_limit,enabled,restart_requested_at FROM cameras WHERE enabled=1 AND rtsp_url!='' ORDER BY id")
 
