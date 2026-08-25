@@ -121,6 +121,20 @@ print_zmk_logo(){
     ' ╚══════╝╚═╝     ╚═╝╚═╝  ╚═╝      ╚═══╝  ╚═╝╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝'
 }
 
+print_linux_tux(){
+  cat <<'TUX'
+                               .--.
+                              (o o)
+                             (  ^  )
+                            <  ___  >
+                            /|     |\
+                           /_|_____|_\
+                              / | \
+                             /__|__\
+TUX
+  printf '%s\n' '                            LINUX TUX'
+}
+
 print_launch_summary(){
   local version ref revision profile compose_display launch_command
   version=$(tr -d '[:space:]' < VERSION 2>/dev/null || printf 'DEV')
@@ -136,6 +150,7 @@ print_launch_summary(){
   [[ -x "$launch_command" ]] || launch_command="./start.sh (launcher is created by bootstrap)"
   printf '\n%s\n' '================================================================'
   print_zmk_logo
+  print_linux_tux
   printf '%s\n' '                           ZMK VISION'
   printf '%s\n' '                 VIDEO ANALYTICS CONTROL PLATFORM'
   printf '%s\n' '================================================================'

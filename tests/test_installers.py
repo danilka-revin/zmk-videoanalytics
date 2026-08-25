@@ -38,6 +38,8 @@ def test_linux_installers_pass_shell_parser_and_dry_check():
         assert 'VIDEO ANALYTICS CONTROL PLATFORM' in script
         assert 'SERVICE STATUS' in script
         assert 'API HEALTH CHECK' in script
+        assert 'LINUX TUX' in script
+        assert '(o o)' in script
 
 
 def test_bootstrap_launcher_and_rtsp_wizard_escape_credentials(tmp_path):
