@@ -137,7 +137,7 @@ def menu(user_id: int, username: str = "") -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🚨 События", callback_data="events"), InlineKeyboardButton(text="🧾 Ошибки", callback_data="errors")],
         [InlineKeyboardButton(text="🧠 Модели", callback_data="models"), InlineKeyboardButton(text="🩺 Health", callback_data="health")],
     ]
-    if allowed(user_id, "operator", username): rows.append([InlineKeyboardButton(text="📥 CSV-отчёт", callback_data="report")])
+    if allowed(user_id, "operator", username): rows.append([InlineKeyboardButton(text="📦 Отчёт + кадры", callback_data="report")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def api(method: str, path: str, **kwargs: Any) -> Any:
@@ -247,7 +247,7 @@ async def start(message: Message):
 @router.message(Command("help"))
 async def help_cmd(message: Message):
     if not await guard(message): return
-    await message.answer("/status — состояние\n/cameras — список и кнопки кадров\n/camera &lt;camera_id&gt; — последний кадр\n/events — события\n/logs — ошибки\n/report — CSV\n/models — модели\n/switch_model &lt;name&gt; — hot-swap (admin)\n/thresholds — пороги AI\n/set_threshold &lt;metric&gt; &lt;value&gt; — изменить порог\n/train &lt;camera_id&gt; — дообучение\n/cancel_training &lt;job_id&gt; — отменить обучение\n/users — пользователи\n/alert_test — тест тревоги\n/health — сервисы", reply_markup=menu(message.from_user.id,message.from_user.username or ''))
+    await message.answer("/status — состояние\n/cameras — список и кнопки кадров\n/camera &lt;camera_id&gt; — последний кадр\n/events — события\n/logs — ошибки\n/report — ZIP-отчёт с кадрами\n/models — модели\n/switch_model &lt;name&gt; — hot-swap (admin)\n/thresholds — пороги AI\n/set_threshold &lt;metric&gt; &lt;value&gt; — изменить порог\n/train &lt;camera_id&gt; — дообучение\n/cancel_training &lt;job_id&gt; — отменить обучение\n/users — пользователи\n/alert_test — тест тревоги\n/health — сервисы", reply_markup=menu(message.from_user.id,message.from_user.username or ''))
 
 @router.message(Command("status"))
 async def status(message: Message):
@@ -284,8 +284,8 @@ async def logs_cmd(message: Message):
 @router.message(Command("report"))
 async def report_cmd(message: Message):
     if not await guard(message, "operator"): return
-    content=await api("GET","/api/reports/events.csv")
-    await message.answer_document(BufferedInputFile(content,filename=f"zmk-events-{datetime.now(timezone.utc):%Y%m%d}.csv"),caption="Отчёт по событиям")
+    content=await api("GET","/api/reports/events.zip")
+    await message.answer_document(BufferedInputFile(content,filename=f"zmk-events-with-evidence-{datetime.now(timezone.utc):%Y%m%d}.zip"),caption="Отчёт по событиям: русская таблица и доступные кадры нарушений")
 
 @router.message(Command("models"))
 async def models_cmd(message: Message):
@@ -386,7 +386,7 @@ async def callbacks(query: CallbackQuery):
     elif query.data=="health":
         h=await api("GET","/api/system-health"); await message.answer(f"<b>🩺 Health</b>\nCPU {h['cpu']}% · RAM {h['ram']}% · GPU {h['gpu']}%")
     elif query.data=="report":
-        content=await api("GET","/api/reports/events.csv"); await message.answer_document(BufferedInputFile(content,filename=f"zmk-events-{datetime.now(timezone.utc):%Y%m%d}.csv"))
+        content=await api("GET","/api/reports/events.zip"); await message.answer_document(BufferedInputFile(content,filename=f"zmk-events-with-evidence-{datetime.now(timezone.utc):%Y%m%d}.zip"),caption="Русская таблица и доступные кадры нарушений")
 
 async def _complete_command(command_id: int, status: str, error: str = "") -> None:
     await api("POST",f"/api/bots/telegram/commands/{command_id}/complete",json={"status":status,"error":error[:300]})

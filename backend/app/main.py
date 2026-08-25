@@ -26,6 +26,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 from email.message import EmailMessage
+from html import escape as html_escape
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlparse
@@ -2937,20 +2938,128 @@ def csv_safe(value:Any):
 
 def sanitize_csv_rows(data:list[dict[str,Any]]): return [{k:csv_safe(v) for k,v in row.items()} for row in data]
 
-@app.get("/api/reports/events.csv")
-def report_csv(severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None,camera_id:str|None=None,q:str|None=Query(default=None,max_length=100)):
-    """Export exactly the event slice an operator is reviewing."""
+_EVENT_REPORT_FIELDS=(
+    "№ события","Дата и время","Тип нарушения","Код нарушения","Критичность","Уверенность, %",
+    "Камера","ID камеры","Зона","Объект / человек","ID детекции","Статус проверки","Подтверждено",
+    "Время решения","Комментарий оператора","Кадр нарушения","Файл кадра","Ссылка на кадр",
+)
+_EVENT_SEVERITY_LABELS={"critical":"Критический","high":"Высокий","medium":"Средний","low":"Низкий"}
+
+
+def _event_report_rows(severity:str|None,event_type:str|None,acknowledged:bool|None,review_status:str|None,camera_id:str|None,q:str|None) -> list[dict[str,Any]]:
+    """Return exactly the event slice selected in the operator workspace."""
     ack=int(acknowledged) if acknowledged is not None else None
     term=(q or "").strip()
     like=f"%{term}%" if term else None
-    data=sanitize_csv_rows(rows("""SELECT e.timestamp,e.camera_id,e.type,e.severity,e.confidence,e.person_id,e.acknowledged,e.review_status,e.reviewed_at,e.note FROM events e
+    return rows("""SELECT e.id,e.timestamp,e.camera_id,e.type,e.severity,e.confidence,e.person_id,e.external_id,e.acknowledged,e.review_status,e.reviewed_at,e.note,
+        c.name AS camera_name,c.zone AS camera_zone FROM events e
         LEFT JOIN cameras c ON c.id=e.camera_id
         WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?) AND (? IS NULL OR e.review_status=?) AND (? IS NULL OR e.camera_id=?)
-          AND (? IS NULL OR e.camera_id LIKE ? OR e.person_id LIKE ? OR e.type LIKE ? OR c.name LIKE ? OR c.zone LIKE ?)
-        ORDER BY e.timestamp DESC""",(severity,severity,event_type,event_type,ack,ack,review_status,review_status,camera_id,camera_id,like,like,like,like,like,like)))
-    fields=['timestamp','camera_id','type','severity','confidence','person_id','acknowledged','review_status','reviewed_at','note']
-    out=io.StringIO(); w=csv.DictWriter(out,fieldnames=fields); w.writeheader(); w.writerows(data)
-    return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=zmk-events.csv"})
+          AND (? IS NULL OR e.camera_id LIKE ? OR e.person_id LIKE ? OR e.external_id LIKE ? OR e.type LIKE ? OR c.name LIKE ? OR c.zone LIKE ?)
+        ORDER BY e.timestamp DESC""",(severity,severity,event_type,event_type,ack,ack,review_status,review_status,camera_id,camera_id,like,like,like,like,like,like,like))
+
+
+def _event_review_state(row:dict[str,Any]) -> str:
+    state=str(row.get("review_status") or "")
+    if state in REVIEW_LABELS:
+        return state
+    return "accepted" if bool(row.get("acknowledged")) else "pending"
+
+
+def _event_report_record(row:dict[str,Any]) -> dict[str,Any]:
+    event_id=int(row["id"])
+    frame=event_frame_path_for(event_id)
+    has_frame=frame.is_file()
+    review=_event_review_state(row)
+    frame_file=f"frames/event-{event_id}.jpg" if has_frame else ""
+    return {
+        "№ события":event_id,
+        "Дата и время":str(row.get("timestamp") or ""),
+        "Тип нарушения":EVENT_LABELS.get(str(row.get("type") or ""),str(row.get("type") or "—")),
+        "Код нарушения":str(row.get("type") or ""),
+        "Критичность":_EVENT_SEVERITY_LABELS.get(str(row.get("severity") or ""),str(row.get("severity") or "—")),
+        "Уверенность, %":round(float(row.get("confidence") or 0)*100,2),
+        "Камера":str(row.get("camera_name") or row.get("camera_id") or "—"),
+        "ID камеры":str(row.get("camera_id") or ""),
+        "Зона":str(row.get("camera_zone") or "—"),
+        "Объект / человек":str(row.get("person_id") or "—"),
+        "ID детекции":str(row.get("external_id") or "—"),
+        "Статус проверки":REVIEW_LABELS.get(review,review),
+        "Подтверждено":"Да" if bool(row.get("acknowledged")) else "Нет",
+        "Время решения":str(row.get("reviewed_at") or "—"),
+        "Комментарий оператора":str(row.get("note") or "—"),
+        "Кадр нарушения":"Есть" if has_frame else "Не сохранён",
+        "Файл кадра":frame_file or "—",
+        "Ссылка на кадр":f"/api/events/{event_id}/frame" if has_frame else "—",
+    }
+
+
+def _event_report_csv(records:list[dict[str,Any]]) -> str:
+    out=io.StringIO()
+    # UTF-8 BOM + semicolon delimiter open correctly in Russian Excel without a
+    # manual import wizard, while the headers remain meaningful to operators.
+    out.write("\ufeff")
+    writer=csv.DictWriter(out,fieldnames=_EVENT_REPORT_FIELDS,delimiter=";",lineterminator="\n")
+    writer.writeheader(); writer.writerows(sanitize_csv_rows(records))
+    return out.getvalue()
+
+
+def _event_report_html(records:list[dict[str,Any]]) -> str:
+    rows_html=[]
+    for record in records:
+        cells=[]
+        for field in _EVENT_REPORT_FIELDS:
+            value=record.get(field,"—")
+            if field=="Кадр нарушения" and record.get("Файл кадра") not in {"", "—"}:
+                image=html_escape(str(record["Файл кадра"]),quote=True)
+                cells.append(f'<td><img src="{image}" alt="Кадр нарушения события {html_escape(str(record["№ события"]))}"><small>{html_escape(str(value))}</small></td>')
+            else:
+                cells.append(f"<td>{html_escape(str(value))}</td>")
+        rows_html.append("<tr>"+"".join(cells)+"</tr>")
+    headers="".join(f"<th>{html_escape(field)}</th>" for field in _EVENT_REPORT_FIELDS)
+    evidence=sum(1 for record in records if record.get("Файл кадра") not in {"", "—"})
+    return f"""<!doctype html><html lang="ru"><meta charset="utf-8"><title>ZMK Vision — журнал нарушений</title>
+<style>body{{font:13px/1.4 Arial,sans-serif;color:#17211d;margin:24px}}h1{{margin:0 0 4px}}p{{color:#526158}}.summary{{display:flex;gap:12px;margin:18px 0}}.summary span{{padding:8px 10px;border:1px solid #d9e5dd;border-radius:8px;background:#f4faf6}}table{{width:100%;border-collapse:collapse;font-size:11px}}th{{position:sticky;top:0;background:#193426;color:#f4ffef}}th,td{{border:1px solid #dce6df;padding:6px;text-align:left;vertical-align:top}}tr:nth-child(even){{background:#f7faf8}}img{{display:block;max-width:180px;max-height:112px;border-radius:4px;background:#16231d}}td small{{display:block;margin-top:3px;color:#66756d}}@media print{{body{{margin:8px}}th{{position:static}}}}</style>
+<h1>ZMK Vision — журнал нарушений</h1><p>Сформировано: {html_escape(now_iso())}. В архиве сохранены доступные кадры нарушений.</p>
+<div class="summary"><span>Событий: <b>{len(records)}</b></span><span>Кадров: <b>{evidence}</b></span></div>
+<table><thead><tr>{headers}</tr></thead><tbody>{''.join(rows_html) or '<tr><td colspan="18">Событий по выбранному фильтру нет.</td></tr>'}</tbody></table></html>"""
+
+
+def _event_report_args(severity:str|None,event_type:str|None,acknowledged:bool|None,review_status:Literal["pending","accepted","rejected"]|None,camera_id:str|None,q:str|None) -> list[dict[str,Any]]:
+    return [_event_report_record(row) for row in _event_report_rows(severity,event_type,acknowledged,review_status,camera_id,q)]
+
+
+@app.get("/api/reports/events.csv")
+def report_csv(severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None,camera_id:str|None=None,q:str|None=Query(default=None,max_length=100)):
+    """Russian Excel-friendly event table with all audit fields and frame status."""
+    content=_event_report_csv(_event_report_args(severity,event_type,acknowledged,review_status,camera_id,q))
+    return StreamingResponse(iter([content]),media_type="text/csv; charset=utf-8",headers={"Content-Disposition":"attachment; filename=zmk-events-ru.csv"})
+
+
+@app.get("/api/reports/events.zip")
+def report_zip(severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None,camera_id:str|None=None,q:str|None=Query(default=None,max_length=100)):
+    """Export a ready-to-open Russian report with the table and evidence JPEGs."""
+    records=_event_report_args(severity,event_type,acknowledged,review_status,camera_id,q)
+    archive=io.BytesIO()
+    with zipfile.ZipFile(archive,"w",compression=zipfile.ZIP_DEFLATED,compresslevel=6) as bundle:
+        bundle.writestr("events_ru.csv",_event_report_csv(records).encode("utf-8"))
+        bundle.writestr("report.html",_event_report_html(records).encode("utf-8"))
+        frame_count=0
+        for record in records:
+            filename=str(record.get("Файл кадра") or "")
+            if not filename or filename=="—":
+                continue
+            frame=event_frame_path_for(int(record["№ события"]))
+            if frame.is_file():
+                bundle.write(frame,filename)
+                frame_count+=1
+        bundle.writestr("README.txt",("ZMK Vision — экспорт журнала нарушений\n\n"
+            "events_ru.csv — таблица с русскими названиями столбцов для Excel.\n"
+            "report.html — наглядный отчёт с кадрами нарушений.\n"
+            "frames/ — JPEG-кадры, доступные на момент экспорта.\n"
+            f"Событий: {len(records)}; кадров: {frame_count}.\n").encode())
+        bundle.writestr("manifest.json",json.dumps({"generated_at":now_iso(),"events":len(records),"frames":frame_count,"format":"zmk-event-evidence-v1"},ensure_ascii=False,indent=2).encode("utf-8"))
+    return StreamingResponse(iter([archive.getvalue()]),media_type="application/zip",headers={"Content-Disposition":"attachment; filename=zmk-events-with-evidence.zip"})
 @app.get("/api/stream")
 async def stream():
     async def generate():

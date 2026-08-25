@@ -268,12 +268,12 @@ async def logs_cmd(event: MessageCreated):
 async def report_cmd(event: MessageCreated):
     if not await guard(event, "operator"):
         return
-    content = await api("GET", "/api/reports/events.csv")
-    with tempfile.NamedTemporaryFile(prefix=f"zmk-events-{datetime.now(timezone.utc):%Y%m%d}-", suffix=".csv", delete=False) as handle:
+    content = await api("GET", "/api/reports/events.zip")
+    with tempfile.NamedTemporaryFile(prefix=f"zmk-events-with-evidence-{datetime.now(timezone.utc):%Y%m%d}-", suffix=".zip", delete=False) as handle:
         handle.write(content)
         path = Path(handle.name)
     try:
-        await event.message.answer("📥 Отчёт по событиям", attachments=[InputMedia(str(path))])
+        await event.message.answer("📦 Отчёт по событиям: русская таблица и доступные кадры", attachments=[InputMedia(str(path))])
     finally:
         path.unlink(missing_ok=True)
 
