@@ -5,6 +5,7 @@ import csv
 import io
 import json
 import zipfile
+from datetime import datetime, timedelta
 
 from app import main
 from fastapi.testclient import TestClient
@@ -56,3 +57,20 @@ def test_russian_event_csv_and_evidence_zip_keep_full_event_context():
             assert f'<img src="frames/event-{event_id}.jpg"' in html
             manifest = json.loads(archive.read("manifest.json"))
             assert manifest["events"] == 1 and manifest["frames"] == 1
+
+
+def test_event_evidence_zip_honors_overview_period():
+    with TestClient(main.app) as client:
+        con = main.db()
+        con.execute(
+            "INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id,external_id,acknowledged,note) VALUES(?,?,?,?,?,?,?,?,?)",
+            ((datetime.now(main.TZ)-timedelta(hours=48)).isoformat(), "cam_01", "smoking", "high", 0.9, "worker-old", "REPORT-OLDER-THAN-OVERVIEW", 0, ""),
+        )
+        con.commit()
+        con.close()
+
+        archive_response = client.get("/api/reports/events.zip?hours=24&q=REPORT-OLDER-THAN-OVERVIEW")
+        assert archive_response.status_code == 200, archive_response.text
+        with zipfile.ZipFile(io.BytesIO(archive_response.content)) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+            assert manifest["events"] == 0

@@ -2946,17 +2946,19 @@ _EVENT_REPORT_FIELDS=(
 _EVENT_SEVERITY_LABELS={"critical":"Критический","high":"Высокий","medium":"Средний","low":"Низкий"}
 
 
-def _event_report_rows(severity:str|None,event_type:str|None,acknowledged:bool|None,review_status:str|None,camera_id:str|None,q:str|None) -> list[dict[str,Any]]:
+def _event_report_rows(severity:str|None,event_type:str|None,acknowledged:bool|None,review_status:str|None,camera_id:str|None,q:str|None,hours:int|None=None) -> list[dict[str,Any]]:
     """Return exactly the event slice selected in the operator workspace."""
     ack=int(acknowledged) if acknowledged is not None else None
     term=(q or "").strip()
     like=f"%{term}%" if term else None
+    since=(datetime.now(TZ)-timedelta(hours=hours)).isoformat() if hours else None
     return rows("""SELECT e.id,e.timestamp,e.camera_id,e.type,e.severity,e.confidence,e.person_id,e.external_id,e.acknowledged,e.review_status,e.reviewed_at,e.note,
         c.name AS camera_name,c.zone AS camera_zone FROM events e
         LEFT JOIN cameras c ON c.id=e.camera_id
         WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?) AND (? IS NULL OR e.review_status=?) AND (? IS NULL OR e.camera_id=?)
+          AND (? IS NULL OR e.timestamp>=?)
           AND (? IS NULL OR e.camera_id LIKE ? OR e.person_id LIKE ? OR e.external_id LIKE ? OR e.type LIKE ? OR c.name LIKE ? OR c.zone LIKE ?)
-        ORDER BY e.timestamp DESC""",(severity,severity,event_type,event_type,ack,ack,review_status,review_status,camera_id,camera_id,like,like,like,like,like,like,like))
+        ORDER BY e.timestamp DESC""",(severity,severity,event_type,event_type,ack,ack,review_status,review_status,camera_id,camera_id,since,since,like,like,like,like,like,like,like))
 
 
 def _event_review_state(row:dict[str,Any]) -> str:
@@ -3025,21 +3027,21 @@ def _event_report_html(records:list[dict[str,Any]]) -> str:
 <table><thead><tr>{headers}</tr></thead><tbody>{''.join(rows_html) or '<tr><td colspan="18">Событий по выбранному фильтру нет.</td></tr>'}</tbody></table></html>"""
 
 
-def _event_report_args(severity:str|None,event_type:str|None,acknowledged:bool|None,review_status:Literal["pending","accepted","rejected"]|None,camera_id:str|None,q:str|None) -> list[dict[str,Any]]:
-    return [_event_report_record(row) for row in _event_report_rows(severity,event_type,acknowledged,review_status,camera_id,q)]
+def _event_report_args(severity:str|None,event_type:str|None,acknowledged:bool|None,review_status:Literal["pending","accepted","rejected"]|None,camera_id:str|None,q:str|None,hours:int|None=None) -> list[dict[str,Any]]:
+    return [_event_report_record(row) for row in _event_report_rows(severity,event_type,acknowledged,review_status,camera_id,q,hours)]
 
 
 @app.get("/api/reports/events.csv")
-def report_csv(severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None,camera_id:str|None=None,q:str|None=Query(default=None,max_length=100)):
+def report_csv(severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None,camera_id:str|None=None,q:str|None=Query(default=None,max_length=100),hours:int|None=Query(default=None,ge=1,le=2160)):
     """Russian Excel-friendly event table with all audit fields and frame status."""
-    content=_event_report_csv(_event_report_args(severity,event_type,acknowledged,review_status,camera_id,q))
+    content=_event_report_csv(_event_report_args(severity,event_type,acknowledged,review_status,camera_id,q,hours))
     return StreamingResponse(iter([content]),media_type="text/csv; charset=utf-8",headers={"Content-Disposition":"attachment; filename=zmk-events-ru.csv"})
 
 
 @app.get("/api/reports/events.zip")
-def report_zip(severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None,camera_id:str|None=None,q:str|None=Query(default=None,max_length=100)):
+def report_zip(severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None,camera_id:str|None=None,q:str|None=Query(default=None,max_length=100),hours:int|None=Query(default=None,ge=1,le=2160)):
     """Export a ready-to-open Russian report with the table and evidence JPEGs."""
-    records=_event_report_args(severity,event_type,acknowledged,review_status,camera_id,q)
+    records=_event_report_args(severity,event_type,acknowledged,review_status,camera_id,q,hours)
     archive=io.BytesIO()
     with zipfile.ZipFile(archive,"w",compression=zipfile.ZIP_DEFLATED,compresslevel=6) as bundle:
         bundle.writestr("events_ru.csv",_event_report_csv(records).encode("utf-8"))
