@@ -90,11 +90,18 @@ switch ($messenger.ToLowerInvariant()) {
   "telegram" {
     $token = if ($NonInteractive) { $env:TELEGRAM_BOT_TOKEN } else { Read-Host "Telegram bot token" }
     if ($token -notmatch '^\d+:[A-Za-z0-9_-]{20,}$') { throw "Telegram token format is invalid" }
-    $admin = if ($NonInteractive) { $env:TELEGRAM_ADMIN_IDS } else { Read-Host "Your Telegram numeric ID (admin)" }
-    if ($admin -notmatch '^\d+(,\d+)*$') { throw "Telegram admin ID must contain only numeric IDs separated by commas" }
+    $adminUsername = if ($NonInteractive) { $env:TELEGRAM_ADMIN_USERNAMES } else { Read-Host "Your Telegram username (for example @chilavik)" }
+    $adminIds = if ($NonInteractive) { $env:TELEGRAM_ADMIN_IDS } else { "" }
+    if ($adminUsername) {
+      if ($adminUsername -notmatch '^@[A-Za-z0-9_]{5,32}(,@[A-Za-z0-9_]{5,32})*$') { throw "Telegram username must use @chilavik format; separate several names with commas" }
+      Set-DotEnvValue "TELEGRAM_ADMIN_USERNAMES" $adminUsername; Set-DotEnvValue "TELEGRAM_ADMIN_IDS" ""
+    } elseif ($adminIds -match '^\d+(,\d+)*$') {
+      # Compatibility for existing non-interactive installations.
+      Set-DotEnvValue "TELEGRAM_ADMIN_IDS" $adminIds
+    } else { throw "Set a Telegram username, for example @chilavik" }
     $url = if ($NonInteractive) { $env:TELEGRAM_WEBAPP_URL } else { Read-Host "Public HTTPS Mini App URL (Enter for bot-only)" }
     if ($url -and $url -notmatch '^https://') { throw "Telegram Mini App URL must use HTTPS" }
-    Set-DotEnvValue "TELEGRAM_BOT_TOKEN" $token; Set-DotEnvValue "TELEGRAM_ADMIN_IDS" $admin; Set-DotEnvValue "TELEGRAM_WEBAPP_URL" $url
+    Set-DotEnvValue "TELEGRAM_BOT_TOKEN" $token; Set-DotEnvValue "TELEGRAM_WEBAPP_URL" $url
     Set-DotEnvValue "MESSENGER_PROVIDER" "telegram"
   }
   "max" {

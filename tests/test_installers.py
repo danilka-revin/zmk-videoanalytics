@@ -44,6 +44,7 @@ def test_bootstrap_launcher_and_rtsp_wizard_escape_credentials(tmp_path):
     bootstrap = (ROOT/'installers/bootstrap-linux.sh').read_text()
     for required in ['git clone', 'ZMK_REF', 'ZMK_INSTALL_DIR', 'zmk-vision', '/dev/tty', 'NONINTERACTIVE=1', 'ENABLE_INFERENCE=true']:
         assert required in bootstrap
+    assert 'TELEGRAM_ADMIN_USERNAMES' in (ROOT/'installers/wizard.sh').read_text()
     # Explicit shallow fetches populate FETCH_HEAD, but do not guarantee a
     # remote-tracking origin/<slash-containing-branch> ref. The repeat launcher
     # must therefore check out the fetched commit directly.
@@ -133,6 +134,7 @@ def test_compose_and_environment_are_consistent():
     assert compose['services']['api']['environment']['MODEL_UPLOAD_MAX_BYTES'] == '${MODEL_UPLOAD_MAX_BYTES:-2000000000}'
     assert compose['services']['api']['environment']['ZMK_PASSWORD_AUTH'] == '${ZMK_PASSWORD_AUTH:-true}'
     assert compose['services']['api']['environment']['ZMK_INITIAL_PASSWORD'] == '${ZMK_INITIAL_PASSWORD:-1234}'
+    assert compose['services']['api']['environment']['TELEGRAM_ADMIN_USERNAMES'] == '${TELEGRAM_ADMIN_USERNAMES:-}'
     assert compose['services']['api']['environment']['ZMK_BOT_API_TOKEN_FILE'] == '/bot-tokens/.api-token'
     assert compose['services']['api']['ports'] == ['127.0.0.1:8000:8000']
     # Both messenger workers stay available and idle safely until the Admin → Боты
@@ -151,6 +153,7 @@ def test_compose_and_environment_are_consistent():
         assert compose['services'][service]['environment']['ZMK_BOT_TOKEN_DIR'] == '/bot-secrets'
         assert compose['services'][service]['environment']['ZMK_BOT_API_TOKEN_FILE'] == '/bot-secrets/.api-token'
         assert 'bot-token-data:/bot-secrets:ro' in compose['services'][service]['volumes']
+    assert compose['services']['telegram-bot']['environment']['TELEGRAM_ADMIN_USERNAMES'] == '${TELEGRAM_ADMIN_USERNAMES:-}'
     assert 'bot-token-data' in compose['volumes']
     assert 'profiles' not in compose['services']['training-worker']
     assert compose['services']['training-worker']['build'] == './services/training_worker'
@@ -169,7 +172,7 @@ def test_compose_and_environment_are_consistent():
     lines = [x for x in (ROOT/'.env.example').read_text().splitlines() if x and not x.startswith('#')]
     keys = [x.split('=',1)[0] for x in lines]
     assert len(keys) == len(set(keys))
-    assert {'MESSENGER_PROVIDER','ZMK_API_KEY','ZMK_PASSWORD_AUTH','ZMK_INITIAL_PASSWORD','SMTP_HOST','TELEGRAM_BOT_TOKEN','MAX_BOT_TOKEN','MAX_ADMIN_IDS','MODEL_UPLOAD_MAX_BYTES','POSTGRES_PASSWORD','MINIO_ROOT_PASSWORD'} <= set(keys)
+    assert {'MESSENGER_PROVIDER','ZMK_API_KEY','ZMK_PASSWORD_AUTH','ZMK_INITIAL_PASSWORD','SMTP_HOST','TELEGRAM_BOT_TOKEN','TELEGRAM_ADMIN_USERNAMES','MAX_BOT_TOKEN','MAX_ADMIN_IDS','MODEL_UPLOAD_MAX_BYTES','POSTGRES_PASSWORD','MINIO_ROOT_PASSWORD'} <= set(keys)
 
 
 def test_release_contains_installation_assets():

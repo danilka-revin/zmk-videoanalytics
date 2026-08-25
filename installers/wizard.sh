@@ -42,12 +42,20 @@ run_config(){
   PROFILE=()
   case "$MESSENGER" in
     telegram)
-      if [[ -n "${NONINTERACTIVE:-}" ]]; then TOKEN="${TELEGRAM_BOT_TOKEN:-}"; ADMIN="${TELEGRAM_ADMIN_IDS:-}"; WEBAPP="${TELEGRAM_WEBAPP_URL:-}"
-      else read -r -p "Telegram bot token (от @BotFather): " TOKEN; read -r -p "Ваш Telegram numeric ID (admin): " ADMIN; read -r -p "Public HTTPS Mini App URL (Enter для bot-only): " WEBAPP; fi
+      if [[ -n "${NONINTERACTIVE:-}" ]]; then TOKEN="${TELEGRAM_BOT_TOKEN:-}"; ADMIN_USERNAME="${TELEGRAM_ADMIN_USERNAMES:-}"; ADMIN_IDS="${TELEGRAM_ADMIN_IDS:-}"; WEBAPP="${TELEGRAM_WEBAPP_URL:-}"
+      else read -r -p "Telegram bot token (от @BotFather): " TOKEN; read -r -p "Ваш Telegram username (например @chilavik, несколько через запятую): " ADMIN_USERNAME; ADMIN_IDS=""; read -r -p "Public HTTPS Mini App URL (Enter для bot-only): " WEBAPP; fi
       if ! [[ "$TOKEN" =~ ^[0-9]+:[A-Za-z0-9_-]{20,}$ ]]; then echo "Ошибка: неверный формат Telegram token"; return 1; fi
-      if ! [[ "$ADMIN" =~ ^[0-9]+(,[0-9]+)*$ ]]; then echo "Ошибка: Telegram admin ID должен состоять из цифр через запятую"; return 1; fi
+      if [[ -n "$ADMIN_USERNAME" ]]; then
+        if ! [[ "$ADMIN_USERNAME" =~ ^@[A-Za-z0-9_]{5,32}(,@[A-Za-z0-9_]{5,32})*$ ]]; then echo "Ошибка: Telegram username укажите как @chilavik (несколько — через запятую)"; return 1; fi
+        set_env TELEGRAM_ADMIN_USERNAMES "$ADMIN_USERNAME"; set_env TELEGRAM_ADMIN_IDS ""
+      elif [[ "$ADMIN_IDS" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+        # Backward compatibility for existing unattended deployments.
+        set_env TELEGRAM_ADMIN_IDS "$ADMIN_IDS"
+      else
+        echo "Ошибка: укажите Telegram username, например @chilavik"; return 1
+      fi
       if [[ -n "$WEBAPP" && "$WEBAPP" != https://* ]]; then echo "Ошибка: Mini App URL должен быть https"; return 1; fi
-      set_env TELEGRAM_BOT_TOKEN "$TOKEN"; set_env TELEGRAM_ADMIN_IDS "$ADMIN"; set_env TELEGRAM_WEBAPP_URL "$WEBAPP"
+      set_env TELEGRAM_BOT_TOKEN "$TOKEN"; set_env TELEGRAM_WEBAPP_URL "$WEBAPP"
       set_env MESSENGER_PROVIDER "telegram"
       ;;
     max)

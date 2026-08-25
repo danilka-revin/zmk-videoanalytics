@@ -65,3 +65,17 @@ def test_bot_api_token_reads_private_mount(tmp_path, monkeypatch):
     token_file.write_text('service-token\n',encoding='utf-8')
     monkeypatch.setenv('ZMK_BOT_API_TOKEN_FILE',str(token_file))
     assert bot_main._bot_api_token()=='service-token'
+
+
+def test_username_roles_are_case_insensitive(monkeypatch):
+    previous = (set(bot_main.RUNTIME.admins), set(bot_main.RUNTIME.operators), set(bot_main.RUNTIME.viewers), set(bot_main.RUNTIME.admin_usernames), set(bot_main.RUNTIME.operator_usernames), set(bot_main.RUNTIME.viewer_usernames))
+    try:
+        bot_main.RUNTIME.admins = set(); bot_main.RUNTIME.operators = set(); bot_main.RUNTIME.viewers = set()
+        bot_main.RUNTIME.admin_usernames = {"@chilavik"}; bot_main.RUNTIME.operator_usernames = {"@shift_operator"}; bot_main.RUNTIME.viewer_usernames = {"@safety_viewer"}
+        assert role_for(999, "ChIlAvIk") == "admin"
+        assert allowed(999, "admin", "@chilavik")
+        assert role_for(998, "shift_operator") == "operator"
+        assert not allowed(997, "operator", "safety_viewer")
+        assert role_for(996) == "denied"
+    finally:
+        bot_main.RUNTIME.admins, bot_main.RUNTIME.operators, bot_main.RUNTIME.viewers, bot_main.RUNTIME.admin_usernames, bot_main.RUNTIME.operator_usernames, bot_main.RUNTIME.viewer_usernames = previous

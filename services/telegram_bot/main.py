@@ -67,9 +67,31 @@ def _ids(value: str) -> set[int]:
         if token and token.lstrip("-").isdigit(): result.add(int(token))
     return result
 
-ADMINS = _ids(os.getenv("TELEGRAM_ADMIN_IDS", ""))
-OPERATORS = _ids(os.getenv("TELEGRAM_OPERATOR_IDS", ""))
-VIEWERS = _ids(os.getenv("TELEGRAM_VIEWER_IDS", ""))
+_USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{5,32}$")
+
+
+def _normalize_username(value: str | None) -> str:
+    handle=str(value or "").strip().removeprefix("@")
+    return "@"+handle.lower() if _USERNAME_RE.fullmatch(handle) else ""
+
+
+def _role_env(role: str) -> str:
+    return ",".join(item for item in (os.getenv(f"TELEGRAM_{role}_IDS", "").strip(),os.getenv(f"TELEGRAM_{role}_USERNAMES", "").strip()) if item)
+
+
+def _principals(value: str) -> tuple[set[int],set[str]]:
+    ids=_ids(value); usernames:set[str]=set()
+    for token in value.replace(";", ",").replace("\n", ",").split(","):
+        token=token.strip()
+        if token and not token.lstrip("-").isdigit():
+            username=_normalize_username(token)
+            if username: usernames.add(username)
+    return ids,usernames
+
+
+ADMINS, ADMIN_USERNAMES = _principals(_role_env("ADMIN"))
+OPERATORS, OPERATOR_USERNAMES = _principals(_role_env("OPERATOR"))
+VIEWERS, VIEWER_USERNAMES = _principals(_role_env("VIEWER"))
 
 @dataclass
 class RuntimeConfig:
@@ -79,6 +101,9 @@ class RuntimeConfig:
     admins: set[int] = field(default_factory=lambda: set(ADMINS))
     operators: set[int] = field(default_factory=lambda: set(OPERATORS))
     viewers: set[int] = field(default_factory=lambda: set(VIEWERS))
+    admin_usernames: set[str] = field(default_factory=lambda: set(ADMIN_USERNAMES))
+    operator_usernames: set[str] = field(default_factory=lambda: set(OPERATOR_USERNAMES))
+    viewer_usernames: set[str] = field(default_factory=lambda: set(VIEWER_USERNAMES))
     alert_recipients: set[int] = field(default_factory=set)
     webapp_url: str = ""
 
@@ -87,13 +112,14 @@ router = Router()
 ROLE_LEVEL = {"denied": 0, "viewer": 1, "operator": 2, "admin": 3}
 SEVERITY_LEVEL = {"low": 1, "medium": 2, "high": 3, "critical": 4}
 
-def role_for(user_id: int) -> str:
-    if user_id in RUNTIME.admins: return "admin"
-    if user_id in RUNTIME.operators: return "operator"
-    if user_id in RUNTIME.viewers: return "viewer"
+def role_for(user_id: int, username: str = "") -> str:
+    handle=_normalize_username(username)
+    if user_id in RUNTIME.admins or handle and handle in RUNTIME.admin_usernames: return "admin"
+    if user_id in RUNTIME.operators or handle and handle in RUNTIME.operator_usernames: return "operator"
+    if user_id in RUNTIME.viewers or handle and handle in RUNTIME.viewer_usernames: return "viewer"
     return "denied"
-def allowed(user_id: int, minimum: str = "viewer") -> bool:
-    return ROLE_LEVEL[role_for(user_id)] >= ROLE_LEVEL[minimum]
+def allowed(user_id: int, minimum: str = "viewer", username: str = "") -> bool:
+    return ROLE_LEVEL[role_for(user_id,username)] >= ROLE_LEVEL[minimum]
 
 def alert_recipients() -> set[int]:
     return set(RUNTIME.alert_recipients) or (set(RUNTIME.admins) | set(RUNTIME.operators))
@@ -101,7 +127,7 @@ def should_alert(event: dict[str, Any]) -> bool:
     threshold=SEVERITY_LEVEL.get(RUNTIME.alert_min_severity, SEVERITY_LEVEL["high"])
     return RUNTIME.alerts_enabled and SEVERITY_LEVEL.get(str(event.get("severity", "")), 0) >= threshold
 
-def menu(user_id: int) -> InlineKeyboardMarkup:
+def menu(user_id: int, username: str = "") -> InlineKeyboardMarkup:
     rows = []
     webapp_url=RUNTIME.webapp_url or WEBAPP_URL
     if webapp_url.startswith("https://"):
@@ -111,7 +137,7 @@ def menu(user_id: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="🚨 События", callback_data="events"), InlineKeyboardButton(text="🧾 Ошибки", callback_data="errors")],
         [InlineKeyboardButton(text="🧠 Модели", callback_data="models"), InlineKeyboardButton(text="🩺 Health", callback_data="health")],
     ]
-    if allowed(user_id, "operator"): rows.append([InlineKeyboardButton(text="📥 CSV-отчёт", callback_data="report")])
+    if allowed(user_id, "operator", username): rows.append([InlineKeyboardButton(text="📥 CSV-отчёт", callback_data="report")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 async def api(method: str, path: str, **kwargs: Any) -> Any:
@@ -205,25 +231,28 @@ async def _send_camera_snapshot(message: Message, camera_id: str) -> None:
 
 async def guard(message: Message, minimum: str = "viewer") -> bool:
     if not RUNTIME.enabled: return False
-    uid = message.from_user.id if message.from_user else 0
-    if allowed(uid, minimum): return True
-    await message.answer(f"⛔ Ваш Telegram ID не включён в белый список.\nID: <code>{uid}</code>")
+    user=message.from_user
+    uid=user.id if user else 0
+    username=str(user.username or "") if user else ""
+    if allowed(uid, minimum, username): return True
+    hint="Укажите @username в Admin → Боты." if username else "У этого аккаунта нет username — задайте username в Telegram или используйте числовой ID."
+    await message.answer(f"⛔ Ваш Telegram username не включён в белый список.\n{hint}")
     return False
 
 @router.message(Command("start"))
 async def start(message: Message):
     if not await guard(message): return
-    await message.answer(f"<b>ZMK Vision</b>\nРоль: <code>{role_for(message.from_user.id)}</code>\nУправление видеоаналитикой и отчётами.", reply_markup=menu(message.from_user.id))
+    await message.answer(f"<b>ZMK Vision</b>\nРоль: <code>{role_for(message.from_user.id,message.from_user.username or '')}</code>\nУправление видеоаналитикой и отчётами.", reply_markup=menu(message.from_user.id,message.from_user.username or ''))
 
 @router.message(Command("help"))
 async def help_cmd(message: Message):
     if not await guard(message): return
-    await message.answer("/status — состояние\n/cameras — список и кнопки кадров\n/camera &lt;camera_id&gt; — последний кадр\n/events — события\n/logs — ошибки\n/report — CSV\n/models — модели\n/switch_model &lt;name&gt; — hot-swap (admin)\n/thresholds — пороги AI\n/set_threshold &lt;metric&gt; &lt;value&gt; — изменить порог\n/train &lt;camera_id&gt; — дообучение\n/cancel_training &lt;job_id&gt; — отменить обучение\n/users — пользователи\n/alert_test — тест тревоги\n/health — сервисы", reply_markup=menu(message.from_user.id))
+    await message.answer("/status — состояние\n/cameras — список и кнопки кадров\n/camera &lt;camera_id&gt; — последний кадр\n/events — события\n/logs — ошибки\n/report — CSV\n/models — модели\n/switch_model &lt;name&gt; — hot-swap (admin)\n/thresholds — пороги AI\n/set_threshold &lt;metric&gt; &lt;value&gt; — изменить порог\n/train &lt;camera_id&gt; — дообучение\n/cancel_training &lt;job_id&gt; — отменить обучение\n/users — пользователи\n/alert_test — тест тревоги\n/health — сервисы", reply_markup=menu(message.from_user.id,message.from_user.username or ''))
 
 @router.message(Command("status"))
 async def status(message: Message):
     if not await guard(message): return
-    await message.answer(dashboard_text(await api("GET", "/api/dashboard")), reply_markup=menu(message.from_user.id))
+    await message.answer(dashboard_text(await api("GET", "/api/dashboard")), reply_markup=menu(message.from_user.id,message.from_user.username or ''))
 
 @router.message(Command("cameras"))
 async def cameras(message: Message):
@@ -327,7 +356,7 @@ async def camera_snapshot_callback(query: CallbackQuery):
     if not RUNTIME.enabled:
         await query.answer("Бот отключён оператором",show_alert=True)
         return
-    if not query.from_user or not allowed(query.from_user.id):
+    if not query.from_user or not allowed(query.from_user.id,"viewer",query.from_user.username or ''):
         await query.answer("Нет доступа",show_alert=True)
         return
     camera_id=(query.data or "").removeprefix("camera:")
@@ -342,10 +371,10 @@ async def camera_snapshot_callback(query: CallbackQuery):
 @router.callback_query(F.data.in_({"status","cameras","events","errors","models","health","report"}))
 async def callbacks(query: CallbackQuery):
     if not RUNTIME.enabled: await query.answer("Бот отключён оператором",show_alert=True); return
-    if not query.from_user or not allowed(query.from_user.id): await query.answer("Нет доступа",show_alert=True); return
-    if query.data in {"errors","report"} and not allowed(query.from_user.id,"operator"): await query.answer("Нужна роль operator",show_alert=True); return
+    if not query.from_user or not allowed(query.from_user.id,"viewer",query.from_user.username or ''): await query.answer("Нет доступа",show_alert=True); return
+    if query.data in {"errors","report"} and not allowed(query.from_user.id,"operator",query.from_user.username or ''): await query.answer("Нужна роль operator",show_alert=True); return
     await query.answer(); message=query.message
-    if query.data=="status": await message.answer(dashboard_text(await api("GET","/api/dashboard")),reply_markup=menu(query.from_user.id))
+    if query.data=="status": await message.answer(dashboard_text(await api("GET","/api/dashboard")),reply_markup=menu(query.from_user.id,query.from_user.username or ''))
     elif query.data=="cameras":
         await _send_camera_list(message)
     elif query.data=="events":
@@ -383,6 +412,9 @@ async def runtime_worker(bot: Bot):
             RUNTIME.admins={int(x) for x in config.get("admin_ids",[]) }
             RUNTIME.operators={int(x) for x in config.get("operator_ids",[]) }
             RUNTIME.viewers={int(x) for x in config.get("viewer_ids",[]) }
+            RUNTIME.admin_usernames={item for item in (_normalize_username(str(x)) for x in config.get("admin_usernames",[])) if item}
+            RUNTIME.operator_usernames={item for item in (_normalize_username(str(x)) for x in config.get("operator_usernames",[])) if item}
+            RUNTIME.viewer_usernames={item for item in (_normalize_username(str(x)) for x in config.get("viewer_usernames",[])) if item}
             RUNTIME.alert_recipients={int(x) for x in config.get("alert_recipients",[]) }
             RUNTIME.webapp_url=str(config.get("webapp_url") or "")
             status="active" if RUNTIME.enabled else "disabled"

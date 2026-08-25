@@ -29,11 +29,14 @@ def bot_payload(*, enabled: bool, token: object | None = None) -> dict[str, obje
     return payload
 
 
-def telegram_init_data(token: str, user_id: int) -> str:
+def telegram_init_data(token: str, user_id: int, username: str = "") -> str:
+    user = {"id": user_id}
+    if username:
+        user["username"] = username
     values = {
         "auth_date": str(int(time.time())),
         "query_id": "admin-token-test",
-        "user": json.dumps({"id": user_id}, separators=(",", ":")),
+        "user": json.dumps(user, separators=(",", ":")),
     }
     check = "\n".join(f"{key}={value}" for key, value in sorted(values.items()))
     secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
@@ -100,3 +103,26 @@ def test_admin_token_takes_precedence_over_legacy_environment(monkeypatch):
         assert saved.json()["token_source"] == "admin"
 
     assert main._effective_bot_token("max") == admin_token
+
+
+def test_telegram_username_role_allows_bot_and_mini_app(monkeypatch):
+    secret = "123456789:AA_username_role_test_token_123456"
+    with TestClient(main.app) as client:
+        payload = bot_payload(enabled=True, token=secret)
+        payload.update({"admin_ids": "@ChIlAvIk", "operator_ids": "@shift_operator", "viewer_ids": "@safety_viewer"})
+        saved = client.put("/api/admin/bots/telegram", json=payload)
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["admin_ids"] == "@chilavik"
+
+        runtime = client.get("/api/bots/telegram/runtime")
+        assert runtime.status_code == 200, runtime.text
+        assert runtime.json()["admin_ids"] == []
+        assert runtime.json()["admin_usernames"] == ["@chilavik"]
+        assert runtime.json()["operator_usernames"] == ["@shift_operator"]
+
+        monkeypatch.setattr(main, "API_KEY", "protected-api")
+        headers = {"X-Telegram-Init-Data": telegram_init_data(secret, 501, "ChIlAvIk")}
+        assert client.get("/api/dashboard", headers=headers).status_code == 200
+        session = client.get("/api/session", headers=headers)
+        assert session.status_code == 200 and session.json()["role"] == "admin"
+        assert client.get("/api/dashboard", headers={"X-Telegram-Init-Data": telegram_init_data(secret, 502, "other_user")}).status_code == 401

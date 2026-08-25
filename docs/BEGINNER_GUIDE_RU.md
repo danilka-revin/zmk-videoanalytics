@@ -265,13 +265,15 @@ http://localhost:8000/docs
 
 Никому не отправляйте этот token и не публикуйте его на GitHub.
 
-## 15. Как узнать Telegram ID
+## 15. Как указать Telegram username
 
-Откройте `@userinfobot` или аналогичный сервис и получите числовой ID:
+Откройте профиль Telegram и задайте публичный username. В настройках ZMK Vision он указывается с `@`, например:
 
 ```text
-123456789
+@chilavik
 ```
+
+Username нужен для whitelist ролей. Если у аккаунта нет username, задайте его в Telegram. Числовой ID остаётся совместимым запасным вариантом, но для новых настроек используйте username. Получатели push-тревог по-прежнему задаются числовыми chat ID: Telegram не гарантирует отправку личного сообщения только по username.
 
 ## 16. Настройка `.env`
 
@@ -290,22 +292,24 @@ cp .env.example .env
 chmod 600 .env
 ```
 
-Для обычного запуска токен можно оставить пустым: после старта он вводится в **Админ → Боты**. Там же указываются ID и роли. Это рекомендуемый путь для панели: токен передаётся только при сохранении и затем не показывается снова.
+Для обычного запуска токен можно оставить пустым: после старта он вводится в **Админ → Боты**. Там же указываются username и роли. Это рекомендуемый путь для панели: токен передаётся только при сохранении и затем не показывается снова.
 
 Для headless-развёртывания можно заполнить `.env` как запасной вариант:
 
 ```env
 TELEGRAM_BOT_TOKEN=123456789:AAExampleToken
-TELEGRAM_ADMIN_IDS=123456789
-TELEGRAM_OPERATOR_IDS=
-TELEGRAM_VIEWER_IDS=
+TELEGRAM_ADMIN_USERNAMES=@chilavik
+TELEGRAM_OPERATOR_USERNAMES=
+TELEGRAM_VIEWER_USERNAMES=
 ```
 
-Несколько ID указываются через запятую без пробелов:
+Несколько username указываются через запятую без пробелов:
 
 ```env
-TELEGRAM_OPERATOR_IDS=111111111,222222222
+TELEGRAM_OPERATOR_USERNAMES=@shift_lead,@safety_operator
 ```
+
+`TELEGRAM_ADMIN_IDS`, `TELEGRAM_OPERATOR_IDS` и `TELEGRAM_VIEWER_IDS` продолжают работать для совместимости со старыми контурами. Не используйте username как получателя push-тревоги — для этого нужен числовой chat ID.
 
 Роли:
 
@@ -315,7 +319,7 @@ TELEGRAM_OPERATOR_IDS=111111111,222222222
 
 ## 17. Запуск Telegram-бота
 
-Windows или Linux: запустите обычный стек, затем откройте **Админ → Боты**. В карточке Telegram вставьте токен, добавьте свой Telegram ID в «Администраторы ID» и включите переключатель — это можно сделать одним сохранением.
+Windows или Linux: запустите обычный стек, затем откройте **Админ → Боты**. В карточке Telegram вставьте токен, добавьте свой username, например **`@chilavik`**, в «Администраторы Telegram» и включите переключатель — это можно сделать одним сохранением.
 
 ```bash
 ./start.sh
@@ -350,7 +354,7 @@ TELEGRAM_WEBAPP_URL=https://vision.example.ru/telegram
 - reverse proxy;
 - сетевой доступ к серверу.
 
-Backend проверяет подпись Telegram `initData`, время авторизации и роль пользователя. Не добавляйте посторонние Telegram ID в whitelist.
+Backend проверяет подпись Telegram `initData`, время авторизации и роль пользователя. Не добавляйте посторонние Telegram username в whitelist. Username можно изменить или передать другому аккаунту, поэтому для максимально строгого production-контура числовой ID остаётся более устойчивой альтернативой.
 
 Внутри Mini App доступны:
 
@@ -569,7 +573,7 @@ docker compose logs --tail=200 max-bot
 
 - неправильный token;
 - выбран не тот Compose profile (`telegram` или `max`);
-- Telegram ID отсутствует в whitelist;
+- Telegram username (или совместимый числовой ID) отсутствует в whitelist;
 - бот уже запущен на другом компьютере;
 - API-контейнер недоступен;
 - Telegram Mini App URL использует HTTP вместо HTTPS;

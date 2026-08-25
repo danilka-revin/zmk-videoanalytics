@@ -449,7 +449,7 @@ def init_db():
         "telegram_bot_enabled":"true" if (legacy_telegram_enabled or MESSENGER_PROVIDER=="telegram") else "false",
         "telegram_alerts_enabled":"true" if (legacy_telegram_enabled or MESSENGER_PROVIDER=="telegram") else "false",
         "telegram_alert_min_severity":"critical" if legacy_critical_alerts else "high",
-        "telegram_admin_ids":os.getenv("TELEGRAM_ADMIN_IDS", "").strip(), "telegram_operator_ids":os.getenv("TELEGRAM_OPERATOR_IDS", "").strip(), "telegram_viewer_ids":os.getenv("TELEGRAM_VIEWER_IDS", "").strip(), "telegram_alert_recipients":legacy_telegram_chats_row[0] if legacy_telegram_chats_row else "", "telegram_webapp_url":os.getenv("TELEGRAM_WEBAPP_URL", "").strip(),
+        "telegram_admin_ids":_telegram_role_env("ADMIN"), "telegram_operator_ids":_telegram_role_env("OPERATOR"), "telegram_viewer_ids":_telegram_role_env("VIEWER"), "telegram_alert_recipients":legacy_telegram_chats_row[0] if legacy_telegram_chats_row else "", "telegram_webapp_url":os.getenv("TELEGRAM_WEBAPP_URL", "").strip(),
         "max_bot_enabled":"true" if MESSENGER_PROVIDER=="max" else "false",
         "max_alerts_enabled":"true" if MESSENGER_PROVIDER=="max" else "false",
         "max_alert_min_severity":"critical" if legacy_critical_alerts else "high",
@@ -549,7 +549,7 @@ def telegram_webapp_role(init_data:str)->str|None:
         secret=hmac.new(b"WebAppData",token.encode(),hashlib.sha256).digest()
         expected=hmac.new(secret,check.encode(),hashlib.sha256).hexdigest()
         if not hmac.compare_digest(supplied,expected): return None
-        user=json.loads(values.get("user","{}")); role=_bot_role_for_user("telegram",int(user.get("id",0))); return role if role in {"viewer","operator","admin"} else None
+        user=json.loads(values.get("user","{}")); role=_bot_role_for_user("telegram",int(user.get("id",0)),str(user.get("username") or "")); return role if role in {"viewer","operator","admin"} else None
     except (ValueError,TypeError,json.JSONDecodeError): return None
 
 @app.get("/api/session")
@@ -994,17 +994,70 @@ def _normalized_bot_ids(value: str | None) -> str:
     return ",".join(str(item) for item in _parse_bot_ids(value))
 
 
-def _bot_role_for_user(provider: str, user_id: int) -> str:
-    """Use DB-managed roles, falling back to legacy environment roles safely."""
+_TELEGRAM_USERNAME=re.compile(r"^[A-Za-z0-9_]{5,32}$")
+
+
+def _normalize_telegram_username(value: str | None) -> str:
+    """Return a canonical @username or an empty string for an absent handle."""
+    handle=str(value or "").strip().removeprefix("@")
+    if not handle:
+        return ""
+    if not _TELEGRAM_USERNAME.fullmatch(handle):
+        raise ValueError(f"Недопустимый Telegram username: {value}")
+    return "@"+handle.lower()
+
+
+def _parse_telegram_principals(value: str | None) -> tuple[list[int],list[str]]:
+    """Accept legacy numeric IDs and Telegram @usernames in role fields.
+
+    Alert recipients deliberately remain numeric chat IDs: Telegram bots cannot
+    reliably initiate a private message to an arbitrary username.
+    """
+    ids:list[int]=[]; usernames:list[str]=[]
+    for token in re.split(r"[,;\s]+",str(value or "").strip()):
+        if not token:
+            continue
+        if re.fullmatch(r"-?\d{1,20}",token):
+            parsed=int(token)
+            if parsed==0:
+                raise ValueError("ID не может быть нулём")
+            if parsed not in ids:
+                ids.append(parsed)
+            continue
+        username=_normalize_telegram_username(token)
+        if username not in usernames:
+            usernames.append(username)
+    return ids,usernames
+
+
+def _normalized_telegram_principals(value: str | None) -> str:
+    ids,usernames=_parse_telegram_principals(value)
+    return ",".join([*(str(item) for item in ids),*usernames])
+
+
+def _telegram_role_env(role: str) -> str:
+    """Combine old *_IDS settings with readable *_USERNAMES aliases."""
+    return ",".join(item for item in (os.getenv(f"TELEGRAM_{role}_IDS","").strip(),os.getenv(f"TELEGRAM_{role}_USERNAMES","").strip()) if item)
+
+
+def _bot_role_for_user(provider: str, user_id: int, username: str = "") -> str:
+    """Use DB-managed roles, supporting @username for Telegram only."""
     if provider not in BOT_PROVIDERS:
         return "denied"
     try:
         data={item["key"]:item["value"] for item in rows("SELECT key,value FROM settings WHERE key IN (?,?,?)",(f"{provider}_admin_ids",f"{provider}_operator_ids",f"{provider}_viewer_ids"))}
         configured=any(str(data.get(f"{provider}_{role}_ids","")).strip() for role in ("admin","operator","viewer"))
         if configured:
-            if user_id in _parse_bot_ids(data.get(f"{provider}_admin_ids")): return "admin"
-            if user_id in _parse_bot_ids(data.get(f"{provider}_operator_ids")): return "operator"
-            if user_id in _parse_bot_ids(data.get(f"{provider}_viewer_ids")): return "viewer"
+            if provider=="telegram":
+                handle=_normalize_telegram_username(username) if username else ""
+                for role in ("admin","operator","viewer"):
+                    ids,usernames=_parse_telegram_principals(data.get(f"telegram_{role}_ids"))
+                    if user_id in ids or handle and handle in usernames:
+                        return role
+            else:
+                if user_id in _parse_bot_ids(data.get(f"{provider}_admin_ids")): return "admin"
+                if user_id in _parse_bot_ids(data.get(f"{provider}_operator_ids")): return "operator"
+                if user_id in _parse_bot_ids(data.get(f"{provider}_viewer_ids")): return "viewer"
             return "denied"
     except (sqlite3.Error,ValueError):
         pass
@@ -1520,9 +1573,15 @@ def diagnose_camera(camera_id:str):
 @app.get("/api/diagnostics")
 def diagnostics():
     camera_ids=[r["id"] for r in rows("SELECT id FROM cameras ORDER BY id")]
+    # Snapshot freshness is the state when the operator starts diagnostics, not
+    # after a group of slow TCP checks has consumed the freshness window.
+    snapshot_state={}
+    for camera_id in camera_ids:
+        age=snapshot_age_seconds(camera_id)
+        snapshot_state[camera_id]={"snapshot_age_seconds":age,"snapshot":"fresh" if age is not None and age<15 else ("stale" if age is not None else "none"),"live_frame_age_seconds":live_frame_age_seconds(camera_id)}
     with ThreadPoolExecutor(max_workers=min(10,max(1,len(camera_ids)))) as pool: camera_results=list(pool.map(diagnose_camera_row,camera_ids))
     for result in camera_results:
-        age=snapshot_age_seconds(result["camera_id"]); result["snapshot_age_seconds"]=age; result["snapshot"]="fresh" if age is not None and age<15 else ("stale" if age is not None else "none"); result["live_frame_age_seconds"]=live_frame_age_seconds(result["camera_id"])
+        result.update(snapshot_state.get(result["camera_id"],{"snapshot_age_seconds":None,"snapshot":"none","live_frame_age_seconds":None}))
     return {"generated_at":now_iso(),"system":system_health_data(),"worker":inference_worker_state(),"cameras":camera_results}
 
 @app.get("/api/events")
@@ -1699,9 +1758,9 @@ def update_bot(provider: Literal["telegram","max"], payload: BotConfigIn):
             f"{provider}_bot_enabled":"true" if payload.enabled else "false",
             f"{provider}_alerts_enabled":"true" if payload.alerts_enabled else "false",
             f"{provider}_alert_min_severity":payload.alert_min_severity,
-            f"{provider}_admin_ids":_normalized_bot_ids(payload.admin_ids),
-            f"{provider}_operator_ids":_normalized_bot_ids(payload.operator_ids),
-            f"{provider}_viewer_ids":_normalized_bot_ids(payload.viewer_ids),
+            f"{provider}_admin_ids":(_normalized_telegram_principals(payload.admin_ids) if provider=="telegram" else _normalized_bot_ids(payload.admin_ids)),
+            f"{provider}_operator_ids":(_normalized_telegram_principals(payload.operator_ids) if provider=="telegram" else _normalized_bot_ids(payload.operator_ids)),
+            f"{provider}_viewer_ids":(_normalized_telegram_principals(payload.viewer_ids) if provider=="telegram" else _normalized_bot_ids(payload.viewer_ids)),
             f"{provider}_alert_recipients":_normalized_bot_ids(payload.alert_recipients),
         }
         if provider=="telegram":
@@ -1761,14 +1820,24 @@ def bot_runtime_config(provider: Literal["telegram","max"]):
     con=db()
     try:
         settings=_bot_settings_map(con)
+        if provider=="telegram":
+            admin_ids,admin_usernames=_parse_telegram_principals(settings.get("telegram_admin_ids"))
+            operator_ids,operator_usernames=_parse_telegram_principals(settings.get("telegram_operator_ids"))
+            viewer_ids,viewer_usernames=_parse_telegram_principals(settings.get("telegram_viewer_ids"))
+        else:
+            admin_ids,operator_ids,viewer_ids=(_parse_bot_ids(settings.get("max_admin_ids")),_parse_bot_ids(settings.get("max_operator_ids")),_parse_bot_ids(settings.get("max_viewer_ids")))
+            admin_usernames,operator_usernames,viewer_usernames=[],[],[]
         return {
             "provider":provider,
             "enabled":settings.get(f"{provider}_bot_enabled","false")=="true",
             "alerts_enabled":settings.get(f"{provider}_alerts_enabled","false")=="true",
             "alert_min_severity":settings.get(f"{provider}_alert_min_severity","high"),
-            "admin_ids":_parse_bot_ids(settings.get(f"{provider}_admin_ids")),
-            "operator_ids":_parse_bot_ids(settings.get(f"{provider}_operator_ids")),
-            "viewer_ids":_parse_bot_ids(settings.get(f"{provider}_viewer_ids")),
+            "admin_ids":admin_ids,
+            "operator_ids":operator_ids,
+            "viewer_ids":viewer_ids,
+            "admin_usernames":admin_usernames,
+            "operator_usernames":operator_usernames,
+            "viewer_usernames":viewer_usernames,
             "alert_recipients":_parse_bot_ids(settings.get(f"{provider}_alert_recipients")),
             "webapp_url":settings.get("telegram_webapp_url","") if provider=="telegram" else "",
         }
