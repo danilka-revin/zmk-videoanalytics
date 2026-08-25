@@ -160,3 +160,430 @@ html[data-theme=dark] .event-actions .evidence{background:#1c3040;border-color:#
 @keyframes overview-rise{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}@keyframes chart-bar-rise{from{transform:scaleY(.05);opacity:.2}to{transform:scaleY(1);opacity:1}}@keyframes hero-glow{0%,100%{transform:translate3d(0,0,0)}50%{transform:translate3d(-12px,10px,0)}}@keyframes drawer-in{from{transform:translateX(28px);opacity:.3}to{transform:translateX(0);opacity:1}}html[data-motion=full] .overview-hero{animation:overview-rise .42s both}html[data-motion=full] .overview-kpi{animation:overview-rise .42s both}html[data-motion=full] .overview-kpi:nth-child(2){animation-delay:.05s}html[data-motion=full] .overview-kpi:nth-child(3){animation-delay:.10s}html[data-motion=full] .overview-kpi:nth-child(4){animation-delay:.15s}html[data-motion=full] .overview-analytics-grid .panel{animation:overview-rise .46s both;animation-delay:.12s}html[data-motion=full] .overview-lower-grid .panel{animation:overview-rise .48s both;animation-delay:.18s}html[data-motion=full] .analytics-bar{transform-origin:bottom;animation:chart-bar-rise .55s cubic-bezier(.2,.9,.3,1) both}html[data-motion=full] .overview-hero:after{animation:hero-glow 7s ease-in-out infinite}html[data-motion=full] .customizer{animation:drawer-in .24s both}html[data-motion=full] .overview-page .panel:hover,.overview-page .overview-kpi:hover{transform:translateY(-2px);box-shadow:0 10px 24px #17251d12;border-color:#bad2c0}html[data-motion=reduced] *{animation-duration:.14s!important;transition-duration:.14s!important}html[data-motion=off] *{animation:none!important;transition:none!important;scroll-behavior:auto!important}@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important;scroll-behavior:auto!important}}html[data-camera-fit=contain] .camera-snapshot{object-fit:contain}html[data-camera-fit=cover] .camera-snapshot{object-fit:cover}html[data-corners=square] .panel,html[data-corners=square] .metric,html[data-corners=square] .camera-card,html[data-corners=square] .analytics-workspace,html[data-corners=square] .overview-hero{border-radius:5px!important}
 /* Expanded personalisation controls. */
 .customizer{width:min(390px,100vw)}.custom-option-grid{display:grid;gap:12px}.custom-option-grid>label{display:flex;flex-direction:column;gap:6px;color:var(--muted);font-size:8px}.custom-option-grid select{border:1px solid var(--line);background:var(--surface-2);color:var(--text);border-radius:7px;padding:8px;font:inherit}.segmented.triple button{min-width:0}.custom-section .segmented button{cursor:pointer}@media(max-width:1050px){.overview-controls{grid-template-columns:repeat(3,minmax(0,1fr))}.overview-control-group{grid-column:1/-1}.overview-analytics-grid{grid-template-columns:1fr}.overview-lower-grid{grid-template-columns:1fr}.overview-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}}@media(max-width:640px){.overview-hero{padding:20px;flex-direction:column}.overview-hero-actions{justify-content:flex-start;max-width:none}.overview-controls{grid-template-columns:1fr}.overview-kpis{grid-template-columns:1fr}.overview-chart-foot{flex-wrap:wrap}.overview-chart-foot b{margin-left:0;width:100%}.customizer{width:min(390px,100vw)}}
+
+/* --------------------------------------------------------------------------
+   ZMK Vision visual refresh — adaptive Liquid Glass surfaces.
+   The effect is opt-in through data-glass and degrades to opaque cards when
+   backdrop-filter is unavailable. Camera pixels are deliberately untouched.
+   -------------------------------------------------------------------------- */
+:root{
+  --accent-rgb:213 255 69;
+  --surface-rgb:255 255 255;
+  --surface-2-rgb:247 249 248;
+  --ink-rgb:23 33 29;
+  --glass-orb-one:var(--accent-rgb);
+  --glass-orb-two:94 173 255;
+  --glass-orb-three:174 136 255;
+  --radius-xs:8px;
+  --radius-sm:12px;
+  --radius-md:16px;
+  --radius-lg:22px;
+  --shadow-xs:0 1px 2px rgb(23 33 29 / .05),0 5px 14px rgb(23 33 29 / .035);
+  --shadow-sm:0 8px 24px rgb(23 33 29 / .07),0 1px 2px rgb(23 33 29 / .05);
+  --shadow-md:0 18px 50px rgb(22 39 30 / .11),0 2px 6px rgb(22 39 30 / .045);
+  --focus-ring:0 0 0 3px rgb(var(--accent-rgb) / .34);
+}
+html{background:var(--page);scroll-behavior:smooth}
+html[data-theme=dark]{
+  --surface-rgb:21 32 27;
+  --surface-2-rgb:28 42 35;
+  --ink-rgb:233 240 236;
+  --shadow-xs:0 1px 2px rgb(0 0 0 / .22),0 6px 16px rgb(0 0 0 / .16);
+  --shadow-sm:0 12px 30px rgb(0 0 0 / .24),0 1px 2px rgb(0 0 0 / .22);
+  --shadow-md:0 22px 60px rgb(0 0 0 / .36),0 2px 8px rgb(0 0 0 / .25);
+}
+html[data-glass-tint=cool]{--glass-orb-one:105 177 255;--glass-orb-two:127 157 255;--glass-orb-three:95 217 213}
+html[data-glass-tint=warm]{--glass-orb-one:255 183 91;--glass-orb-two:255 128 118;--glass-orb-three:220 151 255}
+body{
+  min-width:320px;
+  overflow-x:hidden;
+  position:relative;
+  isolation:isolate;
+  background:
+    linear-gradient(122deg,rgb(var(--surface-2-rgb) / .8),rgb(var(--surface-rgb) / .7) 48%,rgb(var(--surface-2-rgb) / .9)),
+    var(--page);
+  font-family:Inter,Manrope,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+  font-feature-settings:"cv02","cv03","cv04","cv11";
+  letter-spacing:.002em;
+}
+body::before,body::after{content:"";position:fixed;pointer-events:none;z-index:0;opacity:0;transition:opacity .45s ease}
+body::before{
+  inset:0;
+  background:
+    radial-gradient(50rem 31rem at -8% -12%,rgb(var(--glass-orb-one) / .18),transparent 67%),
+    radial-gradient(42rem 30rem at 111% 3%,rgb(var(--glass-orb-two) / .14),transparent 69%),
+    radial-gradient(35rem 28rem at 72% 111%,rgb(var(--glass-orb-three) / .09),transparent 73%);
+}
+body::after{
+  width:24rem;height:24rem;right:-10rem;bottom:-13rem;border-radius:50%;
+  background:rgb(var(--glass-orb-one) / .2);
+  filter:blur(46px);
+}
+html[data-glass=soft] body::before{opacity:.75}
+html[data-glass=soft] body::after{opacity:.4}
+html[data-glass=vivid] body::before{opacity:1}
+html[data-glass=vivid] body::after{opacity:.72}
+html[data-glass=off] body::before,html[data-glass=off] body::after{display:none}
+.app{position:relative;z-index:1;min-height:100vh}
+button,input,select,textarea{font:inherit}
+button{touch-action:manipulation}
+button:focus-visible,a:focus-visible,input:focus-visible,select:focus-visible,textarea:focus-visible{
+  outline:0;box-shadow:var(--focus-ring)!important;position:relative;z-index:2;
+}
+button:disabled{cursor:not-allowed}
+
+/* A more deliberate shell: the navigation has depth while content remains calm. */
+.app>aside:not(.customizer){
+  width:250px;
+  padding:28px 16px 18px;
+  background:linear-gradient(155deg,#11221b 0%,#0a1511 62%,#101f19 100%);
+  border-right:1px solid rgb(255 255 255 / .07);
+  box-shadow:14px 0 42px rgb(6 17 12 / .13);
+}
+main{margin-left:250px;min-width:0}
+header{
+  height:88px;
+  padding:0 34px;
+  border-bottom:1px solid rgb(var(--ink-rgb) / .08);
+  box-shadow:0 7px 20px rgb(23 33 29 / .025);
+  position:sticky;top:0;z-index:35;
+}
+h1{font-size:23px;font-weight:720;letter-spacing:-.045em}
+header p,.pt p,.toolbar p{font-size:10px;line-height:1.45;color:var(--muted)}
+section{padding:28px 34px 90px}
+.brand{gap:12px;padding:0 8px 30px}
+.brandmark{
+  width:40px;height:40px;border-radius:13px;
+  background:linear-gradient(135deg,#efffb4 0%,var(--accent) 65%,rgb(var(--accent-rgb) / .75));
+  color:#15231c;box-shadow:0 8px 22px rgb(var(--accent-rgb) / .2),inset 0 1px 1px rgb(255 255 255 / .78);
+}
+.brand b{font-size:13px;letter-spacing:.115em}
+.brand small{font-size:9px;color:#90a198}
+nav{gap:5px}
+nav button{
+  min-height:42px;
+  border:1px solid transparent;
+  border-radius:11px;
+  color:#96aaa0;
+  padding:10px 11px;
+  transition:transform .2s ease,background .2s ease,color .2s ease,border-color .2s ease;
+}
+nav button:hover{background:rgb(255 255 255 / .065);border-color:rgb(255 255 255 / .07);color:#eff9f3}
+nav button.active{
+  color:#fff;
+  background:linear-gradient(105deg,rgb(var(--accent-rgb) / .18),rgb(255 255 255 / .065));
+  border-color:rgb(var(--accent-rgb) / .21);
+  box-shadow:inset 0 1px 0 rgb(255 255 255 / .11),0 8px 20px rgb(0 0 0 / .11);
+}
+nav button.active::before{content:"";width:3px;height:16px;margin-left:-4px;border-radius:99px;background:var(--accent);box-shadow:0 0 13px rgb(var(--accent-rgb) / .7)}
+nav button.active svg{color:var(--accent)}
+nav em{box-shadow:0 2px 8px rgb(228 80 62 / .26)}
+.side-status{border-radius:14px;border-color:rgb(255 255 255 / .08);background:linear-gradient(135deg,rgb(255 255 255 / .07),rgb(255 255 255 / .025));box-shadow:inset 0 1px 0 rgb(255 255 255 / .05)}
+.profile{border-color:rgb(255 255 255 / .08)}
+.avatar{box-shadow:0 4px 13px rgb(var(--accent-rgb) / .2)}
+.pulse{box-shadow:0 0 0 4px #7ddc5224,0 0 12px #7ddc5257}
+
+/* Shared elevated pieces. The opaque baseline is intentional for compatibility. */
+.panel,.metric,.camera-card,.overview-kpi,.admin-tabs,.statusline,
+.camera-modal,.preview-modal,.event-evidence-modal,.bulk-ack-modal,.reject-review-modal,
+.dataset-delete-modal,.model-register-modal,.search-results,.toast{
+  border-color:rgb(var(--ink-rgb) / .09);
+  box-shadow:var(--shadow-xs);
+}
+.panel,.metric,.camera-card,.overview-kpi{border-radius:var(--radius-md)}
+.panel{overflow:hidden}
+.metric{min-height:132px;padding:18px}
+.metric,.overview-kpi{background:var(--surface)}
+.metric-top b{font-size:26px;letter-spacing:-.05em}
+.metric-top span,.metric-top small,.delta{color:var(--muted)}
+.mi,.overview-kpi-icon{border-radius:11px;box-shadow:inset 0 1px 0 rgb(255 255 255 / .5)}
+.metrics,.overview-kpis,.admin-metrics{gap:14px}
+.grid,.grid.lower,.overview-analytics-grid,.overview-lower-grid{gap:14px}
+.pt{padding:19px 20px 12px;align-items:flex-start}
+.pt h3,.toolbar h3{font-size:13px;letter-spacing:-.015em}
+.statusline{padding:12px 15px;border-radius:var(--radius-sm);background:linear-gradient(110deg,rgb(229 249 234 / .86),rgb(244 251 246 / .92))}
+.statusline b{font-size:11px}
+.statusline button,.pt button{font-weight:650}
+
+/* Header controls, selectors and action buttons share a clear tactile language. */
+.search{
+  width:300px;min-height:39px;
+  border-radius:12px;border-color:rgb(var(--ink-rgb) / .1);
+  background:rgb(var(--surface-rgb) / .82);
+  box-shadow:inset 0 1px 0 rgb(255 255 255 / .45);
+}
+.search:focus-within{border-color:rgb(var(--accent-rgb) / .55);box-shadow:var(--focus-ring),inset 0 1px 0 rgb(255 255 255 / .5)}
+.search input{min-width:0;color:var(--text)}
+.search input::placeholder{color:var(--muted)}
+.search kbd{border:1px solid rgb(var(--ink-rgb) / .08);background:rgb(var(--ink-rgb) / .045);color:var(--muted)}
+.icon,.refresh{
+  min-height:39px;border-radius:11px;border-color:rgb(var(--ink-rgb) / .1);
+  background:rgb(var(--surface-rgb) / .9);color:var(--text);box-shadow:var(--shadow-xs);
+  transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease;
+}
+.icon:hover,.refresh:hover{transform:translateY(-1px);border-color:rgb(var(--accent-rgb) / .4);box-shadow:var(--shadow-sm)}
+.toolbar{padding:19px 20px;background:linear-gradient(110deg,rgb(var(--surface-rgb) / .62),transparent)}
+.toolbar button,.toolbar a,.page-actions>button,.camera-actions button,.empty-state button,
+.modal-actions button,.overview-controls button,.overview-hero-actions button{
+  border-radius:9px;
+  transition:transform .18s ease,box-shadow .18s ease,border-color .18s ease,background .18s ease;
+}
+.toolbar button:hover,.toolbar a:hover,.page-actions>button:hover,.camera-actions button:hover,
+.modal-actions button:hover,.overview-controls button:hover,.overview-hero-actions button:hover{transform:translateY(-1px);box-shadow:var(--shadow-xs)}
+.toolbar button,.toolbar a,.camera-actions button,.modal-actions button{border-color:rgb(var(--ink-rgb) / .11)}
+
+/* Camera streams retain an opaque, high-contrast frame while their chrome becomes refined. */
+.cards{gap:16px}
+.camera-card{overflow:hidden;background:var(--surface);transition:transform .24s ease,box-shadow .24s ease,border-color .24s ease}
+.camera-card:hover{border-color:rgb(var(--accent-rgb) / .42);box-shadow:var(--shadow-md);transform:translateY(-2px)}
+.feed{isolation:isolate;background:#060b09}
+.feed::after{content:"";position:absolute;inset:0;z-index:1;pointer-events:none;background:linear-gradient(180deg,rgb(0 0 0 / .28),transparent 28%,transparent 60%,rgb(0 0 0 / .34))}
+.feed>*{z-index:2}
+.camera-snapshot{transition:transform .5s cubic-bezier(.2,.7,.2,1)}
+html[data-motion=full] .camera-card:hover .camera-snapshot{transform:scale(1.012)}
+.feed .live,.frame-age,.feed:has(.camera-snapshot)>b{
+  border:1px solid rgb(255 255 255 / .16);
+  border-radius:7px;
+  box-shadow:0 4px 13px rgb(0 0 0 / .22);
+  backdrop-filter:blur(7px);
+  -webkit-backdrop-filter:blur(7px);
+}
+.camera-info{padding:14px 15px 12px}
+.camera-info h3{font-size:12px;letter-spacing:-.015em}
+.camera-stats{padding:11px 12px;border-color:rgb(var(--ink-rgb) / .08);background:rgb(var(--surface-2-rgb) / .42)}
+.camera-stats b{font-weight:750}
+.camera-actions{padding:11px 12px;border-color:rgb(var(--ink-rgb) / .08)}
+
+/* Tables, event filters and operational screens become easier to scan. */
+.tr{border-color:rgb(var(--ink-rgb) / .075);transition:background .16s ease}
+.tr:not(.th):hover{background:rgb(var(--accent-rgb) / .055)}
+.tr.th{background:rgb(var(--ink-rgb) / .035);color:var(--muted)}
+.table .tr:first-child{border-top-color:transparent}
+.event-filters{
+  gap:10px;padding:14px 20px;
+  border-color:rgb(var(--ink-rgb) / .08);
+  background:rgb(var(--surface-2-rgb) / .52);
+}
+.event-filters input,.event-filters select,.overview-controls input,.overview-controls select,
+.camera-modal input,.camera-modal textarea,.camera-modal select,.setting-grid input,
+.trainer-head select,.error-report select,.training-options input,.custom-option-grid select{
+  border-color:rgb(var(--ink-rgb) / .12);
+  border-radius:9px;
+  background:rgb(var(--surface-rgb) / .88);
+  color:var(--text);
+  box-shadow:inset 0 1px 1px rgb(255 255 255 / .32);
+}
+.event-filters input:focus,.event-filters select:focus,.overview-controls input:focus,.overview-controls select:focus,
+.camera-modal input:focus,.camera-modal textarea:focus,.camera-modal select:focus,.setting-grid input:focus,
+.trainer-head select:focus,.error-report select:focus,.training-options input:focus,.custom-option-grid select:focus{
+  border-color:rgb(var(--accent-rgb) / .6);outline:0;box-shadow:var(--focus-ring),inset 0 1px 1px rgb(255 255 255 / .3);
+}
+.ack{border-radius:8px;border-color:rgb(var(--ink-rgb) / .12);transition:transform .16s ease,border-color .16s ease,background .16s ease}
+.ack:hover{transform:translateY(-1px);border-color:rgb(var(--accent-rgb) / .5);background:rgb(var(--accent-rgb) / .09)}
+.sev{box-shadow:0 0 10px currentColor}
+.event-actions .evidence{border-radius:8px}
+
+/* Models, settings and training panels gain the same hierarchy as the dashboard. */
+.model-grid{gap:16px}
+.model{padding:25px;border-radius:var(--radius-md)}
+.model>span,.tag,.role,.jobstatus{border:1px solid rgb(var(--ink-rgb) / .07);box-shadow:inset 0 1px 0 rgb(255 255 255 / .35)}
+.model>div{border-color:rgb(var(--ink-rgb) / .08)}
+.active-model{border-color:rgb(var(--accent-rgb) / .45);box-shadow:0 0 0 1px rgb(var(--accent-rgb) / .12),var(--shadow-sm)}
+.settings-title{padding:21px 22px;border-color:rgb(var(--ink-rgb) / .08);background:linear-gradient(110deg,rgb(var(--accent-rgb) / .06),transparent 42%)}
+.setting-grid{padding:11px 22px;column-gap:38px}
+.setting-grid label{border-color:rgb(var(--ink-rgb) / .08)}
+.user-row,.job,.logrow,.camrow{border-color:rgb(var(--ink-rgb) / .075)}
+.service-grid>div,.latency,.overview-model-health,.event-evidence-meta span{
+  border:1px solid rgb(var(--ink-rgb) / .06);
+  background:rgb(var(--surface-2-rgb) / .66);
+  box-shadow:inset 0 1px 0 rgb(255 255 255 / .24);
+}
+
+/* Overview gets depth without reducing the clarity of real operational data. */
+.overview-page{gap:16px}
+.overview-hero{
+  min-height:196px;padding:26px 28px;border-radius:var(--radius-lg);
+  border:1px solid rgb(255 255 255 / .13);
+  background:
+    radial-gradient(28rem 18rem at 100% 0,rgb(var(--accent-rgb) / .28),transparent 67%),
+    linear-gradient(132deg,#0d2018 0%,#1a3d2d 52%,#315b43 100%);
+  box-shadow:0 20px 44px rgb(18 48 31 / .2),inset 0 1px 0 rgb(255 255 255 / .12);
+}
+.overview-hero::before{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(112deg,rgb(255 255 255 / .065),transparent 38%)}
+.overview-hero:after{width:360px;height:360px;right:-105px;top:-215px;background:radial-gradient(circle,rgb(var(--accent-rgb) / .43),transparent 67%)}
+.overview-eyebrow{color:rgb(245 255 200);font-size:8px}
+.overview-hero h2{font-size:29px;line-height:1;letter-spacing:-.052em}
+.overview-hero p{font-size:10px;color:#c9ddd0;max-width:520px}
+.overview-hero-meta span{border-color:rgb(255 255 255 / .16);background:rgb(6 20 14 / .3);box-shadow:inset 0 1px 0 rgb(255 255 255 / .08)}
+.overview-hero-actions button{border-color:rgb(255 255 255 / .2);background:rgb(255 255 255 / .11);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+.overview-hero-actions button.primary{background:linear-gradient(135deg,#ecffb5,var(--accent));box-shadow:0 7px 19px rgb(0 0 0 / .18)}
+.overview-controls{
+  padding:14px 15px;border-radius:var(--radius-md);
+  border-color:rgb(var(--ink-rgb) / .09);box-shadow:var(--shadow-xs);
+}
+.period-group{padding:3px;border:1px solid rgb(var(--ink-rgb) / .08);border-radius:9px;background:rgb(var(--surface-2-rgb) / .7)}
+.period-group button{border-radius:6px}
+.period-group button.active{background:var(--surface);box-shadow:var(--shadow-xs)}
+.overview-kpi{padding:15px;box-shadow:var(--shadow-xs)}
+.overview-kpi b{font-size:23px;letter-spacing:-.055em}
+.overview-chart-card{min-height:400px}
+.overview-chart-card .pt,.overview-review-card .pt{padding:20px 20px 10px}
+.analytics-chart{padding:16px 20px 0}
+.analytics-chart line{stroke:rgb(var(--ink-rgb) / .13)}
+.analytics-chart text{fill:var(--muted);font-size:9px}
+.analytics-chart .analytics-bar{fill:rgb(var(--accent-rgb) / .75)}
+.analytics-chart .analytics-line{stroke-width:3;filter:drop-shadow(0 4px 5px rgb(var(--accent-rgb) / .22))}
+.analytics-chart .analytics-dot{stroke:var(--surface);stroke-width:2}
+.overview-chart-foot{border-color:rgb(var(--ink-rgb) / .08)}
+.review-donut{box-shadow:0 10px 25px rgb(23 33 29 / .08),inset 0 1px 1px rgb(255 255 255 / .4)}
+.review-donut:after{box-shadow:inset 0 0 0 1px rgb(var(--ink-rgb) / .06)}
+
+/* Dialogs are composited as solid, readable layers first; glass enhancement is below. */
+.modal-backdrop{background:rgb(7 18 13 / .56);backdrop-filter:blur(8px) saturate(118%);-webkit-backdrop-filter:blur(8px) saturate(118%)}
+.camera-modal,.preview-modal,.event-evidence-modal,.bulk-ack-modal,.reject-review-modal,.dataset-delete-modal,.model-register-modal{
+  border-radius:var(--radius-lg);border-color:rgb(var(--ink-rgb) / .12);box-shadow:0 28px 80px rgb(0 0 0 / .28);
+}
+.modal-head{padding-bottom:12px;border-bottom:1px solid rgb(var(--ink-rgb) / .08)}
+.modal-head button{border-radius:9px;transition:transform .16s ease,background .16s ease}
+.modal-head button:hover{transform:rotate(4deg);background:rgb(var(--accent-rgb) / .11)}
+.toast{border-radius:12px;border-color:rgb(var(--accent-rgb) / .35);box-shadow:var(--shadow-md)}
+
+/* Customizer: a live, understandable preview of the visual material. */
+.drawer-overlay{background:rgb(7 18 13 / .46);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.customizer{
+  width:min(410px,100vw);
+  border-left:1px solid rgb(var(--ink-rgb) / .1);
+  box-shadow:-20px 0 60px rgb(0 0 0 / .18);
+  scrollbar-gutter:stable;
+}
+.custom-head{height:94px;padding:19px 22px;border-color:rgb(var(--ink-rgb) / .08);background:linear-gradient(135deg,rgb(var(--accent-rgb) / .105),transparent 58%)}
+.custom-kicker{display:flex;align-items:center;gap:5px;color:#5b8869;font-size:8px;font-weight:800;letter-spacing:.105em;margin-bottom:5px}
+.custom-head h2{font-size:19px;letter-spacing:-.035em}
+.custom-head button{border-radius:11px;border:1px solid rgb(var(--ink-rgb) / .07);transition:transform .16s ease,background .16s ease}
+.custom-head button:hover{transform:rotate(4deg);background:rgb(var(--accent-rgb) / .11)}
+.custom-section{padding:20px 22px;border-color:rgb(var(--ink-rgb) / .08)}
+.custom-section h3{color:var(--text);font-size:10px;letter-spacing:.09em}
+.custom-section-heading{display:flex;justify-content:space-between;gap:12px;align-items:flex-start;margin-bottom:13px}
+.custom-section-heading h3{margin-bottom:5px}
+.custom-section-heading p{margin:0;color:var(--muted);font-size:9px;line-height:1.45;max-width:270px}
+.custom-section-heading>svg{margin-top:1px;color:#5c8b6a}
+.glass-preview{
+  position:relative;height:116px;overflow:hidden;margin:0 0 14px;border-radius:14px;
+  border:1px solid rgb(var(--ink-rgb) / .1);
+  background:linear-gradient(122deg,#164030 0%,#276753 51%,#254d77 100%);
+  box-shadow:inset 0 1px 0 rgb(255 255 255 / .18),0 8px 16px rgb(23 33 29 / .07);
+}
+.glass-preview::after{content:"";position:absolute;inset:0;background:linear-gradient(124deg,rgb(255 255 255 / .14),transparent 42%,rgb(255 255 255 / .05));pointer-events:none}
+.glass-orb{position:absolute;border-radius:50%;filter:blur(3px);opacity:.85}
+.orb-one{width:116px;height:116px;left:-26px;bottom:-50px;background:rgb(var(--accent-rgb) / .8)}
+.orb-two{width:118px;height:118px;right:-24px;top:-55px;background:#89b7ffcc}
+.glass-preview-card{
+  position:absolute;z-index:1;left:18px;top:20px;width:192px;min-height:71px;padding:12px 13px;
+  border:1px solid rgb(255 255 255 / .46);border-radius:12px;
+  background:linear-gradient(135deg,rgb(255 255 255 / .48),rgb(255 255 255 / .2));
+  box-shadow:0 11px 22px rgb(0 0 0 / .12),inset 0 1px 0 rgb(255 255 255 / .52);
+  backdrop-filter:blur(12px) saturate(145%);-webkit-backdrop-filter:blur(12px) saturate(145%);
+  color:#fff;
+}
+.glass-preview-card span{display:inline-grid;place-items:center;width:24px;height:24px;margin-right:8px;vertical-align:middle;border-radius:8px;background:rgb(255 255 255 / .2)}
+.glass-preview-card b{font-size:10px;vertical-align:middle}.glass-preview-card small{display:block;margin-top:6px;color:#edfff4;font-size:8px}
+.glass-preview-chip{position:absolute;z-index:1;width:60px;height:24px;right:17px;bottom:17px;border:1px solid rgb(255 255 255 / .33);border-radius:9px;background:rgb(255 255 255 / .22);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px)}
+.glass-preview.is-off .glass-preview-card,.glass-preview.is-off .glass-preview-chip{backdrop-filter:none;-webkit-backdrop-filter:none;background:rgb(14 36 27 / .9);border-color:rgb(255 255 255 / .15);box-shadow:none}
+.glass-preview[data-glass-preview=vivid] .glass-preview-card{background:linear-gradient(135deg,rgb(255 255 255 / .6),rgb(255 255 255 / .16));backdrop-filter:blur(20px) saturate(175%);-webkit-backdrop-filter:blur(20px) saturate(175%)}
+.choice-grid{gap:8px}.choice-grid button{height:76px;border-radius:11px;border-color:rgb(var(--ink-rgb) / .09);background:rgb(var(--surface-2-rgb) / .65);transition:transform .16s ease,background .16s ease,border-color .16s ease,box-shadow .16s ease}
+.choice-grid button:hover{transform:translateY(-1px);border-color:rgb(var(--accent-rgb) / .42)}
+.choice-grid button.selected{border-color:rgb(var(--accent-rgb) / .62);background:rgb(var(--accent-rgb) / .1);box-shadow:inset 0 0 0 1px rgb(var(--accent-rgb) / .16),0 6px 16px rgb(var(--accent-rgb) / .1)}
+.accents{gap:15px}.accents button{width:33px;height:33px;transition:transform .16s ease,box-shadow .16s ease}.accents button:hover{transform:scale(1.09)}.accents button.selected{box-shadow:0 0 0 3px rgb(var(--accent-rgb) / .23),0 4px 10px rgb(23 33 29 / .12)}
+.segmented{border-radius:10px;border-color:rgb(var(--ink-rgb) / .09);background:rgb(var(--surface-2-rgb) / .75)}
+.segmented button{min-height:31px;border-radius:7px;font-weight:600;transition:background .15s ease,color .15s ease,box-shadow .15s ease,transform .15s ease}
+.segmented button:hover{color:var(--text)}
+.segmented button.active{background:rgb(var(--surface-rgb) / .94);box-shadow:0 2px 8px rgb(23 33 29 / .11);color:var(--text)}
+.custom-option-grid{gap:14px}.custom-option-grid>label{font-size:9px;color:var(--muted);font-weight:650}.custom-option-grid select{min-height:37px;padding:8px 9px}.custom-section>small{font-size:8px;line-height:1.48}.custom-footer{padding:19px 22px 24px;position:sticky;bottom:0;background:linear-gradient(to top,var(--surface) 76%,rgb(var(--surface-rgb) / 0));border-top:1px solid rgb(var(--ink-rgb) / .06)}
+.custom-footer button{border-radius:10px}.custom-footer .primary{background:linear-gradient(135deg,#1a3428,#11251c);box-shadow:0 7px 18px rgb(18 41 29 / .18)}
+
+/* True glass layer. These rules only run in browsers with compositing support. */
+@supports ((-webkit-backdrop-filter:blur(1px)) or (backdrop-filter:blur(1px))){
+  html[data-glass=soft] header,
+  html[data-glass=soft] .panel,html[data-glass=soft] .metric,html[data-glass=soft] .camera-card,
+  html[data-glass=soft] .overview-kpi,html[data-glass=soft] .admin-tabs,html[data-glass=soft] .statusline,
+  html[data-glass=soft] .camera-modal,html[data-glass=soft] .preview-modal,html[data-glass=soft] .event-evidence-modal,
+  html[data-glass=soft] .bulk-ack-modal,html[data-glass=soft] .reject-review-modal,html[data-glass=soft] .dataset-delete-modal,
+  html[data-glass=soft] .model-register-modal,html[data-glass=soft] .search-results,html[data-glass=soft] .toast,
+  html[data-glass=soft] .customizer{
+    background-color:rgb(var(--surface-rgb) / .78);
+    background-image:linear-gradient(135deg,rgb(255 255 255 / .2),transparent 34%);
+    backdrop-filter:blur(18px) saturate(138%);
+    -webkit-backdrop-filter:blur(18px) saturate(138%);
+    border-color:rgb(255 255 255 / .42);
+  }
+  html[data-glass=soft] .overview-controls,html[data-glass=soft] .event-filters,html[data-glass=soft] .toolbar{
+    background-color:rgb(var(--surface-rgb) / .69);backdrop-filter:blur(14px) saturate(132%);-webkit-backdrop-filter:blur(14px) saturate(132%);
+  }
+  html[data-glass=vivid] header,
+  html[data-glass=vivid] .panel,html[data-glass=vivid] .metric,html[data-glass=vivid] .camera-card,
+  html[data-glass=vivid] .overview-kpi,html[data-glass=vivid] .admin-tabs,html[data-glass=vivid] .statusline,
+  html[data-glass=vivid] .camera-modal,html[data-glass=vivid] .preview-modal,html[data-glass=vivid] .event-evidence-modal,
+  html[data-glass=vivid] .bulk-ack-modal,html[data-glass=vivid] .reject-review-modal,html[data-glass=vivid] .dataset-delete-modal,
+  html[data-glass=vivid] .model-register-modal,html[data-glass=vivid] .search-results,html[data-glass=vivid] .toast,
+  html[data-glass=vivid] .customizer{
+    background-color:rgb(var(--surface-rgb) / .63);
+    background-image:linear-gradient(132deg,rgb(255 255 255 / .34),rgb(var(--accent-rgb) / .065) 42%,transparent 70%);
+    backdrop-filter:blur(28px) saturate(165%);
+    -webkit-backdrop-filter:blur(28px) saturate(165%);
+    border-color:rgb(255 255 255 / .5);
+    box-shadow:inset 0 1px 0 rgb(255 255 255 / .48),var(--shadow-sm);
+  }
+  html[data-glass=vivid] .overview-controls,html[data-glass=vivid] .event-filters,html[data-glass=vivid] .toolbar{
+    background-color:rgb(var(--surface-rgb) / .58);backdrop-filter:blur(22px) saturate(155%);-webkit-backdrop-filter:blur(22px) saturate(155%);
+  }
+  html[data-glass=soft] .app>aside:not(.customizer){
+    background:linear-gradient(160deg,rgb(11 29 21 / .87),rgb(7 17 13 / .83));
+    backdrop-filter:blur(18px) saturate(130%);-webkit-backdrop-filter:blur(18px) saturate(130%);
+  }
+  html[data-glass=vivid] .app>aside:not(.customizer){
+    background:linear-gradient(160deg,rgb(10 34 24 / .78),rgb(7 17 13 / .73));
+    backdrop-filter:blur(25px) saturate(155%);-webkit-backdrop-filter:blur(25px) saturate(155%);
+  }
+  html[data-theme=dark][data-glass=soft] header,html[data-theme=dark][data-glass=soft] .panel,
+  html[data-theme=dark][data-glass=soft] .metric,html[data-theme=dark][data-glass=soft] .camera-card,
+  html[data-theme=dark][data-glass=soft] .overview-kpi,html[data-theme=dark][data-glass=soft] .customizer,
+  html[data-theme=dark][data-glass=vivid] header,html[data-theme=dark][data-glass=vivid] .panel,
+  html[data-theme=dark][data-glass=vivid] .metric,html[data-theme=dark][data-glass=vivid] .camera-card,
+  html[data-theme=dark][data-glass=vivid] .overview-kpi,html[data-theme=dark][data-glass=vivid] .customizer{
+    background-image:linear-gradient(135deg,rgb(255 255 255 / .075),transparent 35%);
+    border-color:rgb(255 255 255 / .14);
+  }
+}
+
+/* Compact navigation and smaller workspaces preserve the visual hierarchy. */
+html[data-sidebar=compact] .app>aside:not(.customizer){width:82px}
+html[data-sidebar=compact] main{margin-left:82px}
+html[data-sidebar=compact] .app>aside:not(.customizer) nav button{width:48px;border-radius:12px}
+html[data-corners=square] .overview-kpi,html[data-corners=square] .statusline,html[data-corners=square] .camera-modal,
+html[data-corners=square] .preview-modal,html[data-corners=square] .customizer,html[data-corners=square] .overview-controls{border-radius:6px!important}
+@keyframes glass-drift{0%,100%{transform:translate3d(0,0,0) scale(1)}50%{transform:translate3d(-22px,-13px,0) scale(1.08)}}
+@keyframes glass-shimmer{0%,100%{opacity:.46;transform:translateX(0)}50%{opacity:.75;transform:translateX(-9px)}}
+html[data-motion=full][data-glass=soft] body::after{animation:glass-drift 13s ease-in-out infinite}
+html[data-motion=full][data-glass=vivid] body::after{animation:glass-drift 10s ease-in-out infinite}
+html[data-motion=full] .glass-preview::after{animation:glass-shimmer 4.5s ease-in-out infinite}
+html[data-motion=reduced] body::after,html[data-motion=off] body::after,html[data-motion=off] .glass-preview::after{animation:none}
+
+@media(max-width:1100px){
+  .app>aside:not(.customizer){width:218px}.app>aside:not(.customizer) .brand{padding-bottom:23px}main{margin-left:218px}
+  header{padding:0 26px}section{padding-inline:26px}.search{width:240px}
+}
+@media(max-width:900px){
+  .app>aside:not(.customizer){width:78px;align-items:center;padding-inline:12px}
+  .app>aside:not(.customizer) .brand>div:last-child,.app>aside:not(.customizer) nav span,.app>aside:not(.customizer) nav em,
+  .app>aside:not(.customizer) .side-status,.app>aside:not(.customizer) .profile>div:not(.avatar),.app>aside:not(.customizer) .profile>svg{display:none}
+  .app>aside:not(.customizer) nav button{justify-content:center;width:48px}.app>aside:not(.customizer) nav button.active::before{display:none}
+  .app>aside:not(.customizer) .brand{padding-inline:0}.app>aside:not(.customizer) .profile{padding-inline:0}
+  main{margin-left:78px}.head-actions .search{width:205px}header{padding:0 22px}section{padding-inline:22px}
+}
+@media(max-width:680px){
+  .app>aside:not(.customizer){display:none}main{margin-left:0}header{height:auto;min-height:74px;padding:14px 16px;gap:12px;align-items:flex-start}.head-actions{gap:6px}.head-actions .search{width:min(45vw,220px)}section{padding:18px 16px 80px}.overview-hero h2{font-size:25px}.overview-hero{padding:22px}.customizer{width:min(410px,100vw)}
+}
+@media(max-width:460px){
+  header p{display:none}.head-actions .search{width:158px}.search kbd{display:none}.overview-hero-actions{gap:6px}.overview-hero-actions button{padding:8px}.camera-page-tools{flex-wrap:wrap}
+}
+@media(prefers-reduced-motion:reduce){body::after,.glass-preview::after{animation:none!important}}
