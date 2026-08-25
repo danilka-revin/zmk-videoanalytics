@@ -162,8 +162,15 @@ def test_delete_model_blocked_when_active(model_dir, preset_url, monkeypatch):
         con.commit(); con.close()
         assert c.post("/api/models/yolo11n/activate").status_code == 200
         r = c.delete("/api/models/yolo11n")
-        assert r.status_code == 409  # active model cannot be deleted
+        assert r.status_code == 409  # active model cannot be deleted accidentally
         assert "активн" in r.json()["detail"].lower()
+        # The panel can explicitly stop analytics and remove the active model
+        # in one confirmed action.
+        removed = c.delete("/api/models/yolo11n?deactivate=true")
+        assert removed.status_code == 200, removed.text
+        assert removed.json()["deactivated_active"] is True
+        assert removed.json()["active_model"] is None
+        assert not (model_dir / "yolo11n.pt").exists()
 
 
 def test_delete_model_removes_registry_and_artifact(model_dir, preset_url, monkeypatch):

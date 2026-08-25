@@ -56,6 +56,20 @@ def test_uploads_local_model_to_shared_volume_registers_checksum_and_deletes_it(
         assert not target.exists()
 
 
+def test_activation_rejects_uploaded_model_when_shared_artifact_disappeared(model_dir):
+    with TestClient(main.app) as client:
+        uploaded = client.post(
+            "/api/models/upload", params=upload_params(name="lost-artifact"), content=b"onnx-data",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        (model_dir / "lost-artifact.onnx").unlink()
+        activated = client.post("/api/models/lost-artifact/activate")
+
+    assert activated.status_code == 409
+    assert "отсутствует" in activated.json()["detail"]
+
+
 def test_rejects_extension_mismatch_without_creating_model_file(model_dir):
     with TestClient(main.app) as client:
         result = client.post(

@@ -260,8 +260,10 @@ def draw_detection_overlay(
     font cannot render Cyrillic reliably in a minimal container.
     """
 
-    recognised = {"person", "helmet", "no_helmet", "vest", *EVENT_CLASSES}
-    if not any(box.semantic in recognised for box in boxes):
+    # A custom local model may use classes outside ZMK's safety-event schema.
+    # They must still be visible on the camera preview; only event generation
+    # below remains limited to recognised safety semantics.
+    if not boxes:
         return None
     try:
         canvas = image.copy()
@@ -270,8 +272,6 @@ def draw_detection_overlay(
         scale = max(.35, min(.7, min(height, width) / 1000))
         violating_people = {person.index for _, person, _ in helmet_violations if person is not None}
         for box in boxes:
-            if box.semantic not in recognised:
-                continue
             x1, y1, x2, y2 = box.bbox
             left = max(0, min(width - 1, round(x1)))
             top = max(0, min(height - 1, round(y1)))
@@ -290,7 +290,11 @@ def draw_detection_overlay(
             elif box.semantic == "vest":
                 colour, title = (200, 80, 170), "VEST"
             else:
-                colour, title = (0, 165, 255), box.semantic.upper()
+                # OpenCV Hershey fonts cannot safely render arbitrary Unicode,
+                # but a clean ASCII fallback still proves that the custom model
+                # is producing real boxes on the live camera.
+                title=re.sub(r"[^A-Za-z0-9_. -]+","?",str(box.label or box.semantic)).strip()[:32] or f"CLASS {box.index}"
+                colour = (0, 165, 255)
             cv2.rectangle(canvas, (left, top), (right, bottom), colour, thickness)
             cv2.putText(
                 canvas,
@@ -441,6 +445,7 @@ class Runtime:
         self.device = DEVICE_SETTING
         self._model_task: asyncio.Task[tuple[str, Any, str]] | None = None
         self._model_loading_name = ""
+        self._model_error = ""
         self._model_retry_at = 0.0
         self._no_model_announced = False
 
@@ -650,16 +655,29 @@ class Runtime:
             session.telemetry_window_started = now
             session.frames_in_window = 0
 
+    def _model_runtime(self) -> tuple[str, str, str]:
+        """Return (name, state, safe_error) for API/UI model lifecycle status."""
+        if self._model_error:
+            return self._model_loading_name or self.model_name, "error", self._model_error
+        if self.model is not None and self.model_name:
+            return self.model_name, "ready", ""
+        if self._model_task is not None and not self._model_task.done():
+            return self._model_loading_name, "loading", ""
+        return "", "none", ""
+
     async def _heartbeat(self) -> None:
         now = time.monotonic()
         if now - self._last_heartbeat_at < HEARTBEAT_INTERVAL_SECONDS:
             return
         status = "running" if self.sessions else "idle"
-        detail = f"cameras={len(self.sessions)} model={self.model_name or 'none'}"
+        model_name, model_status, model_error = self._model_runtime()
+        detail = f"cameras={len(self.sessions)} model={model_name or 'none'} state={model_status}"
+        if model_error:
+            detail += f" error={model_error}"
         try:
             await self.post_internal(
                 "/api/internal/inference/heartbeat",
-                {"status": status, "detail": detail, "camera_count": len(self.sessions)},
+                {"status": status, "detail": detail[:300], "camera_count": len(self.sessions), "model_name": model_name, "model_status": model_status, "model_error": model_error[:300]},
             )
             self._last_heartbeat_at = now
         except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
@@ -713,6 +731,8 @@ class Runtime:
             self._model_task = None
             self.model = None
             self.model_name = ""
+            self._model_loading_name = ""
+            self._model_error = ""
             for session in self.sessions.values():
                 if session.inference_task is not None and not session.inference_task.done():
                     session.inference_task.cancel()
@@ -727,6 +747,8 @@ class Runtime:
         wanted_name = str(info["name"])
         self._no_model_announced = False
         if self.model_name == wanted_name and self.model is not None:
+            self._model_loading_name = wanted_name
+            self._model_error = ""
             return
 
         if self._model_task is not None:
@@ -736,13 +758,17 @@ class Runtime:
             self._model_task = None
             try:
                 loaded_name, model, device = task.result()
-            except (OSError, RuntimeError, ValueError, ImportError) as exc:
+            except Exception as exc:  # noqa: BLE001 - model backends raise heterogeneous load errors.
                 self._model_retry_at = now + 15
-                self._log(f"model unavailable; camera capture continues: {redact_error(exc)}", force=True)
+                self._model_loading_name = wanted_name
+                self._model_error = redact_error(exc)
+                self._log(f"model unavailable; camera capture continues: {self._model_error}", force=True)
                 return
             if loaded_name == wanted_name:
                 self.model = model
                 self.model_name = loaded_name
+                self._model_loading_name = loaded_name
+                self._model_error = ""
                 self.device = device
                 self._log(f"active model loaded: {loaded_name} (device={device})", force=True)
                 return
@@ -758,6 +784,7 @@ class Runtime:
             session.latest_visual = None
             session.next_inference_at = 0
         self._model_loading_name = wanted_name
+        self._model_error = ""
         self._model_task = asyncio.create_task(self._load_model_async(dict(info)), name=f"model-load-{wanted_name}")
         self._log(f"loading active model {wanted_name} in background", force=True)
 
@@ -1082,7 +1109,9 @@ class Runtime:
                     )
                 )[0]
         except Exception as exc:  # noqa: BLE001 - ML failures must not stop RTSP.
-            self._log(f"inference failed; camera capture continues: {redact_error(exc)}")
+            self._model_loading_name = self.model_name
+            self._model_error = redact_error(exc)
+            self._log(f"inference failed; camera capture continues: {self._model_error}")
             return
 
         stamp = datetime.now(timezone.utc).isoformat()
@@ -1105,9 +1134,12 @@ class Runtime:
                 label = _label_at(names, int(cls))
                 raw.append(ModelBox((x1, y1, x2, y2), label, normalise_model_label(label), float(score), index))
         except (AttributeError, IndexError, TypeError, ValueError) as exc:
-            self._log(f"invalid model output ignored: {redact_error(exc)}")
+            self._model_loading_name = self.model_name
+            self._model_error = redact_error(exc)
+            self._log(f"invalid model output ignored: {self._model_error}")
             return
 
+        self._model_error = ""
         detections: list[dict[str, Any]] = []
         frame_token = int(time.time() * 1000)
 

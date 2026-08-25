@@ -127,6 +127,35 @@ def test_no_active_model_does_not_import_ml_dependencies(worker_mod):
     assert "torch" not in worker_mod.__dict__
 
 
+def test_heartbeat_reports_real_model_load_state(worker_mod):
+    runtime = worker_mod.Runtime()
+    runtime._model_loading_name = "custom-forklift"
+    runtime._model_error = "Unsupported model graph"
+    calls = _record_internal(runtime)
+
+    asyncio.run(runtime._heartbeat())
+
+    assert calls
+    payload = calls[-1][1]
+    assert payload["model_name"] == "custom-forklift"
+    assert payload["model_status"] == "error"
+    assert payload["model_error"] == "Unsupported model graph"
+
+
+def test_prediction_error_is_reported_as_model_runtime_error(worker_mod):
+    class BrokenModel:
+        def predict(self, *_args, **_kwargs):
+            raise RuntimeError("Unsupported ONNX graph")
+
+    runtime = worker_mod.Runtime()
+    runtime.model = BrokenModel()
+    runtime.model_name = "custom-onnx"
+    session = worker_mod.CameraSession(config=worker_mod.CameraConfig.from_api(_camera()))
+
+    assert asyncio.run(runtime._infer(session, _FakeImage())) is None
+    assert runtime._model_runtime() == ("custom-onnx", "error", "Unsupported ONNX graph")
+
+
 def test_ppe_labels_link_no_helmet_to_the_detected_person(worker_mod):
     person = worker_mod.ModelBox((0, 0, 100, 200), "Human", "person", .96, 0)
     bare_head = worker_mod.ModelBox((35, 12, 65, 55), "No-Helmet", "no_helmet", .92, 1)
@@ -264,6 +293,19 @@ def test_ppe_boxes_are_drawn_into_the_published_camera_preview(worker_mod):
     assert len(rectangles) >= 2
     assert any(text.startswith("PERSON") for text in labels)
     assert any(text.startswith("HELMET") for text in labels)
+
+
+def test_custom_model_classes_are_drawn_on_live_preview(worker_mod):
+    rectangles, labels = [], []
+    worker_mod.cv2.rectangle = lambda image, *args: rectangles.append(args) or image
+    worker_mod.cv2.putText = lambda image, text, *args: labels.append(text) or image
+    custom = worker_mod.ModelBox((1, 1, 18, 19), "Forklift", "forklift", .91, 0)
+
+    result = worker_mod.draw_detection_overlay(_FakeImage(), [custom], [])
+
+    assert result is not None
+    assert rectangles
+    assert any(text.startswith("Forklift") for text in labels)
 
 
 def test_live_preview_does_not_wait_for_slow_ai_inference(worker_mod):

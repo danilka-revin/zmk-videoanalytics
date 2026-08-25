@@ -201,7 +201,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS cameras(id TEXT PRIMARY KEY, name TEXT NOT NULL, zone TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rtsp_url TEXT NOT NULL DEFAULT '', fps_limit REAL NOT NULL DEFAULT 8, status TEXT NOT NULL DEFAULT 'unknown', fps REAL NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, telemetry_at TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '', restart_requested_at TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, camera_id TEXT NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL, confidence REAL NOT NULL, person_id TEXT, external_id TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, review_status TEXT NOT NULL DEFAULT 'pending', reviewed_at TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '', FOREIGN KEY(camera_id) REFERENCES cameras(id));
     CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, level TEXT NOT NULL, service TEXT NOT NULL, message TEXT NOT NULL, camera_id TEXT);
-    CREATE TABLE IF NOT EXISTS worker_status(name TEXT PRIMARY KEY, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', camera_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS worker_status(name TEXT PRIMARY KEY, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', camera_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, model_name TEXT NOT NULL DEFAULT '', model_status TEXT NOT NULL DEFAULT 'none', model_error TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS model_registry(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, format TEXT NOT NULL, status TEXT NOT NULL, precision REAL, recall REAL, trained_at TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'external', artifact_uri TEXT NOT NULL DEFAULT '', checksum TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS training_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, camera_id TEXT NOT NULL, base_model TEXT NOT NULL, target_name TEXT NOT NULL, image_count INTEGER NOT NULL, epochs INTEGER NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL, error TEXT, batch INTEGER NOT NULL DEFAULT 8, imgsz INTEGER NOT NULL DEFAULT 640, patience INTEGER NOT NULL DEFAULT 20, confidence REAL NOT NULL DEFAULT .35, val_split REAL NOT NULL DEFAULT .2, capture_fps REAL NOT NULL DEFAULT 2, FOREIGN KEY(camera_id) REFERENCES cameras(id));
@@ -217,6 +217,11 @@ def init_db():
     # Previous releases capped every camera at 20 FPS. High-FPS mode upgrades
     # the known legacy 8/20 FPS defaults to 60 while the UI still exposes a per-camera choice.
     if HIGH_FPS_MODE: con.execute("UPDATE cameras SET fps_limit=60 WHERE fps_limit IN (8,20)")
+    # The inference worker reports the exact lifecycle of the active model so
+    # the Web panel can distinguish "selected" from "actually loaded".
+    worker_columns={r[1] for r in con.execute("PRAGMA table_info(worker_status)").fetchall()}
+    for column,ddl in {"model_name":"TEXT NOT NULL DEFAULT ''","model_status":"TEXT NOT NULL DEFAULT 'none'","model_error":"TEXT NOT NULL DEFAULT ''"}.items():
+        if column not in worker_columns: con.execute(f"ALTER TABLE worker_status ADD COLUMN {column} {ddl}")
     model_columns={r[1] for r in con.execute("PRAGMA table_info(model_registry)").fetchall()}
     for column,ddl in {"artifact_uri":"TEXT NOT NULL DEFAULT ''","checksum":"TEXT NOT NULL DEFAULT ''"}.items():
         if column not in model_columns: con.execute(f"ALTER TABLE model_registry ADD COLUMN {column} {ddl}")
@@ -499,6 +504,9 @@ class InferenceHeartbeat(BaseModel):
     status:Literal["starting","running","idle","degraded","stopped"]
     detail:str=Field(default="",max_length=300)
     camera_count:int=Field(default=0,ge=0,le=10000)
+    model_name:str=Field(default="",max_length=120)
+    model_status:Literal["none","loading","ready","error"]="none"
+    model_error:str=Field(default="",max_length=300)
 class CameraSnapshotIn(BaseModel):
     jpeg_base64:str=Field(min_length=16,max_length=1_800_000)
     captured_at:datetime|None=None
@@ -751,10 +759,10 @@ def _bot_view(provider: str, settings: dict[str,str], runtime: sqlite3.Row | Non
 
 
 def inference_worker_state() -> dict[str,Any]:
-    con=db(); row=con.execute("SELECT status,detail,camera_count,updated_at FROM worker_status WHERE name='inference'").fetchone(); con.close()
-    if not row: return {"connected":False,"status":"absent","detail":"Нет heartbeat от inference worker","camera_count":0,"age_seconds":None}
+    con=db(); row=con.execute("SELECT status,detail,camera_count,updated_at,model_name,model_status,model_error FROM worker_status WHERE name='inference'").fetchone(); con.close()
+    if not row: return {"connected":False,"status":"absent","detail":"Нет heartbeat от inference worker","camera_count":0,"age_seconds":None,"model_name":"","model_status":"none","model_error":""}
     age=timestamp_age_seconds(row[3]); connected=age is not None and age<=15 and row[0] in {"starting","running","idle","degraded"}
-    return {"connected":connected,"status":row[0],"detail":row[1],"camera_count":row[2],"updated_at":row[3],"age_seconds":age}
+    return {"connected":connected,"status":row[0],"detail":row[1],"camera_count":row[2],"updated_at":row[3],"age_seconds":age,"model_name":row[4] or "","model_status":row[5] or "none","model_error":row[6] or ""}
 
 def update_headers() -> dict[str,str]:
     headers = {}
@@ -891,7 +899,7 @@ def internal_cameras(): return rows("SELECT id,name,rtsp_url,fps_limit,enabled,r
 
 @app.post("/api/internal/inference/heartbeat",status_code=204)
 def inference_heartbeat(payload:InferenceHeartbeat):
-    con=db(); con.execute("INSERT INTO worker_status(name,status,detail,camera_count,updated_at) VALUES('inference',?,?,?,?) ON CONFLICT(name) DO UPDATE SET status=excluded.status,detail=excluded.detail,camera_count=excluded.camera_count,updated_at=excluded.updated_at",(payload.status,payload.detail,payload.camera_count,now_iso())); con.commit(); con.close()
+    con=db(); con.execute("INSERT INTO worker_status(name,status,detail,camera_count,updated_at,model_name,model_status,model_error) VALUES('inference',?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET status=excluded.status,detail=excluded.detail,camera_count=excluded.camera_count,updated_at=excluded.updated_at,model_name=excluded.model_name,model_status=excluded.model_status,model_error=excluded.model_error",(payload.status,payload.detail,payload.camera_count,now_iso(),payload.model_name,payload.model_status,payload.model_error)); con.commit(); con.close()
 
 @app.get("/api/internal/active-model")
 def internal_active_model():
@@ -1461,15 +1469,34 @@ def _model_meets_quality(precision: float | None, recall: float | None, limits: 
     )
 
 
+def _model_runtime_view(name: str, active: bool, worker: dict[str,Any]) -> dict[str,Any]:
+    """Expose whether the selected model has really reached inference worker."""
+    base={"worker_connected":bool(worker.get("connected")),"worker_updated_at":worker.get("updated_at",""),"worker_age_seconds":worker.get("age_seconds")}
+    if not active:
+        return {**base,"status":"inactive","detail":""}
+    if not worker.get("connected"):
+        return {**base,"status":"worker_offline","detail":"Inference worker не на связи — запустите профиль inference"}
+    worker_model=str(worker.get("model_name") or "")
+    worker_status=str(worker.get("model_status") or "none")
+    if worker_model==name:
+        detail=str(worker.get("model_error") or worker.get("detail") or "")
+        return {**base,"status":worker_status,"detail":detail}
+    if worker_status=="error" and not worker_model:
+        return {**base,"status":"error","detail":str(worker.get("model_error") or worker.get("detail") or "Не удалось загрузить активную модель")}
+    return {**base,"status":"waiting","detail":"Inference worker ещё не применил выбранную модель"}
+
+
 @app.get("/api/models")
 def models():
     active=rows("SELECT value FROM settings WHERE key='active_model'")[0]["value"]
     limits={r["key"]:float(r["value"]) for r in rows("SELECT key,value FROM settings WHERE key IN ('min_model_precision','min_model_recall')")}
+    worker=inference_worker_state()
     data=rows("SELECT name,format,status,precision,recall,trained_at,source,artifact_uri,checksum FROM model_registry ORDER BY id DESC")
     for item in data:
         item["active"]=item["name"]==active
         item["trial_eligible"]=_is_trial_preset_source(item.get("source"))
         item["trial_mode"]=bool(item["active"] and item["trial_eligible"] and not _model_meets_quality(item.get("precision"),item.get("recall"),limits))
+        item["runtime"]=_model_runtime_view(str(item["name"]),bool(item["active"]),worker)
     return data
 
 
@@ -1653,16 +1680,33 @@ def active_model_health():
     if not model: raise HTTPException(503,"Активная модель отсутствует в реестре")
     healthy=model[2]=="ready" and _model_meets_quality(model[3],model[4],limits)
     trial_mode=bool(not healthy and _is_trial_preset_source(model[6]))
-    return {"healthy":healthy,"trial_mode":trial_mode,"model":dict(model),"requirements":{"precision":limits.get('min_model_precision',90),"recall":limits.get('min_model_recall',85)},"last_inference":dict(last) if last else None}
+    runtime=_model_runtime_view(str(model[0]),True,inference_worker_state())
+    return {"healthy":healthy,"trial_mode":trial_mode,"model":dict(model),"runtime":runtime,"requirements":{"precision":limits.get('min_model_precision',90),"recall":limits.get('min_model_recall',85)},"last_inference":dict(last) if last else None}
+
+
+def _ensure_managed_model_artifact(source: str | None, artifact_uri: str | None) -> None:
+    """Fail early when an uploaded/preset artifact vanished from model-data."""
+    if not source or not source.startswith(("upload:","preset:")):
+        return
+    if not str(artifact_uri or "").startswith("file://"):
+        raise HTTPException(409,"Управляемый артефакт модели имеет некорректный путь")
+    try:
+        artifact=Path(str(artifact_uri).removeprefix("file://")).resolve()
+        base=MODEL_DIR.resolve()
+    except (OSError,ValueError) as exc:
+        raise HTTPException(409,"Не удалось проверить файл модели в хранилище") from exc
+    if base not in artifact.parents or not artifact.is_file():
+        raise HTTPException(409,"Файл модели отсутствует в общем хранилище. Загрузите модель заново.")
 
 
 def _activate_model(name:str, *, allow_trial:bool=False):
     started=time.perf_counter()
     con=db()
     try:
-        model=con.execute("SELECT status,precision,recall,source FROM model_registry WHERE name=?",(name,)).fetchone()
+        model=con.execute("SELECT status,precision,recall,source,artifact_uri FROM model_registry WHERE name=?",(name,)).fetchone()
         if not model: raise HTTPException(404,"Модель не найдена")
         if model[0] != "ready": raise HTTPException(409,"Модель ещё не готова")
+        _ensure_managed_model_artifact(model[3],model[4])
         limits={r[0]:float(r[1]) for r in con.execute("SELECT key,value FROM settings WHERE key IN ('min_model_precision','min_model_recall')").fetchall()}
         quality_ok=_model_meets_quality(model[1],model[2],limits)
         trial_mode=not quality_ok and allow_trial and _is_trial_preset_source(model[3])
@@ -1728,22 +1772,38 @@ def deactivate_trial_model(name:str):
         con.close()
 
 @app.delete("/api/models/{name}")
-def delete_model(name:str):
-    """Remove a model from the registry and its managed preset/upload artifact.
+def delete_model(name:str, deactivate:bool=False):
+    """Remove a model and optionally stop it first when it is currently active.
 
-    Manually registered external ``file://`` URIs are left untouched; only
-    files created by this service inside MODEL_DIR are eligible for deletion.
+    The ordinary route still refuses accidental deletion of an active model.
+    The Web panel sends ``deactivate=true`` only after an explicit confirmation.
     """
     if not re.fullmatch(r"[A-Za-z0-9._-]{2,120}",name or ""): raise HTTPException(422,"Недопустимое имя модели")
     con=db(); row=con.execute("SELECT status,source,artifact_uri FROM model_registry WHERE name=?",(name,)).fetchone()
     if not row: con.close(); raise HTTPException(404,"Модель не найдена")
-    active=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()[0]
-    if active==name: con.close(); raise HTTPException(409,"Нельзя удалить активную модель — сначала переключитесь на другую (или отключите) через 'Горячая замена'")
+    source=row[1]; artifact_uri=row[2] or ""
     jobs=con.execute("SELECT COUNT(*) FROM training_jobs WHERE target_name=? AND status IN ('queued','running')",(name,)).fetchone()[0]
     if jobs: con.close(); raise HTTPException(409,"Модель используется текущей задачей обучения")
-    source=row[1]; artifact_uri=row[2] or ""
+    active=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()[0]
+    active_after=active
+    deactivated_active=False
+    if active==name:
+        if not deactivate:
+            con.close(); raise HTTPException(409,"Модель активна. Сначала переключитесь на другую или подтвердите остановку и удаление.")
+        deactivated_active=True
+        # Deleting a currently running PPE trial restores its validated model
+        # when possible; regular models leave inference deliberately disabled.
+        previous_row=con.execute("SELECT value FROM settings WHERE key='ppe_trial_previous_model'").fetchone()
+        previous=previous_row[0] if previous_row else ""
+        restored=""
+        if _is_trial_preset_source(source) and previous and previous!=name and con.execute("SELECT 1 FROM model_registry WHERE name=? AND status='ready'",(previous,)).fetchone():
+            restored=previous
+        active_after=restored
+        con.execute("UPDATE settings SET value=? WHERE key='active_model'",(active_after,))
+        con.execute("UPDATE settings SET value=? WHERE key='active_model_disabled'",("false" if active_after else "true",))
+        con.execute("UPDATE settings SET value='' WHERE key='ppe_trial_previous_model'")
     con.execute("DELETE FROM model_registry WHERE name=?",(name,))
-    con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"Model deleted: {name} (source={source})"))
+    con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"Model deleted: {name} (source={source}, deactivated={deactivated_active})"))
     con.commit(); con.close()
     removed_file=False
     if source and source.startswith(("preset:","upload:")) and artifact_uri.startswith("file://"):
@@ -1754,7 +1814,7 @@ def delete_model(name:str):
                 artifact.unlink(); removed_file=True
         except (OSError,ValueError):
             removed_file=False
-    return {"name":name,"deleted":True,"removed_artifact_file":removed_file,"source":source}
+    return {"name":name,"deleted":True,"removed_artifact_file":removed_file,"source":source,"deactivated_active":deactivated_active,"active_model":active_after or None}
 
 IMAGE_EXTS={".jpg",".jpeg",".png",".bmp",".webp",".tif",".tiff"}
 VIDEO_EXTS={".mp4",".avi",".mov",".mkv",".m4v",".webm",".mpg",".mpeg",".wmv"}
