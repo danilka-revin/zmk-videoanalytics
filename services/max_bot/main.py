@@ -16,9 +16,28 @@ from maxapi.types import Command, InputMedia, MessageCreated
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("zmk.max")
+# .env remains a headless fallback; a token entered in Admin → Боты is read
+# from the API's private, read-only-mounted token directory instead.
 TOKEN = os.getenv("MAX_BOT_TOKEN", "")
 API_URL = os.getenv("ZMK_API_URL", "http://api:8000").rstrip("/")
 API_KEY = os.getenv("ZMK_API_KEY", "")
+
+
+def _managed_token() -> str:
+    directory=os.getenv("ZMK_BOT_TOKEN_DIR", "").strip()
+    if not directory:
+        return ""
+    try:
+        return (Path(directory) / "max.token").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def bot_token() -> str:
+    """Prefer the write-only Admin token and retain .env compatibility."""
+    return _managed_token() or os.getenv("MAX_BOT_TOKEN", "").strip() or TOKEN.strip()
+
+
 def _ids(value: str) -> set[int]:
     result=set()
     for token in value.replace(";", ",").replace("\n", ",").split(","):
@@ -342,30 +361,85 @@ async def alert_worker():
             log.exception("MAX alert worker iteration failed")
         await asyncio.sleep(5)
 
-async def wait_for_token():
-    while True:
-        try: await api("POST","/api/bots/max/heartbeat",json={"status":"waiting_token","detail":"MAX_BOT_TOKEN не задан на сервере","enabled":False})
+async def _report_waiting_token() -> None:
+    try:
+        await api("POST","/api/bots/max/heartbeat",json={
+            "status":"waiting_token",
+            "detail":"Токен не задан: укажите его в Admin → Боты или MAX_BOT_TOKEN в .env",
+            "enabled":False,
+        })
+    except Exception:
+        log.debug("Could not report MAX waiting-token heartbeat",exc_info=True)
+
+
+async def _wait_for_token_change(token: str) -> None:
+    """Wake the polling supervisor when Admin saves or rotates a token."""
+    while bot_token()==token:
+        await asyncio.sleep(2)
+
+
+async def run_bot_session(token: str) -> None:
+    """Run one MAX polling session and restart it after token rotation."""
+    global bot
+    bot=Bot(token=token)
+    await bot.delete_webhook()
+    runtime=asyncio.create_task(runtime_worker())
+    alerts=asyncio.create_task(alert_worker())
+    polling=asyncio.create_task(dp.start_polling(bot))
+    token_watch=asyncio.create_task(_wait_for_token_change(token))
+    try:
+        done,_=await asyncio.wait({polling,token_watch},return_when=asyncio.FIRST_COMPLETED)
+        if token_watch in done:
+            log.info("MAX token changed; reconnecting polling worker")
+            # maxapi exposes an explicit stop flag; set it before cancelling
+            # the in-flight long poll so a later session starts from a clean
+            # dispatcher state.
+            await dp.stop_polling()
+        if not polling.done(): polling.cancel()
+        result=await asyncio.gather(polling,return_exceptions=True)
+        if token_watch not in done and isinstance(result[0],Exception):
+            raise result[0]
+    finally:
+        for task in (runtime,alerts,token_watch):
+            if not task.done(): task.cancel()
+        await asyncio.gather(runtime,alerts,token_watch,return_exceptions=True)
+        # maxapi's current SDK calls this ``close_session``; retain a generic
+        # fallback for compatible versions without coupling deployment to one
+        # exact transport implementation.
+        try:
+            close=getattr(bot,"close_session",None) or getattr(bot,"close",None)
+            if close:
+                result=close()
+                if hasattr(result,"__await__"): await result
         except Exception:
-            log.debug("Could not report MAX waiting-token heartbeat",exc_info=True)
-        await asyncio.sleep(15)
+            log.debug("Could not close MAX bot transport",exc_info=True)
+        bot=None
+
 
 async def main():
-    global bot
-    if not TOKEN:
-        log.warning("MAX_BOT_TOKEN is not configured; service stays ready for Admin status only")
-        await wait_for_token()
-        return
-    bot = Bot(token=TOKEN)
-    if not (ADMINS or OPERATORS or VIEWERS):
-        log.warning("MAX whitelist is empty; configure roles in Admin → Боты")
-    await bot.delete_webhook()
-    runtime = asyncio.create_task(runtime_worker())
-    alerts = asyncio.create_task(alert_worker())
-    try:
-        await dp.start_polling(bot)
-    finally:
-        runtime.cancel(); alerts.cancel()
-        await asyncio.gather(runtime, alerts, return_exceptions=True)
+    waiting_logged=False
+    while True:
+        token=bot_token()
+        if not token:
+            if not waiting_logged:
+                log.warning("MAX token is not configured; waiting for Admin → Боты")
+                waiting_logged=True
+            await _report_waiting_token()
+            await asyncio.sleep(4)
+            continue
+        waiting_logged=False
+        if not (ADMINS or OPERATORS or VIEWERS):
+            log.warning("MAX whitelist is empty; configure roles in Admin → Боты")
+        try:
+            log.info("Starting MAX bot; API=%s",API_URL)
+            await run_bot_session(token)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("MAX polling session stopped")
+            try: await api("POST","/api/bots/max/heartbeat",json={"status":"error","detail":"Не удалось запустить MAX polling","enabled":False})
+            except Exception: log.debug("Could not report MAX startup error",exc_info=True)
+        await asyncio.sleep(1)
 
 
 if __name__ == "__main__":

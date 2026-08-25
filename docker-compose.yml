@@ -7,6 +7,9 @@ services:
     - ./data:/app/data
     - dataset-data:/datasets
     - model-data:/models
+    # Dedicated secret volume: bot workers must not get a read-only mount of
+    # the database/RTSP data just to receive their token.
+    - bot-token-data:/bot-tokens
     environment:
       VIDEOANALYTICS_DB: /app/data/videoanalytics.db
       DATASET_DIR: /datasets
@@ -22,10 +25,15 @@ services:
       TRAINING_WORKER_URL: ${TRAINING_WORKER_URL:-http://training-worker:8010}
       ZMK_WORKER_TOKEN: ${ZMK_WORKER_TOKEN:-}
       ZMK_WORKER_TOKEN_FILE: ${ZMK_WORKER_TOKEN_FILE:-/models/.worker-token}
+      # Write-only tokens entered in Admin → Боты. This dedicated volume is
+      # mounted read-only into messenger workers and never exposed by an API response.
+      ZMK_BOT_TOKEN_DIR: /bot-tokens
       UPDATE_SERVICE_URL: ${UPDATE_SERVICE_URL:-http://updater:8020}
       ZMK_UPDATE_TOKEN: ${ZMK_UPDATE_TOKEN:-}
       # Optional first-camera bootstrap; keep empty when configuring cameras in UI.
       RTSP_CAM_01: ${RTSP_CAM_01:-}
+      # Optional .env fallbacks. Tokens entered in Admin → Боты are stored
+      # outside SQLite in the dedicated bot-token volume and take precedence.
       TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
       TELEGRAM_ADMIN_IDS: ${TELEGRAM_ADMIN_IDS:-}
       TELEGRAM_OPERATOR_IDS: ${TELEGRAM_OPERATOR_IDS:-}
@@ -61,8 +69,12 @@ services:
       TELEGRAM_OPERATOR_IDS: ${TELEGRAM_OPERATOR_IDS:-}
       TELEGRAM_VIEWER_IDS: ${TELEGRAM_VIEWER_IDS:-}
       TELEGRAM_WEBAPP_URL: ${TELEGRAM_WEBAPP_URL:-http://localhost:5173/telegram}
+      # The API writes Admin-entered tokens here atomically; bots can only read.
+      ZMK_BOT_TOKEN_DIR: /bot-secrets
       ZMK_API_URL: http://api:8000
       ZMK_API_KEY: ${ZMK_API_KEY:-}
+    volumes:
+    - bot-token-data:/bot-secrets:ro
     depends_on:
       api:
         condition: service_healthy
@@ -74,8 +86,12 @@ services:
       MAX_ADMIN_IDS: ${MAX_ADMIN_IDS:-}
       MAX_OPERATOR_IDS: ${MAX_OPERATOR_IDS:-}
       MAX_VIEWER_IDS: ${MAX_VIEWER_IDS:-}
+      # Same dedicated private read-only volume as telegram-bot.
+      ZMK_BOT_TOKEN_DIR: /bot-secrets
       ZMK_API_URL: http://api:8000
       ZMK_API_KEY: ${ZMK_API_KEY:-}
+    volumes:
+    - bot-token-data:/bot-secrets:ro
     depends_on:
       api:
         condition: service_healthy
@@ -201,3 +217,4 @@ volumes:
   training-data: {}
   model-data: {}
   dataset-data: {}
+  bot-token-data: {}

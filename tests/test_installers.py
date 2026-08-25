@@ -82,6 +82,14 @@ def test_compose_and_environment_are_consistent():
     assert compose['services']['max-bot']['restart'] == 'unless-stopped'
     assert compose['services']['max-bot']['build'] == './services/max_bot'
     assert compose['services']['api']['environment']['MAX_BOT_TOKEN'] == '${MAX_BOT_TOKEN:-}'
+    # Admin-entered bot tokens stay in a dedicated API-writable volume, never
+    # a broad read-only mount of the database/RTSP data into bot workers.
+    assert compose['services']['api']['environment']['ZMK_BOT_TOKEN_DIR'] == '/bot-tokens'
+    assert 'bot-token-data:/bot-tokens' in compose['services']['api']['volumes']
+    for service in ('telegram-bot', 'max-bot'):
+        assert compose['services'][service]['environment']['ZMK_BOT_TOKEN_DIR'] == '/bot-secrets'
+        assert 'bot-token-data:/bot-secrets:ro' in compose['services'][service]['volumes']
+    assert 'bot-token-data' in compose['volumes']
     assert 'profiles' not in compose['services']['training-worker']
     assert compose['services']['training-worker']['build'] == './services/training_worker'
     assert compose['services']['api']['environment']['TRAINING_WORKER_URL'] == '${TRAINING_WORKER_URL:-http://training-worker:8010}'

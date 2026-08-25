@@ -28,3 +28,10 @@ def test_local_bot_menu_omits_invalid_http_mini_app_button():
         assert '📊 Открыть ZMK Mini App' in labels
     finally:
         bot_main.WEBAPP_URL=previous
+
+
+def test_admin_managed_token_overrides_env_fallback(tmp_path, monkeypatch):
+    monkeypatch.setenv('TELEGRAM_BOT_TOKEN','env-token')
+    monkeypatch.setenv('ZMK_BOT_TOKEN_DIR',str(tmp_path))
+    (tmp_path/'telegram.token').write_text('admin-token\n',encoding='utf-8')
+    assert bot_main.bot_token()=='admin-token'

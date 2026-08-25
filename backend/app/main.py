@@ -253,9 +253,9 @@ def init_db():
         "inference_fps":"8", "inference_device":"cuda:0", "batch_size":"4", "nms_iou":"0.45",
         "helmet_conf":"0.85", "vest_conf":"0.80", "phone_conf":"0.78", "smoking_conf":"0.80", "restricted_zone_conf":"0.82", "immobility_conf":"0.80", "min_model_precision":"90", "min_model_recall":"85",
         "telegram_enabled":"true" if legacy_telegram_enabled else "false", "telegram_chat_ids":legacy_telegram_chats_row[0] if legacy_telegram_chats_row else "", "critical_alerts":"true",
-        # Bot tokens remain process secrets in .env. Everything operational —
-        # enablement, roles, recipients and alert policy — is controlled from
-        # the Admin → Bots workspace and read live by bot services.
+        # Bot tokens are intentionally outside SQLite/settings responses. They
+        # may be supplied from legacy .env values or written through Admin →
+        # Bots to a private, owner-only secret volume/file.
         "telegram_bot_enabled":"true" if (legacy_telegram_enabled or MESSENGER_PROVIDER=="telegram") else "false",
         "telegram_alerts_enabled":"true" if (legacy_telegram_enabled or MESSENGER_PROVIDER=="telegram") else "false",
         "telegram_alert_min_severity":"critical" if legacy_critical_alerts else "high",
@@ -316,13 +316,16 @@ app.openapi=custom_openapi
 
 def telegram_webapp_role(init_data:str)->str|None:
     """Validate Telegram Mini App initData and return the whitelisted role."""
-    if not TELEGRAM_BOT_TOKEN or not init_data or len(init_data)>8192: return None
+    # Resolve on each request: an Admin-entered token must authenticate the
+    # Mini App immediately and the secret itself is never sent to the browser.
+    token=_effective_bot_token("telegram")
+    if not token or not init_data or len(init_data)>8192: return None
     try:
         values=dict(parse_qsl(init_data,keep_blank_values=True)); supplied=values.pop("hash","")
         auth_date=int(values.get("auth_date","0"))
         if abs(int(time.time())-auth_date)>3600: return None
         check="\n".join(f"{k}={v}" for k,v in sorted(values.items()))
-        secret=hmac.new(b"WebAppData",TELEGRAM_BOT_TOKEN.encode(),hashlib.sha256).digest()
+        secret=hmac.new(b"WebAppData",token.encode(),hashlib.sha256).digest()
         expected=hmac.new(secret,check.encode(),hashlib.sha256).hexdigest()
         if not hmac.compare_digest(supplied,expected): return None
         user=json.loads(values.get("user","{}")); role=_bot_role_for_user("telegram",int(user.get("id",0))); return role if role in {"viewer","operator","admin"} else None
@@ -527,6 +530,9 @@ class BotConfigIn(BaseModel):
     viewer_ids:str=Field(default="",max_length=4000)
     alert_recipients:str=Field(default="",max_length=4000)
     webapp_url:str=Field(default="",max_length=1000)
+    # Write-only on purpose.  Keep this untyped here so validation never
+    # echoes a malformed secret back in FastAPI's 422 response.
+    token:Any|None=Field(default=None,json_schema_extra={"writeOnly":True})
 class BotHeartbeatIn(BaseModel):
     status:Literal["active","disabled","waiting_token","api_unavailable","error"]
     detail:str=Field(default="",max_length=300)
@@ -616,8 +622,99 @@ def _active_bot_provider(settings: dict[str,str]) -> str:
     return active[0] if len(active)==1 else "multiple" if active else "none"
 
 
+def _managed_bot_token_dir() -> Path:
+    """Return the private, persistent directory for Admin-entered bot tokens.
+
+    Direct/local deployments default below the persistent ``data`` directory;
+    Docker Compose sets a dedicated named secret volume instead.  Tokens never
+    enter SQLite or a settings API response, and the volume is read-only in
+    each bot worker.  Deployments can override it with ``ZMK_BOT_TOKEN_DIR``.
+    """
+    configured=os.getenv("ZMK_BOT_TOKEN_DIR", "").strip()
+    return Path(configured) if configured else DB_PATH.parent / ".bot-tokens"
+
+
+def _managed_bot_token_path(provider: str) -> Path:
+    if provider not in BOT_PROVIDERS:
+        raise ValueError("Неизвестный провайдер бота")
+    return _managed_bot_token_dir() / f"{provider}.token"
+
+
+def _read_managed_bot_token(provider: str) -> str:
+    try:
+        return _managed_bot_token_path(provider).read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _legacy_bot_token(provider: str) -> str:
+    """Read the pre-Admin .env value, retaining compatibility with old stacks."""
+    if provider=="telegram":
+        # The module-level value is intentionally first: security tests and
+        # long-running local integrations may update it directly.
+        return (TELEGRAM_BOT_TOKEN or os.getenv("TELEGRAM_BOT_TOKEN", "")).strip()
+    return os.getenv("MAX_BOT_TOKEN", "").strip()
+
+
+def _effective_bot_token(provider: str) -> str:
+    """Prefer the write-only Admin secret; .env remains a headless fallback."""
+    if provider not in BOT_PROVIDERS:
+        return ""
+    return _read_managed_bot_token(provider) or _legacy_bot_token(provider)
+
+
+def _bot_token_source(provider: str) -> Literal["admin","environment","none"]:
+    if _read_managed_bot_token(provider):
+        return "admin"
+    return "environment" if _legacy_bot_token(provider) else "none"
+
+
 def _bot_token_configured(provider: str) -> bool:
-    return bool(os.getenv("TELEGRAM_BOT_TOKEN" if provider=="telegram" else "MAX_BOT_TOKEN", "").strip())
+    return bool(_effective_bot_token(provider))
+
+
+def _normalize_bot_token(value: Any) -> str:
+    """Validate a write-only messenger token without ever reflecting it."""
+    if not isinstance(value, str):
+        raise HTTPException(422,"Токен должен быть строкой")
+    token=value.strip()
+    if not token:
+        raise HTTPException(422,"Токен не может быть пустым")
+    if len(token)>512:
+        raise HTTPException(422,"Токен слишком длинный")
+    if any(char.isspace() or ord(char)<32 for char in token):
+        raise HTTPException(422,"Токен не должен содержать пробелы или управляющие символы")
+    return token
+
+
+def _store_managed_bot_token(provider: str, token: str) -> None:
+    """Atomically persist a token with owner-only permissions when supported.
+
+    A temporary sibling file plus ``replace`` means bot workers will observe
+    either the old complete token or the new complete token, never a partial
+    write.  The function deliberately does not log the token or include it in
+    errors.
+    """
+    target=_managed_bot_token_path(provider)
+    temporary:Path|None=None
+    try:
+        target.parent.mkdir(parents=True,exist_ok=True)
+        try: target.parent.chmod(0o700)
+        except OSError: pass  # Windows/filesystems without POSIX modes.
+        with tempfile.NamedTemporaryFile("w",encoding="utf-8",dir=target.parent,prefix=f".{provider}-",delete=False) as stream:
+            temporary=Path(stream.name)
+            stream.write(token+"\n")
+            stream.flush()
+            os.fsync(stream.fileno())
+        try: temporary.chmod(0o600)
+        except OSError: pass
+        temporary.replace(target)
+        try: target.chmod(0o600)
+        except OSError: pass
+    except OSError as exc:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+        raise HTTPException(503,"Не удалось сохранить токен в защищённом хранилище") from exc
 
 
 def _bot_view(provider: str, settings: dict[str,str], runtime: sqlite3.Row | None, last_command: sqlite3.Row | None) -> dict[str,Any]:
@@ -634,7 +731,10 @@ def _bot_view(provider: str, settings: dict[str,str], runtime: sqlite3.Row | Non
         "operator_ids":settings.get(f"{provider}_operator_ids",""),
         "viewer_ids":settings.get(f"{provider}_viewer_ids",""),
         "alert_recipients":settings.get(f"{provider}_alert_recipients",""),
+        # Never return the secret itself — only whether it exists and where it
+        # was configured, so the Admin form can stay write-only.
         "token_configured":_bot_token_configured(provider),
+        "token_source":_bot_token_source(provider),
         "runtime":{"status":status,"detail":runtime[2] if runtime else "Сервис ещё не сообщил состояние","enabled":bool(runtime[3]) if runtime else False,"updated_at":updated_at,"age_seconds":age,"online":bool(age is not None and age<=20 and status in {"active","disabled","waiting_token"})},
         "webapp_url":settings.get("telegram_webapp_url",os.getenv("TELEGRAM_WEBAPP_URL","")) if provider=="telegram" else "",
         "last_test":{"id":last_command[0],"status":last_command[1],"error":last_command[2],"created_at":last_command[3],"completed_at":last_command[4]} if last_command else None,
@@ -1194,9 +1294,6 @@ def admin_bots():
 
 @app.put("/api/admin/bots/{provider}")
 def update_bot(provider: Literal["telegram","max"], payload: BotConfigIn):
-    if payload.enabled and not _bot_token_configured(provider):
-        label="TELEGRAM_BOT_TOKEN" if provider=="telegram" else "MAX_BOT_TOKEN"
-        raise HTTPException(422,f"Нельзя включить {provider}: {label} не задан на сервере. Токен намеренно не хранится в панели.")
     try:
         values={
             f"{provider}_bot_enabled":"true" if payload.enabled else "false",
@@ -1214,6 +1311,16 @@ def update_bot(provider: Literal["telegram","max"], payload: BotConfigIn):
             values["telegram_webapp_url"]=url
     except ValueError as exc:
         raise HTTPException(422,str(exc))
+    # ``token`` is optional: an empty field in the browser must not erase an
+    # existing secret.  A non-empty value atomically replaces it before the
+    # enablement check, allowing operators to add a token and enable a bot with
+    # one Save action.
+    token=_normalize_bot_token(payload.token) if payload.token is not None else ""
+    if payload.enabled and not (token or _bot_token_configured(provider)):
+        label="Telegram" if provider=="telegram" else "MAX"
+        raise HTTPException(422,f"Нельзя включить {label}: сначала введите токен в Admin → Боты или задайте его в .env")
+    if token:
+        _store_managed_bot_token(provider,token)
     con=db()
     try:
         for key,value in values.items(): con.execute("INSERT INTO settings VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,value))
@@ -1222,7 +1329,7 @@ def update_bot(provider: Literal["telegram","max"], payload: BotConfigIn):
             con.execute("INSERT INTO settings VALUES('telegram_enabled',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(values[f"{provider}_alerts_enabled"],))
             con.execute("INSERT INTO settings VALUES('telegram_chat_ids',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(values[f"{provider}_alert_recipients"],))
             con.execute("INSERT INTO settings VALUES('critical_alerts',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",("true" if payload.alert_min_severity=="critical" else "false",))
-        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","bot_admin",f"{provider} bot configured: enabled={payload.enabled}, alerts={payload.alerts_enabled}"))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","bot_admin",f"{provider} bot configured: enabled={payload.enabled}, alerts={payload.alerts_enabled}, token_updated={bool(token)}"))
         con.commit()
         runtime=con.execute("SELECT provider,status,detail,enabled,updated_at FROM bot_runtime WHERE provider=?",(provider,)).fetchone()
         last_command=con.execute("SELECT id,status,error,created_at,completed_at FROM bot_commands WHERE provider=? AND action='test_alert' ORDER BY id DESC LIMIT 1",(provider,)).fetchone()

@@ -7,6 +7,7 @@ import logging
 import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -26,10 +27,30 @@ from aiogram.types import (
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("zmk.telegram")
+# ``TOKEN`` is retained as the legacy .env fallback.  Admin-entered secrets
+# live in a private bind mount instead, so they are never retrievable through
+# the web API and can be updated while this worker is running.
 TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 API_URL = os.getenv("ZMK_API_URL", "http://api:8000").rstrip("/")
 WEBAPP_URL = os.getenv("TELEGRAM_WEBAPP_URL", "http://localhost:5173/telegram")
 API_KEY = os.getenv("ZMK_API_KEY", "")
+
+
+def _managed_token() -> str:
+    directory=os.getenv("ZMK_BOT_TOKEN_DIR", "").strip()
+    if not directory:
+        return ""
+    try:
+        return (Path(directory) / "telegram.token").read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def bot_token() -> str:
+    """Prefer the write-only Admin token and retain .env compatibility."""
+    return _managed_token() or os.getenv("TELEGRAM_BOT_TOKEN", "").strip() or TOKEN.strip()
+
+
 def _ids(value: str) -> set[int]:
     result=set()
     for token in value.replace(";", ",").replace("\n", ",").split(","):
@@ -309,12 +330,22 @@ async def alert_worker(bot: Bot):
         except Exception: log.exception("Alert worker iteration failed")
         await asyncio.sleep(5)
 
-async def wait_for_token():
-    while True:
-        try: await api("POST","/api/bots/telegram/heartbeat",json={"status":"waiting_token","detail":"TELEGRAM_BOT_TOKEN не задан на сервере","enabled":False})
-        except Exception:
-            log.debug("Could not report Telegram waiting-token heartbeat",exc_info=True)
-        await asyncio.sleep(15)
+async def _report_waiting_token() -> None:
+    try:
+        await api("POST","/api/bots/telegram/heartbeat",json={
+            "status":"waiting_token",
+            "detail":"Токен не задан: укажите его в Admin → Боты или TELEGRAM_BOT_TOKEN в .env",
+            "enabled":False,
+        })
+    except Exception:
+        log.debug("Could not report Telegram waiting-token heartbeat",exc_info=True)
+
+
+async def _wait_for_token_change(token: str) -> None:
+    """Wake the polling supervisor when Admin saves or rotates a token."""
+    while bot_token()==token:
+        await asyncio.sleep(2)
+
 
 @router.errors()
 async def telegram_error(event: ErrorEvent):
@@ -326,21 +357,55 @@ async def telegram_error(event: ErrorEvent):
             log.debug("Could not send user-facing error",exc_info=True)
     return True
 
-async def main():
-    if not TOKEN:
-        log.warning("TELEGRAM_BOT_TOKEN is not configured; service stays ready for Admin status only")
-        await wait_for_token()
-        return
-    if not (WEBAPP_URL.startswith(("https://","http://localhost"))): raise RuntimeError("TELEGRAM_WEBAPP_URL must use HTTPS")
-    if not (ADMINS or OPERATORS or VIEWERS): log.warning("Telegram whitelist is empty; configure roles in Admin → Боты")
-    bot=Bot(TOKEN,default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+async def run_bot_session(token: str) -> None:
+    """Run one polling session, cancelling it cleanly after token rotation."""
+    bot=Bot(token,default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp=Dispatcher(); dp.include_router(router)
-    log.info("Starting bot; API=%s",API_URL)
     runtime=asyncio.create_task(runtime_worker(bot))
     alerts=asyncio.create_task(alert_worker(bot))
-    try: await dp.start_polling(bot,allowed_updates=dp.resolve_used_update_types())
+    polling=asyncio.create_task(dp.start_polling(bot,allowed_updates=dp.resolve_used_update_types()))
+    token_watch=asyncio.create_task(_wait_for_token_change(token))
+    try:
+        done,_=await asyncio.wait({polling,token_watch},return_when=asyncio.FIRST_COMPLETED)
+        if token_watch in done:
+            log.info("Telegram token changed; reconnecting polling worker")
+        # ``start_polling`` owns a long-poll request, so cancelling the task is
+        # portable across aiogram versions and releases it promptly.
+        if not polling.done(): polling.cancel()
+        result=await asyncio.gather(polling,return_exceptions=True)
+        if token_watch not in done and isinstance(result[0],Exception):
+            raise result[0]
     finally:
-        runtime.cancel(); alerts.cancel()
-        await asyncio.gather(runtime,alerts,return_exceptions=True)
+        for task in (runtime,alerts,token_watch):
+            if not task.done(): task.cancel()
+        await asyncio.gather(runtime,alerts,token_watch,return_exceptions=True)
+        await bot.session.close()
+
+
+async def main():
+    waiting_logged=False
+    while True:
+        token=bot_token()
+        if not token:
+            if not waiting_logged:
+                log.warning("Telegram token is not configured; waiting for Admin → Боты")
+                waiting_logged=True
+            await _report_waiting_token()
+            await asyncio.sleep(4)
+            continue
+        waiting_logged=False
+        if not (ADMINS or OPERATORS or VIEWERS): log.warning("Telegram whitelist is empty; configure roles in Admin → Боты")
+        try:
+            log.info("Starting Telegram bot; API=%s",API_URL)
+            await run_bot_session(token)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Telegram polling session stopped")
+            try: await api("POST","/api/bots/telegram/heartbeat",json={"status":"error","detail":"Не удалось запустить Telegram polling","enabled":False})
+            except Exception: log.debug("Could not report Telegram startup error",exc_info=True)
+        await asyncio.sleep(1)
+
 
 if __name__=="__main__": asyncio.run(main())
