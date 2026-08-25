@@ -123,3 +123,56 @@ def test_system_health_contains_measured_values():
         assert 0<=health['ram']<=100
         assert 0<=health['disk']<=100
         assert health['gpu'] is None or 0<=health['gpu']<=100
+
+
+def test_smart_search_supports_russian_aliases_typos_prefixes_and_workspaces(monkeypatch):
+    monkeypatch.setattr(main, "SEED_TEST_DATA", False)
+    with TestClient(main.app) as c:
+        created = c.post('/api/cameras', json={
+            'name': 'Проходная Южный вход',
+            'zone': 'Склад № 2',
+            'description': 'Въезд для погрузчиков',
+            'rtsp_url': 'rtsp://127.0.0.1:9/stream',
+        })
+        assert created.status_code == 201
+        camera_id = created.json()['id']
+        con = main.db()
+        timestamp = main.now_iso()
+        event_id = con.execute(
+            "INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id,note) VALUES(?,?,?,?,?,?,?)",
+            (timestamp, camera_id, 'no_helmet', 'critical', .91, 'operator-7', 'Проверить у мастера'),
+        ).lastrowid
+        con.execute(
+            "INSERT INTO model_registry(name,format,status,precision,recall,trained_at,source,artifact_uri,checksum) VALUES(?,?,?,?,?,?,?,?,?)",
+            ('guard-yolo-v3', 'ONNX', 'ready', 91, 89, timestamp, 'local', 'file:///models/guard-yolo-v3.onnx', ''),
+        )
+        con.execute(
+            "INSERT INTO datasets(name,path,image_count,class_count,created_at,kind) VALUES(?,?,?,?,?,?)",
+            ('helmet-shift-august', '/tmp/helmet-shift-august', 120, 2, timestamp, 'images'),
+        )
+        con.commit(); con.close()
+
+        searched_event = c.get(f'/api/events/by-id/{event_id}')
+        assert searched_event.status_code == 200 and searched_event.json()['camera_id'] == camera_id
+
+        casefolded = c.get('/api/search', params={'q': 'ЮЖНЫЙ'}).json()['results']
+        assert any(item['kind'] == 'camera' and item['id'] == camera_id for item in casefolded)
+
+        prefixed = c.get('/api/search', params={'q': 'камера:проходн'}).json()['results']
+        assert prefixed and {item['kind'] for item in prefixed} == {'camera'}
+
+        helmet = c.get('/api/search', params={'q': 'каска'}).json()['results']
+        assert any(item['kind'] == 'event' and item['title'] == 'Без каски' for item in helmet)
+        grammatical_case = c.get('/api/search', params={'q': 'каску'}).json()['results']
+        assert any(item['kind'] == 'event' for item in grammatical_case)
+        typo = c.get('/api/search', params={'q': 'касска'}).json()['results']
+        assert any(item['kind'] == 'event' for item in typo)
+
+        model = c.get('/api/search', params={'q': 'модель:guard'}).json()['results']
+        assert model and model[0]['kind'] == 'model' and model[0]['id'] == 'guard-yolo-v3'
+        dataset = c.get('/api/search', params={'q': 'датасет:helmet'}).json()['results']
+        assert dataset and dataset[0]['kind'] == 'dataset' and dataset[0]['title'] == 'helmet-shift-august'
+
+        # Search can recognize the operator term RTSP but must never leak the URL.
+        safe_camera_search = c.get('/api/search', params={'q': 'rtsp'}).json()['results']
+        assert safe_camera_search and all('127.0.0.1:9' not in str(item) for item in safe_camera_search)

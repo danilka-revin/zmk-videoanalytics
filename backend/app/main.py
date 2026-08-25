@@ -22,6 +22,7 @@ import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qsl, urlparse
@@ -926,6 +927,14 @@ def events(limit:int=Query(50,ge=1,le=500),severity:str|None=None,event_type:str
     for item in data: item["has_frame"]=event_frame_path_for(int(item["id"])).is_file()
     return data
 
+@app.get("/api/events/by-id/{event_id}")
+def event_by_id(event_id:int):
+    data=rows("""SELECT e.*,c.name camera_name,c.zone FROM events e JOIN cameras c ON c.id=e.camera_id
+        WHERE e.id=?""",(event_id,))
+    if not data: raise HTTPException(404,"Событие не найдено")
+    item=data[0]; item["has_frame"]=event_frame_path_for(event_id).is_file()
+    return item
+
 @app.get("/api/events/{event_id}/frame")
 def event_frame(event_id:int):
     con=db(); row=con.execute("SELECT id FROM events WHERE id=?",(event_id,)).fetchone(); con.close()
@@ -1642,17 +1651,194 @@ def error_report_csv(hours:int=Query(24,ge=1,le=720)):
     since=(datetime.now(TZ)-timedelta(hours=hours)).isoformat(); data=sanitize_csv_rows(rows("SELECT timestamp,level,service,camera_id,message FROM logs WHERE level IN ('WARNING','ERROR','CRITICAL') AND timestamp>=? ORDER BY id DESC",(since,)))
     out=io.StringIO(); fields=['timestamp','level','service','camera_id','message']; w=csv.DictWriter(out,fieldnames=fields); w.writeheader(); w.writerows(data)
     return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=zmk-error-report.csv"})
+# Search is intentionally kept local and transparent: it never queries or exposes
+# RTSP URLs/artifact locations, but it understands the words operators use in
+# Russian and English.  SQLite LIKE is case-sensitive for Cyrillic on many
+# builds, so ranking happens after a bounded local read with casefolded text.
+_SEARCH_KIND_ALIASES: dict[str, tuple[str, ...]] = {
+    "camera": ("camera", "cameras", "cam", "камера", "камеры", "видео", "поток", "rtsp"),
+    "event": ("event", "events", "alert", "событие", "события", "нарушение", "нарушения", "тревога"),
+    "model": ("model", "models", "модель", "модели", "ai", "ии"),
+    "dataset": ("dataset", "datasets", "датасет", "датасеты", "набор", "разметка"),
+    "training": ("training", "train", "job", "обучение", "задача", "задачи"),
+}
+_SEARCH_EVENT_LABELS: dict[str, str] = {
+    "no_helmet": "Без каски",
+    "no_vest": "Без жилета",
+    "phone_usage": "Использование телефона",
+    "smoking": "Курение",
+    "restricted_zone": "Опасная зона",
+    "immobility": "Неподвижность",
+}
+_SEARCH_EVENT_ALIASES: dict[str, tuple[str, ...]] = {
+    "no_helmet": ("без каски", "каска", "каски", "каску", "каске", "helmet", "hard hat", "no helmet"),
+    "no_vest": ("без жилета", "жилет", "жилеты", "жилета", "жилету", "vest", "no vest"),
+    "phone_usage": ("телефон", "телефона", "phone", "mobile"),
+    "smoking": ("курение", "курит", "сигарета", "smoking"),
+    "restricted_zone": ("опасная зона", "запретная зона", "проход", "restricted zone"),
+    "immobility": ("неподвижность", "неподвижен", "лежит", "immobility"),
+}
+_SEARCH_SEVERITY_ALIASES: dict[str, tuple[str, ...]] = {
+    "critical": ("critical", "критический", "критические", "критично"),
+    "high": ("high", "высокий", "высокие"),
+    "medium": ("medium", "средний", "средние"),
+    "low": ("low", "низкий", "низкие"),
+}
+_SEARCH_REVIEW_ALIASES: dict[str, tuple[str, ...]] = {
+    "pending": ("pending", "ожидает", "ожидают", "требует внимания", "новое"),
+    "accepted": ("accepted", "принято", "приняты", "подтверждено", "проверено"),
+    "rejected": ("rejected", "не принято", "отклонено", "ложное", "ложные"),
+}
+_SEARCH_CAMERA_STATUS_ALIASES: dict[str, tuple[str, ...]] = {
+    "online": ("online", "онлайн", "в эфире", "работает"),
+    "offline": ("offline", "офлайн", "недоступна", "не в сети"),
+    "connecting": ("connecting", "подключение", "подключается"),
+    "recovering": ("recovering", "восстановление", "переподключение"),
+    "error": ("error", "ошибка"),
+    "unknown": ("unknown", "неизвестно"),
+}
+
+
+def _search_normalize(value: Any) -> str:
+    """Casefold Russian/English text, preserving only searchable word tokens."""
+    raw = str(value or "").casefold().replace("ё", "е").replace("_", " ").replace("-", " ")
+    return " ".join(re.findall(r"[\w]+", raw, flags=re.UNICODE))
+
+
+def _search_alias_text(value: str, aliases: dict[str, tuple[str, ...]]) -> str:
+    return " ".join((value, *aliases.get(value, ())))
+
+
+def _search_parse_query(raw: str) -> tuple[str, set[str] | None]:
+    """Support ergonomic prefixes such as camera:gate and модель:yolo."""
+    normalized = _search_normalize(raw)
+    if not normalized:
+        return "", None
+    alias_to_kind = {alias: kind for kind, aliases in _SEARCH_KIND_ALIASES.items() for alias in aliases}
+    match = re.match(r"^\s*([^:\s]+)\s*:\s*(.*)$", raw.casefold())
+    if match:
+        prefix = _search_normalize(match.group(1))
+        kind = alias_to_kind.get(prefix)
+        if kind:
+            return _search_normalize(match.group(2)), {kind}
+    tokens = normalized.split()
+    if len(tokens) > 1 and tokens[0] in alias_to_kind:
+        return " ".join(tokens[1:]), {alias_to_kind[tokens[0]]}
+    return normalized, None
+
+
+def _search_match(query: str, fields: list[tuple[str, Any]]) -> tuple[int, list[str]] | None:
+    """Return a deterministic relevance score or None if all query words miss.
+
+    Exact words and prefixes rank first.  A conservative SequenceMatcher fallback
+    makes one small typo (for example "касска") usable without pretending that an
+    unrelated record is a match.
+    """
+    tokens = [token for token in _search_normalize(query).split() if token]
+    normalized_fields = [(label, _search_normalize(value)) for label, value in fields if _search_normalize(value)]
+    document = " ".join(value for _, value in normalized_fields)
+    if not document:
+        return None
+    if not tokens:
+        return 1, []
+    words = tuple(dict.fromkeys(document.split()))
+    score = 0
+    for token in tokens:
+        if token in words:
+            score += 110
+        elif any(word.startswith(token) for word in words):
+            score += 82
+        elif token in document:
+            score += 58
+        elif len(token) >= 3:
+            nearby = (word for word in words if abs(len(word) - len(token)) <= max(2, len(token) // 3))
+            similarity = max((SequenceMatcher(None, token, word).ratio() for word in nearby), default=0.0)
+            if similarity >= 0.82:
+                score += int(28 + similarity * 42)
+            else:
+                return None
+        else:
+            return None
+    phrase = " ".join(tokens)
+    if phrase and phrase in document:
+        score += 90
+    matches = [label for label, value in normalized_fields if phrase in value or any(token in value for token in tokens)]
+    return score, matches[:2] or ["похожее совпадение"]
+
+
+def _search_subtitle_status(value: str, aliases: dict[str, tuple[str, ...]]) -> str:
+    labels = {
+        "online": "Онлайн", "offline": "Офлайн", "connecting": "Подключение", "recovering": "Восстановление", "error": "Ошибка", "unknown": "Неизвестно",
+        "critical": "Критический", "high": "Высокий", "medium": "Средний", "low": "Низкий",
+        "pending": "Требует внимания", "accepted": "Принято", "rejected": "Не принято",
+    }
+    return labels.get(value, value)
+
+
 @app.get("/api/search")
-def global_search(q:str=Query(min_length=2,max_length=100),limit:int=Query(20,ge=1,le=50)):
-    term=f"%{q.strip()}%"; con=db(); results=[]
-    for row in con.execute("SELECT id,name,zone,description,status FROM cameras WHERE name LIKE ? OR zone LIKE ? OR description LIKE ? LIMIT ?",(term,term,term,limit)).fetchall(): results.append({"kind":"camera","id":row[0],"title":row[1],"subtitle":f"{row[2]} · {row[4]}"})
-    remaining=max(0,limit-len(results))
-    if remaining:
-        for row in con.execute("SELECT id,type,camera_id,severity,timestamp FROM events WHERE type LIKE ? OR person_id LIKE ? OR note LIKE ? ORDER BY timestamp DESC LIMIT ?",(term,term,term,remaining)).fetchall(): results.append({"kind":"event","id":row[0],"title":row[1],"subtitle":f"{row[2]} · {row[3]} · {row[4]}"})
-    remaining=max(0,limit-len(results))
-    if remaining:
-        for row in con.execute("SELECT name,format,status,source FROM model_registry WHERE name LIKE ? OR source LIKE ? LIMIT ?",(term,term,remaining)).fetchall(): results.append({"kind":"model","id":row[0],"title":row[0],"subtitle":f"{row[1]} · {row[2]}"})
-    con.close(); return {"query":q,"results":results}
+def global_search(q: str = Query(min_length=1, max_length=100), limit: int = Query(20, ge=1, le=50)):
+    query, requested_kinds = _search_parse_query(q)
+    # A prefix alone (for example "camera:") is a useful browse command.
+    # Unprefixed punctuation-only input, however, has no meaningful result.
+    if not query and requested_kinds is None:
+        return {"query": q, "normalized_query": "", "results": []}
+    con = db()
+    candidates: list[tuple[int, int, dict[str, Any]]] = []
+    kind_rank = {"camera": 0, "event": 1, "model": 2, "dataset": 3, "training": 4}
+
+    def add(kind: str, item_id: str | int, title: str, subtitle: str, fields: list[tuple[str, Any]]) -> None:
+        if requested_kinds is not None and kind not in requested_kinds:
+            return
+        # Kind words make broad queries like "камера" or "модель" useful even
+        # when the record itself has an arbitrary operator-assigned name.
+        kind_words = " ".join(_SEARCH_KIND_ALIASES.get(kind, (kind,)))
+        match = _search_match(query, [("категория", kind_words), *fields])
+        if match is None:
+            return
+        score, matches = match
+        candidates.append((score, kind_rank[kind], {"kind": kind, "id": item_id, "title": title, "subtitle": subtitle, "matches": matches}))
+
+    try:
+        for row in con.execute("SELECT id,name,zone,description,status,fps FROM cameras ORDER BY updated_at DESC,id LIMIT 1000").fetchall():
+            status = str(row[4] or "unknown")
+            add("camera", row[0], row[1], f"{row[2] or 'Без зоны'} · {_search_subtitle_status(status, _SEARCH_CAMERA_STATUS_ALIASES)} · {float(row[5] or 0):.1f} FPS", [
+                ("название", row[1]), ("ID камеры", row[0]), ("зона", row[2]), ("описание", row[3]), ("статус", _search_alias_text(status, _SEARCH_CAMERA_STATUS_ALIASES)),
+            ])
+        for row in con.execute("""SELECT e.id,e.type,e.camera_id,e.severity,e.timestamp,e.person_id,e.note,e.review_status,c.name,c.zone
+            FROM events e LEFT JOIN cameras c ON c.id=e.camera_id ORDER BY e.timestamp DESC LIMIT 1200""").fetchall():
+            event_type = str(row[1] or "")
+            severity = str(row[3] or "")
+            review = str(row[7] or "pending")
+            label = _SEARCH_EVENT_LABELS.get(event_type, event_type.replace("_", " ") or "Событие")
+            camera_name = str(row[8] or row[2])
+            add("event", int(row[0]), label, f"{camera_name} · {_search_subtitle_status(severity, _SEARCH_SEVERITY_ALIASES)} · {_search_subtitle_status(review, _SEARCH_REVIEW_ALIASES)} · {row[4]}", [
+                ("тип события", _search_alias_text(event_type, _SEARCH_EVENT_ALIASES)), ("камера", camera_name), ("ID камеры", row[2]), ("зона", row[9]),
+                ("критичность", _search_alias_text(severity, _SEARCH_SEVERITY_ALIASES)), ("решение", _search_alias_text(review, _SEARCH_REVIEW_ALIASES)),
+                ("объект", row[5]), ("комментарий", row[6]), ("ID события", row[0]),
+            ])
+        active_row = con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()
+        active_model_name = str(active_row[0]) if active_row else ""
+        for row in con.execute("SELECT name,format,status,source,precision,recall FROM model_registry ORDER BY id DESC LIMIT 500").fetchall():
+            is_active = active_model_name == str(row[0])
+            subtitle = f"{row[1]} · {row[2]}" + (" · активна" if is_active else "")
+            add("model", row[0], row[0], subtitle, [
+                ("название", row[0]), ("формат", row[1]), ("статус", row[2]), ("источник", row[3]), ("активность", "активная используется" if is_active else "не активна"),
+            ])
+        for row in con.execute("SELECT id,name,kind,image_count,media_count,class_count FROM datasets ORDER BY id DESC LIMIT 500").fetchall():
+            amount = row[4] if str(row[2]) == "videos" else row[3]
+            add("dataset", int(row[0]), row[1], f"{row[2]} · {amount} кадров · {row[5]} классов", [
+                ("название", row[1]), ("тип", row[2]), ("кадры", amount), ("классы", row[5]),
+            ])
+        for row in con.execute("SELECT id,target_name,camera_id,dataset_name,status,stage,progress FROM training_jobs ORDER BY id DESC LIMIT 30").fetchall():
+            source = row[3] or row[2]
+            add("training", int(row[0]), row[1], f"{row[4]} · {row[6]}% · {row[5] or source}", [
+                ("модель", row[1]), ("камера или датасет", source), ("статус", row[4]), ("этап", row[5]), ("ID задачи", row[0]),
+            ])
+    finally:
+        con.close()
+    candidates.sort(key=lambda item: (-item[0], item[1], _search_normalize(item[2]["title"])))
+    results = [item for _, _, item in candidates[:limit]]
+    return {"query": q, "normalized_query": query, "results": results}
 
 def gpu_metrics():
     try:
