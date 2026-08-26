@@ -155,3 +155,19 @@ def test_respects_streaming_size_limit_and_keeps_existing_artifact_safe(model_di
     assert collision.status_code == 409
     assert existing.read_bytes() == b"existing-artifact"
     assert not list(model_dir.glob("*.upload"))
+
+
+def test_unvalidated_upload_can_start_a_safe_camera_test(model_dir):
+    with TestClient(main.app) as client:
+        uploaded = client.post(
+            "/api/models/upload",
+            params={"name": "person-box-test", "format": "ONNX", "filename": "person-box-test.onnx"},
+            content=b"onnx-data",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        model = next(item for item in client.get("/api/models").json() if item["name"] == "person-box-test")
+        assert model["precision"] is None and model["recall"] is None
+        assert client.post("/api/models/person-box-test/activate").status_code == 409
+        tested = client.post("/api/models/person-box-test/activate-test")
+        assert tested.status_code == 200 and tested.json()["test_mode"] is True

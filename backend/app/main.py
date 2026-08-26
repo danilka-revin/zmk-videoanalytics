@@ -39,7 +39,7 @@ from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 APP_VERSION = "2.12.0"
 TZ = timezone(timedelta(hours=7))
@@ -1011,11 +1011,18 @@ class UserIn(BaseModel):
 class ModelIn(BaseModel):
     name:str=Field(min_length=2,max_length=120,pattern=r"^[a-zA-Z0-9._-]+$")
     format:Literal["ONNX","ONNX FP16","TensorRT","TensorRT FP16","PyTorch"]
-    precision:float=Field(ge=0,le=100)
-    recall:float=Field(ge=0,le=100)
+    # Validation metrics are optional for a camera test. They are required only
+    # before the operator promotes a model into a production slot.
+    precision:float|None=Field(default=None,ge=0,le=100)
+    recall:float|None=Field(default=None,ge=0,le=100)
     source:str=Field(default="external",max_length=200)
     artifact_uri:str=Field(min_length=1,max_length=1000)
     checksum:str=Field(default="",max_length=128,pattern=r"^[a-fA-F0-9]*$")
+    @model_validator(mode="after")
+    def metrics_are_a_pair(self):
+        if (self.precision is None) != (self.recall is None):
+            raise ValueError("Укажите Precision и Recall вместе или оставьте оба поля пустыми для теста на камере")
+        return self
 class ModelSlotIn(BaseModel):
     role:Literal["people","helmet","workwear","phone","smoking","zone"]
 class ModelBulkDeleteIn(BaseModel):
@@ -2158,8 +2165,8 @@ async def upload_model_file(
     request: Request,
     name: str=Query(min_length=2,max_length=120,pattern=r"^[a-zA-Z0-9._-]+$"),
     model_format: Literal["ONNX","ONNX FP16","TensorRT","TensorRT FP16","PyTorch"]=Query(alias="format"),
-    precision: float=Query(ge=0,le=100),
-    recall: float=Query(ge=0,le=100),
+    precision: float|None=Query(default=None,ge=0,le=100),
+    recall: float|None=Query(default=None,ge=0,le=100),
     filename: str=Query(min_length=1,max_length=255),
 ):
     """Stream a locally selected model into MODEL_DIR and register it atomically.
@@ -2170,6 +2177,8 @@ async def upload_model_file(
     a validated extension; the persisted filename is always derived from the
     validated model name.
     """
+    if (precision is None) != (recall is None):
+        raise HTTPException(422,"Укажите Precision и Recall вместе или оставьте оба поля пустыми для теста на камере")
     source_filename,extension=_uploaded_model_file_info(model_format,filename)
     if rows("SELECT 1 FROM model_registry WHERE name=?",(name,)):
         raise HTTPException(409,"Модель с таким именем уже существует")
