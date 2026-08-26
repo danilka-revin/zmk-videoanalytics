@@ -182,6 +182,17 @@ try:
         MODEL_PRESETS = json.loads(_ZMK)
 except (ValueError, TypeError):
     pass
+# Each role is executed as an independent model in the inference pipeline.
+# A general model stays available as the compatibility/primary model, while
+# specialised slots let an operator combine best-of-breed detectors.
+MODEL_PIPELINE_ROLES={
+    "people":"Люди",
+    "helmet":"Каски",
+    "workwear":"Спецодежда / жилеты",
+    "phone":"Телефоны",
+    "smoking":"Курение",
+    "zone":"Опасные зоны",
+}
 UPDATE_TOKEN = os.getenv("ZMK_UPDATE_TOKEN", "").strip()
 SEED_TEST_DATA = os.getenv("ZMK_SEED_TEST_DATA", "false").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -460,7 +471,7 @@ def init_db():
     legacy_telegram_enabled=bool(legacy_telegram_enabled_row and legacy_telegram_enabled_row[0]=='true')
     legacy_critical_alerts=bool(legacy_critical_alerts_row and legacy_critical_alerts_row[0]=='true')
     config_defaults={
-        "active_model":"", "active_model_disabled":"false", "ppe_trial_previous_model":"", "model_test_mode":"false", "auth_email":"", "auth_password_must_change":str(True).lower(), "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
+        "active_model":"", "active_model_slots":"{}", "active_model_disabled":"false", "ppe_trial_previous_model":"", "model_test_mode":"false", "auth_email":"", "auth_password_must_change":str(True).lower(), "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
         "retention_days":"90", "archive_quality":"90", "archive_clip_seconds":"10",
         "inference_fps":"8", "inference_device":"cuda:0", "batch_size":"4", "nms_iou":"0.45",
         "helmet_conf":"0.85", "vest_conf":"0.80", "phone_conf":"0.78", "smoking_conf":"0.80", "restricted_zone_conf":"0.82", "immobility_conf":"0.80", "min_model_precision":"90", "min_model_recall":"85",
@@ -1005,6 +1016,8 @@ class ModelIn(BaseModel):
     source:str=Field(default="external",max_length=200)
     artifact_uri:str=Field(min_length=1,max_length=1000)
     checksum:str=Field(default="",max_length=128,pattern=r"^[a-fA-F0-9]*$")
+class ModelSlotIn(BaseModel):
+    role:Literal["people","helmet","workwear","phone","smoking","zone"]
 class ModelBulkDeleteIn(BaseModel):
     names:list[str]=Field(min_length=1,max_length=200)
     deactivate_active:bool=True
@@ -1400,15 +1413,42 @@ def internal_cameras(): return rows("SELECT id,name,rtsp_url,fps_limit,enabled,r
 def inference_heartbeat(payload:InferenceHeartbeat):
     con=db(); con.execute("INSERT INTO worker_status(name,status,detail,camera_count,updated_at,model_name,model_status,model_error) VALUES('inference',?,?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET status=excluded.status,detail=excluded.detail,camera_count=excluded.camera_count,updated_at=excluded.updated_at,model_name=excluded.model_name,model_status=excluded.model_status,model_error=excluded.model_error",(payload.status,payload.detail,payload.camera_count,now_iso(),payload.model_name,payload.model_status,payload.model_error)); con.commit(); con.close()
 
-@app.get("/api/internal/active-model")
-def internal_active_model():
-    data=rows("SELECT m.name,m.format,m.artifact_uri,m.checksum,m.source FROM model_registry m JOIN settings s ON s.key='active_model' AND s.value=m.name WHERE m.status='ready'")
+def active_model_slots() -> dict[str,str]:
+    """Return the validated specialised model mapping stored in settings."""
+    try:
+        raw=json.loads(_auth_setting("active_model_slots","{}"))
+    except (TypeError,ValueError,json.JSONDecodeError):
+        return {}
+    if not isinstance(raw,dict):
+        return {}
+    return {role:name for role,name in raw.items() if role in MODEL_PIPELINE_ROLES and isinstance(name,str) and re.fullmatch(r"[A-Za-z0-9._-]{2,120}",name)}
+
+
+def _internal_model_info(name: str, *, test_mode: bool = False) -> dict[str,Any] | None:
+    data=rows("SELECT name,format,artifact_uri,checksum,source FROM model_registry WHERE name=? AND status='ready'",(name,))
     if not data:
         return None
+    data[0]["test_mode"]=test_mode
+    return data[0]
+
+
+@app.get("/api/internal/active-model")
+def internal_active_model():
+    active=_auth_setting("active_model","")
     # Test mode still loads and paints real boxes, but worker suppresses event
     # delivery so an unvalidated model cannot create production alerts.
-    data[0]["test_mode"]=con_value("model_test_mode","false")=="true"
-    return data[0]
+    return _internal_model_info(active,test_mode=con_value("model_test_mode","false")=="true") if active else None
+
+
+@app.get("/api/internal/active-models")
+def internal_active_models():
+    """Independent specialised models used together on each camera frame."""
+    slots=[]
+    for role,name in active_model_slots().items():
+        info=_internal_model_info(name)
+        if info:
+            slots.append({"role":role,**info})
+    return {"primary":internal_active_model(),"slots":slots}
 
 import re as _re
 
@@ -1725,6 +1765,9 @@ def reject_event(event_id:int,payload:AckIn):
 def ingest_detections(payload:DetectionBatch):
     """Validated contract from inference workers to the event subsystem."""
     con=db(); con.execute("BEGIN IMMEDIATE"); active=con.execute("SELECT value FROM settings WHERE key='active_model'").fetchone()[0]
+    slot_models=set(active_model_slots().values())
+    active_models={str(active)} if active else set()
+    active_models.update(slot_models)
     thresholds={"no_helmet":"helmet_conf","no_vest":"vest_conf","phone_usage":"phone_conf","smoking":"smoking_conf","restricted_zone":"restricted_zone_conf","immobility":"immobility_conf"}
     cooldown_row=con.execute("SELECT value FROM settings WHERE key='event_cooldown_seconds'").fetchone()
     try: cooldown=max(0,int(float(cooldown_row[0]))) if cooldown_row else 30
@@ -1743,7 +1786,7 @@ def ingest_detections(payload:DetectionBatch):
             now=datetime.now(TZ)
             if event_time>now+timedelta(minutes=10) or event_time<now-timedelta(days=7): reason="timestamp_out_of_range"
         if not reason:
-            if d.model_name != active: reason=f"stale_model: active={active}"
+            if d.model_name not in active_models: reason=f"stale_model: active={','.join(sorted(active_models)) or 'none'}"
             elif not cam: reason="unknown_camera"
             elif cam[0] != "online" or not cam[1] or cam_age is None or cam_age>CAMERA_TELEMETRY_STALE_SECONDS: reason="camera_unavailable"
             else:
@@ -1757,13 +1800,13 @@ def ingest_detections(payload:DetectionBatch):
         severity="critical" if d.event_type in {"restricted_zone","immobility"} else "high" if d.event_type in {"no_helmet","smoking"} else "medium"
         cur=con.execute("INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id,external_id) VALUES(?,?,?,?,?,?,?)",(normalized_timestamp,d.camera_id,d.event_type,severity,d.confidence,d.person_id,d.detection_id))
         accepted.append({"index":i,"event_id":cur.lastrowid})
-    con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","inference_gateway",f"batch model={active} accepted={len(accepted)} rejected={len(rejected)}"))
+    con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","inference_gateway",f"batch models={','.join(sorted(active_models)) or 'none'} accepted={len(accepted)} rejected={len(rejected)}"))
     webhook={r[0]:r[1] for r in con.execute("SELECT key,value FROM settings WHERE key IN ('webhook_enabled','webhook_url','webhook_timeout')").fetchall()}; con.commit(); con.close()
     if accepted and webhook.get('webhook_enabled')=='true' and webhook.get('webhook_url'):
-        try: httpx.post(webhook['webhook_url'],json={"source":"zmk-vision","model":active,"events":accepted,"timestamp":now_iso()},timeout=float(webhook.get('webhook_timeout','5'))).raise_for_status()
+        try: httpx.post(webhook['webhook_url'],json={"source":"zmk-vision","model":active or None,"models":sorted(active_models),"events":accepted,"timestamp":now_iso()},timeout=float(webhook.get('webhook_timeout','5'))).raise_for_status()
         except httpx.HTTPError as exc:
             logcon=db(); logcon.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"ERROR","integration",f"Webhook delivery failed: {str(exc)[:300]}")); logcon.commit(); logcon.close()
-    return {"active_model":active,"accepted":accepted,"rejected":rejected,"received":len(payload.detections)}
+    return {"active_model":active,"active_models":sorted(active_models),"accepted":accepted,"rejected":rejected,"received":len(payload.detections)}
 
 @app.get("/api/admin/config")
 def get_config():
@@ -2009,17 +2052,75 @@ def _model_runtime_view(name: str, active: bool, worker: dict[str,Any]) -> dict[
 @app.get("/api/models")
 def models():
     active=rows("SELECT value FROM settings WHERE key='active_model'")[0]["value"]
+    slots=active_model_slots()
     test_mode=con_value("model_test_mode","false")=="true"
     limits={r["key"]:float(r["value"]) for r in rows("SELECT key,value FROM settings WHERE key IN ('min_model_precision','min_model_recall')")}
     worker=inference_worker_state()
     data=rows("SELECT name,format,status,precision,recall,trained_at,source,artifact_uri,checksum FROM model_registry ORDER BY id DESC")
     for item in data:
         item["active"]=item["name"]==active
+        item["slot_roles"]=[role for role,name in slots.items() if name==item["name"]]
+        item["pipeline_active"]=bool(item["slot_roles"])
         item["trial_eligible"]=_is_trial_preset_source(item.get("source"))
         item["trial_mode"]=bool(item["active"] and item["trial_eligible"] and not _model_meets_quality(item.get("precision"),item.get("recall"),limits))
         item["test_mode"]=bool(item["active"] and test_mode)
         item["runtime"]=_model_runtime_view(str(item["name"]),bool(item["active"]),worker)
     return data
+
+
+def _pipeline_settings_from_connection(con: sqlite3.Connection) -> dict[str,str]:
+    row=con.execute("SELECT value FROM settings WHERE key='active_model_slots'").fetchone()
+    try:
+        raw=json.loads(row[0] if row else "{}")
+    except (TypeError,ValueError,json.JSONDecodeError):
+        raw={}
+    return {role:name for role,name in (raw.items() if isinstance(raw,dict) else ()) if role in MODEL_PIPELINE_ROLES and isinstance(name,str) and re.fullmatch(r"[A-Za-z0-9._-]{2,120}",name)}
+
+
+@app.get("/api/models/pipeline")
+def model_pipeline():
+    slots=active_model_slots()
+    records={item["name"]:item for item in rows("SELECT name,format,status,precision,recall,source FROM model_registry WHERE status='ready'")}
+    return {"roles":[{"id":role,"label":label,"model":slots.get(role),"ready":bool(slots.get(role) in records),"model_info":records.get(slots.get(role,""))} for role,label in MODEL_PIPELINE_ROLES.items()],"slots":slots}
+
+
+@app.post("/api/models/{name}/activate-slot")
+def activate_model_slot(name: str, payload: ModelSlotIn):
+    con=db()
+    try:
+        model=con.execute("SELECT status,precision,recall,source,artifact_uri FROM model_registry WHERE name=?",(name,)).fetchone()
+        if not model:
+            raise HTTPException(404,"Модель не найдена")
+        if model[0]!="ready":
+            raise HTTPException(409,"Модель ещё не готова")
+        _ensure_managed_model_artifact(model[3],model[4])
+        limits={row[0]:float(row[1]) for row in con.execute("SELECT key,value FROM settings WHERE key IN ('min_model_precision','min_model_recall')").fetchall()}
+        if not _model_meets_quality(model[1],model[2],limits):
+            raise HTTPException(409,"Для production-контура отдельная модель должна пройти validation: укажите Precision и Recall не ниже quality gate или используйте тест на камере.")
+        slots=_pipeline_settings_from_connection(con)
+        slots[payload.role]=name
+        con.execute("INSERT INTO settings(key,value) VALUES('active_model_slots',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps(slots,ensure_ascii=False,sort_keys=True),))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","model_manager",f"Pipeline slot {payload.role} -> {name}"))
+        con.commit()
+        return {"role":payload.role,"model":name,"slots":slots}
+    finally:
+        con.close()
+
+
+@app.delete("/api/models/pipeline/{role}")
+def deactivate_model_slot(role: str):
+    if role not in MODEL_PIPELINE_ROLES:
+        raise HTTPException(404,"Слот модели не найден")
+    con=db()
+    try:
+        slots=_pipeline_settings_from_connection(con)
+        previous=slots.pop(role,None)
+        con.execute("INSERT INTO settings(key,value) VALUES('active_model_slots',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps(slots,ensure_ascii=False,sort_keys=True),))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","model_manager",f"Pipeline slot {role} cleared"))
+        con.commit()
+        return {"role":role,"cleared":bool(previous),"slots":slots}
+    finally:
+        con.close()
 
 
 @app.post("/api/models",status_code=201)
@@ -2378,8 +2479,13 @@ def _delete_model(name:str, *, deactivate:bool=False):
         con.execute("UPDATE settings SET value=? WHERE key='active_model_disabled'",("false" if active_after else "true",))
         con.execute("UPDATE settings SET value='false' WHERE key='model_test_mode'")
         con.execute("UPDATE settings SET value='' WHERE key='ppe_trial_previous_model'")
+    slots=_pipeline_settings_from_connection(con)
+    removed_slots=[role for role,model_name in slots.items() if model_name==name]
+    if removed_slots:
+        slots={role:model_name for role,model_name in slots.items() if model_name!=name}
+        con.execute("INSERT INTO settings(key,value) VALUES('active_model_slots',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(json.dumps(slots,ensure_ascii=False,sort_keys=True),))
     con.execute("DELETE FROM model_registry WHERE name=?",(name,))
-    con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"Model deleted: {name} (source={source}, deactivated={deactivated_active})"))
+    con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","model_manager",f"Model deleted: {name} (source={source}, deactivated={deactivated_active}, slots={','.join(removed_slots) or 'none'})"))
     con.commit(); con.close()
     removed_file=False
     if source and source.startswith(("preset:","upload:")) and artifact_uri.startswith("file://"):

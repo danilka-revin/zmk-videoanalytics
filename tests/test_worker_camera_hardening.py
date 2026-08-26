@@ -589,3 +589,65 @@ def test_compose_forwards_all_camera_runtime_settings():
         "CAMERA_HEARTBEAT_SECONDS",
     ):
         assert variable in env
+
+
+def test_separate_person_and_helmet_models_are_combined(worker_mod):
+    class Tensor:
+        def __init__(self, value): self.value = value
+        def cpu(self): return self
+        def tolist(self): return self.value
+
+    person_result = types.SimpleNamespace(boxes=types.SimpleNamespace(
+        xyxy=Tensor([[0, 0, 100, 200]]), cls=Tensor([0]), conf=Tensor([.97]),
+    ))
+    helmet_result = types.SimpleNamespace(boxes=types.SimpleNamespace(
+        xyxy=Tensor([]), cls=Tensor([]), conf=Tensor([]),
+    ))
+
+    class PersonModel:
+        def __init__(self): self.names = {0: "person"}
+        def predict(self, *_args, **_kwargs): return [person_result]
+
+    class HelmetModel:
+        def __init__(self): self.names = {0: "helmet"}
+        def predict(self, *_args, **_kwargs): return [helmet_result]
+
+    runtime = worker_mod.Runtime()
+    runtime.model = PersonModel()
+    runtime.model_name = "people-model"
+    runtime.slot_models["helmet"] = worker_mod.SlotModelRuntime(
+        role="helmet", info={"name": "helmet-model"}, model=HelmetModel(), device="cpu",
+    )
+    posted = []
+
+    async def post(path, data):
+        posted.append((path, data))
+        return {"accepted": []}
+
+    runtime.post = post
+    session = worker_mod.CameraSession(config=worker_mod.CameraConfig.from_api(_camera()))
+    visual = asyncio.run(runtime._infer(session, _FakeImage()))
+
+    assert visual is not None and {box.model_name for box in visual.boxes} == {"people-model"}
+    assert visual.helmet_violations
+    assert posted and posted[0][1]["detections"][0]["model_name"] == "people-model"
+    assert posted[0][1]["detections"][0]["event_type"] == "no_helmet"
+
+
+def test_pipeline_slot_loads_independently_of_primary(worker_mod):
+    runtime = worker_mod.Runtime()
+    loaded = object()
+
+    async def fake_load(info):
+        return str(info["name"]), loaded, "cpu"
+
+    runtime._load_model_async = fake_load
+
+    async def scenario():
+        await runtime._refresh_slots([{"role": "helmet", "name": "helmet-model", "artifact_uri": "file:///models/helmet.onnx"}])
+        await asyncio.sleep(0)
+        await runtime._refresh_slots([{"role": "helmet", "name": "helmet-model", "artifact_uri": "file:///models/helmet.onnx"}])
+
+    asyncio.run(scenario())
+    assert runtime.slot_models["helmet"].model is loaded
+    assert runtime._ready_models() == [("helmet-model", loaded, "cpu")]
