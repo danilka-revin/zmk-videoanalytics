@@ -410,7 +410,12 @@ SMTP_USERNAME=vision@example.ru
 SMTP_PASSWORD=your_smtp_password
 SMTP_FROM=vision@example.ru
 SMTP_USE_TLS=true
+SMTP_USE_SSL=false
 ```
+
+Для SMTP с implicit TLS на порту `465` установите `SMTP_USE_SSL=true` и `SMTP_USE_TLS=false`.
+
+В разделе **Персонализация → Доступ** можно просмотреть активные browser-сеансы и завершить незнакомые или все остальные сеансы.
 
 Если SMTP не настроен, система не выдаёт код в интерфейс и честно сообщит, что письмо отправить нельзя.
 

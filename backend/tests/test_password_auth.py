@@ -94,3 +94,50 @@ def test_email_binding_and_recovery_code_resets_password(monkeypatch):
         assert reset.status_code == 200, reset.text
         assert client.post("/api/auth/logout").status_code == 200
         assert client.post("/api/auth/login", json={"password": "recovered-password"}).status_code == 200
+
+
+def test_password_session_list_and_remote_revocation(monkeypatch):
+    enable_password_auth(monkeypatch)
+    with TestClient(main.app) as client:
+        assert client.post("/api/auth/login", json={"password": "1234"}).status_code == 200
+        assert client.put("/api/auth/password", json={"current_password": "1234", "new_password": "session-control-password"}).status_code == 200
+        # A second sign-in produces another valid browser session while keeping
+        # this client's latest cookie as the current one.
+        assert client.post("/api/auth/login", json={"password": "session-control-password"}).status_code == 200
+        listed = client.get("/api/auth/sessions")
+        assert listed.status_code == 200, listed.text
+        sessions = listed.json()["sessions"]
+        assert len(sessions) == 2
+        assert sum(bool(session["current"]) for session in sessions) == 1
+        other = next(session for session in sessions if not session["current"])
+        revoked = client.delete(f"/api/auth/sessions/{other['id']}")
+        assert revoked.status_code == 200 and revoked.json()["current"] is False
+        assert len(client.get("/api/auth/sessions").json()["sessions"]) == 1
+
+
+def test_smtp_implicit_ssl_skips_starttls(monkeypatch):
+    calls: list[str] = []
+
+    class FakeClient:
+        def __enter__(self):
+            calls.append("enter")
+            return self
+
+        def __exit__(self, *_args):
+            calls.append("exit")
+
+        def starttls(self, **_kwargs):
+            calls.append("starttls")
+
+        def login(self, *_args):
+            calls.append("login")
+
+        def send_message(self, _message):
+            calls.append("send")
+
+    monkeypatch.setattr(main, "_smtp_ready", lambda: True)
+    monkeypatch.setattr(main, "SMTP_USE_SSL", True)
+    monkeypatch.setattr(main, "SMTP_USE_TLS", True)
+    monkeypatch.setattr(main.smtplib, "SMTP_SSL", lambda *_args, **_kwargs: FakeClient())
+    main._send_recovery_email("owner@example.test", "123456")
+    assert "send" in calls and "starttls" not in calls

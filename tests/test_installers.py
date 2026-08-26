@@ -135,6 +135,7 @@ def test_compose_and_environment_are_consistent():
     assert compose['services']['api']['environment']['ZMK_PASSWORD_AUTH'] == '${ZMK_PASSWORD_AUTH:-true}'
     assert compose['services']['api']['environment']['ZMK_INITIAL_PASSWORD'] == '${ZMK_INITIAL_PASSWORD:-1234}'
     assert compose['services']['api']['environment']['TELEGRAM_ADMIN_USERNAMES'] == '${TELEGRAM_ADMIN_USERNAMES:-}'
+    assert compose['services']['api']['environment']['SMTP_USE_SSL'] == '${SMTP_USE_SSL:-false}'
     assert compose['services']['api']['environment']['ZMK_BOT_API_TOKEN_FILE'] == '/bot-tokens/.api-token'
     assert compose['services']['api']['ports'] == ['127.0.0.1:8000:8000']
     # Both messenger workers stay available and idle safely until the Admin → Боты
@@ -172,7 +173,7 @@ def test_compose_and_environment_are_consistent():
     lines = [x for x in (ROOT/'.env.example').read_text().splitlines() if x and not x.startswith('#')]
     keys = [x.split('=',1)[0] for x in lines]
     assert len(keys) == len(set(keys))
-    assert {'MESSENGER_PROVIDER','ZMK_API_KEY','ZMK_PASSWORD_AUTH','ZMK_INITIAL_PASSWORD','SMTP_HOST','TELEGRAM_BOT_TOKEN','TELEGRAM_ADMIN_USERNAMES','MAX_BOT_TOKEN','MAX_ADMIN_IDS','MODEL_UPLOAD_MAX_BYTES','POSTGRES_PASSWORD','MINIO_ROOT_PASSWORD'} <= set(keys)
+    assert {'MESSENGER_PROVIDER','ZMK_API_KEY','ZMK_PASSWORD_AUTH','ZMK_INITIAL_PASSWORD','SMTP_HOST','SMTP_USE_SSL','TELEGRAM_BOT_TOKEN','TELEGRAM_ADMIN_USERNAMES','MAX_BOT_TOKEN','MAX_ADMIN_IDS','MODEL_UPLOAD_MAX_BYTES','POSTGRES_PASSWORD','MINIO_ROOT_PASSWORD'} <= set(keys)
 
 
 def test_release_contains_installation_assets():

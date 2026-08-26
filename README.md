@@ -352,6 +352,7 @@ Web Admin ── Telegram/MAX Bot ── Mini App ── СКУД Webhook
 | `GET` | `/api/reports/errors` | Отчёт по ошибкам |
 | `GET` | `/api/reports/events.csv` | Русская CSV-таблица событий |
 | `GET` | `/api/reports/events.zip` | ZIP: CSV, HTML-отчёт и кадры нарушений |
+| `GET` | `/api/reports/support.zip` | Безопасный пакет диагностики: ресурсы, статус камер, аналитика и сводка ошибок |
 | `GET` | `/api/system-health` | Состояние ресурсов |
 
 ## Реальное обучение на NVIDIA GPU
@@ -455,7 +456,12 @@ SMTP_USERNAME=vision@example.ru
 SMTP_PASSWORD=replace-with-smtp-password
 SMTP_FROM=vision@example.ru
 SMTP_USE_TLS=true
+SMTP_USE_SSL=false
 ```
+
+Для SMTP с implicit TLS на порту `465` установите `SMTP_USE_SSL=true` и `SMTP_USE_TLS=false`.
+
+В **Персонализация → Доступ** можно просмотреть активные browser-сеансы, завершить конкретный незнакомый сеанс или сразу завершить все остальные сеансы.
 
 Код восстановления действует ограниченное время и отправляется только на привязанный адрес. Telegram Mini App и сервисные боты используют отдельные проверенные Telegram/service-токены и не требуют ввода browser-пароля.
 

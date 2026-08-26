@@ -79,6 +79,9 @@ SMTP_USERNAME=os.getenv("SMTP_USERNAME","").strip()
 SMTP_PASSWORD=os.getenv("SMTP_PASSWORD","")
 SMTP_FROM=os.getenv("SMTP_FROM","").strip()
 SMTP_USE_TLS=os.getenv("SMTP_USE_TLS","true").strip().lower() not in {"0","false","no","off"}
+# Port 465 uses implicit TLS; port 587 normally uses STARTTLS. SSL takes
+# precedence when both toggles are accidentally enabled.
+SMTP_USE_SSL=os.getenv("SMTP_USE_SSL","false").strip().lower() in {"1","true","yes","on"}
 _auth_attempts: dict[str,list[float]] = {}
 try: RATE_LIMIT_PER_MINUTE = max(10,int(os.getenv("RATE_LIMIT_PER_MINUTE", "120")))
 except ValueError: RATE_LIMIT_PER_MINUTE = 120
@@ -275,13 +278,18 @@ def _auth_session(request: Request) -> dict[str,Any] | None:
         return None
     con=db()
     try:
-        row=con.execute("SELECT id,expires_at FROM auth_sessions WHERE token_hash=?",(_auth_token_digest(token),)).fetchone()
+        row=con.execute("SELECT id,expires_at,last_seen_at FROM auth_sessions WHERE token_hash=?",(_auth_token_digest(token),)).fetchone()
         if not row:
             return None
         if str(row[1])<=now_iso():
             con.execute("DELETE FROM auth_sessions WHERE id=?",(row[0],)); con.commit()
             return None
-        return {"id":str(row[0]),"expires_at":str(row[1])}
+        last_seen=str(row[2] or "")
+        # Keep the active-session view useful without writing SQLite for every
+        # read-only dashboard poll.
+        if timestamp_age_seconds(last_seen) is None or timestamp_age_seconds(last_seen)>300:
+            last_seen=now_iso(); con.execute("UPDATE auth_sessions SET last_seen_at=? WHERE id=?",(last_seen,row[0])); con.commit()
+        return {"id":str(row[0]),"expires_at":str(row[1]),"last_seen_at":last_seen}
     finally:
         con.close()
 
@@ -318,6 +326,15 @@ def _set_auth_cookie(response: Response, token: str, request: Request) -> None:
 def _allow_auth_attempt(request: Request) -> bool:
     now=time.time()
     source=request.headers.get("X-Real-IP") or (request.client.host if request.client else "unknown")
+    # A hostile stream of spoofed source labels must not grow the in-memory
+    # login limiter forever. Keep the same ten-minute policy while bounding it.
+    if len(_auth_attempts)>=10_000 and source not in _auth_attempts:
+        for key,values in list(_auth_attempts.items()):
+            kept=[value for value in values if now-value<600]
+            if kept: _auth_attempts[key]=kept
+            else: _auth_attempts.pop(key,None)
+        if len(_auth_attempts)>=10_000:
+            return False
     attempts=[value for value in _auth_attempts.get(source,[]) if now-value<600]
     _auth_attempts[source]=attempts
     if len(attempts)>=5:
@@ -335,8 +352,12 @@ def _send_recovery_email(address: str, code: str) -> None:
     message["From"]=SMTP_FROM
     message["To"]=address
     message.set_content(f"Код восстановления ZMK Vision: {code}\n\nОн действует {AUTH_RECOVERY_MINUTES} минут. Если вы не запрашивали восстановление, проигнорируйте это письмо.")
-    with smtplib.SMTP(SMTP_HOST,SMTP_PORT,timeout=20) as client:
-        if SMTP_USE_TLS:
+    if SMTP_USE_SSL:
+        client=smtplib.SMTP_SSL(SMTP_HOST,SMTP_PORT,timeout=20,context=ssl.create_default_context())
+    else:
+        client=smtplib.SMTP(SMTP_HOST,SMTP_PORT,timeout=20)
+    with client:
+        if SMTP_USE_TLS and not SMTP_USE_SSL:
             client.starttls(context=ssl.create_default_context())
         if SMTP_USERNAME:
             client.login(SMTP_USERNAME,SMTP_PASSWORD)
@@ -681,6 +702,52 @@ def _require_password_session(request: Request) -> dict[str,Any]:
     if not session:
         raise HTTPException(401,"Требуется вход по паролю")
     return session
+
+
+@app.get("/api/auth/sessions")
+def auth_sessions(request: Request):
+    current=_require_password_session(request)
+    con=db()
+    try:
+        data=[]
+        for row in con.execute("SELECT id,created_at,expires_at,last_seen_at FROM auth_sessions WHERE expires_at>? ORDER BY last_seen_at DESC,created_at DESC",(now_iso(),)).fetchall():
+            data.append({"id":str(row[0]),"created_at":str(row[1]),"expires_at":str(row[2]),"last_seen_at":str(row[3]),"current":hmac.compare_digest(str(row[0]),current["id"])})
+        return {"sessions":data}
+    finally:
+        con.close()
+
+
+@app.post("/api/auth/sessions/revoke-others")
+def auth_revoke_other_sessions(request: Request):
+    current=_require_password_session(request)
+    con=db()
+    try:
+        cur=con.execute("DELETE FROM auth_sessions WHERE id!=?",(current["id"],))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth",f"Other password sessions revoked: {cur.rowcount}"))
+        con.commit()
+        return {"revoked":cur.rowcount}
+    finally:
+        con.close()
+
+
+@app.delete("/api/auth/sessions/{session_id}")
+def auth_revoke_session(session_id: str, request: Request, response: Response):
+    current=_require_password_session(request)
+    if not re.fullmatch(r"[a-f0-9]{32}",session_id):
+        raise HTTPException(404,"Сеанс не найден")
+    con=db()
+    try:
+        cur=con.execute("DELETE FROM auth_sessions WHERE id=?",(session_id,))
+        if not cur.rowcount:
+            raise HTTPException(404,"Сеанс не найден")
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth","Password session revoked"))
+        con.commit()
+    finally:
+        con.close()
+    current_deleted=hmac.compare_digest(session_id,current["id"])
+    if current_deleted:
+        response.delete_cookie(AUTH_COOKIE_NAME,path="/")
+    return {"revoked":True,"current":current_deleted}
 
 
 @app.put("/api/auth/password")
@@ -2711,6 +2778,34 @@ def error_report_csv(hours:int=Query(24,ge=1,le=720)):
     since=(datetime.now(TZ)-timedelta(hours=hours)).isoformat(); data=sanitize_csv_rows(rows("SELECT timestamp,level,service,camera_id,message FROM logs WHERE level IN ('WARNING','ERROR','CRITICAL') AND timestamp>=? ORDER BY id DESC",(since,)))
     out=io.StringIO(); fields=['timestamp','level','service','camera_id','message']; w=csv.DictWriter(out,fieldnames=fields); w.writeheader(); w.writerows(data)
     return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":"attachment; filename=zmk-error-report.csv"})
+
+
+@app.get("/api/reports/support.zip")
+def support_bundle(hours:int=Query(24,ge=1,le=720)):
+    """Download a secret-free diagnostic package for an operator or support team.
+
+    It deliberately exports health, safe camera state, statistics and error
+    counts only; RTSP URLs, API keys, bot tokens, emails and raw log messages
+    are excluded from the package.
+    """
+    # Do not make a support download wait for DNS/TCP probes on every RTSP
+    # endpoint. The package captures the safe live camera state; an operator
+    # can still run the full TCP diagnostic explicitly in the UI.
+    health=system_health_data()
+    camera_state=cameras()
+    analytics=build_overview_analytics(hours)
+    errors=error_report(hours)
+    archive=io.BytesIO()
+    with zipfile.ZipFile(archive,"w",compression=zipfile.ZIP_DEFLATED,compresslevel=6) as bundle:
+        bundle.writestr("system-health.json",json.dumps(health,ensure_ascii=False,indent=2).encode())
+        bundle.writestr("camera-status.json",json.dumps({"generated_at":now_iso(),"worker":health.get("worker"),"cameras":camera_state},ensure_ascii=False,indent=2).encode())
+        bundle.writestr("analytics.json",json.dumps(analytics,ensure_ascii=False,indent=2).encode())
+        bundle.writestr("error-summary.json",json.dumps({"period_hours":hours,"generated_at":errors.get("generated_at"),"summary":errors.get("summary",{}),"count":len(errors.get("items",[]))},ensure_ascii=False,indent=2).encode())
+        bundle.writestr("README.txt",("ZMK Vision — пакет диагностики\n\n"
+            "Внутри: состояние ресурсов, безопасное состояние камер, аналитика и сводка ошибок.\n"
+            "Пакет не содержит RTSP URL, пароли, API-ключи, токены ботов, email и тексты журналов.\n"
+            f"Период аналитики: {hours} ч. Сформировано: {now_iso()}.\n").encode())
+    return StreamingResponse(iter([archive.getvalue()]),media_type="application/zip",headers={"Content-Disposition":"attachment; filename=zmk-support-bundle.zip"})
 # Search is intentionally kept local and transparent: it never queries or exposes
 # RTSP URLs/artifact locations, but it understands the words operators use in
 # Russian and English.  SQLite LIKE is case-sensitive for Cyrillic on many
