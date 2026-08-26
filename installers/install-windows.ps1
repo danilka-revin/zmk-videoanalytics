@@ -105,12 +105,13 @@ switch ($messenger.ToLowerInvariant()) {
     Set-DotEnvValue "MESSENGER_PROVIDER" "telegram"
   }
   "max" {
-    $token = if ($NonInteractive) { $env:MAX_BOT_TOKEN } else { Read-Host "MAX bot token from @MasterBot" }
-    if ($token -notmatch '^[A-Za-z0-9._:-]{20,500}$') { throw "MAX token format is invalid" }
-    $admin = if ($NonInteractive) { $env:MAX_ADMIN_IDS } else { Read-Host "Your MAX numeric ID (admin)" }
-    if ($admin -notmatch '^\d+(,\d+)*$') { throw "MAX admin ID must contain only numeric IDs separated by commas" }
+    $token = if ($NonInteractive) { $env:MAX_BOT_TOKEN } else { Read-Host "MAX bot token from @MasterBot (Enter to configure later)" }
+    if ($token -and $token -notmatch '^[A-Za-z0-9._:-]{20,500}$') { throw "MAX token format is invalid" }
+    $admin = if ($NonInteractive) { $env:MAX_ADMIN_IDS } else { Read-Host "Your MAX numeric ID (optional)" }
+    if ($admin -and $admin -notmatch '^\d+(,\d+)*$') { throw "MAX admin ID must contain only numeric IDs separated by commas" }
     Set-DotEnvValue "MAX_BOT_TOKEN" $token; Set-DotEnvValue "MAX_ADMIN_IDS" $admin
     Set-DotEnvValue "MESSENGER_PROVIDER" "max"
+    if (-not $token) { Write-Host "MAX will start in safe waiting mode. Add the official token later in Admin -> Боты." -ForegroundColor Yellow }
   }
   "none" { Set-DotEnvValue "MESSENGER_PROVIDER" "none" }
   default { throw "MESSENGER_PROVIDER must be telegram, max or none" }

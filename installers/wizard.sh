@@ -60,11 +60,12 @@ run_config(){
       ;;
     max)
       if [[ -n "${NONINTERACTIVE:-}" ]]; then TOKEN="${MAX_BOT_TOKEN:-}"; ADMIN="${MAX_ADMIN_IDS:-}"
-      else read -r -p "MAX bot token от @MasterBot: " TOKEN; read -r -p "Ваш MAX numeric ID (admin): " ADMIN; fi
-      if ! [[ "$TOKEN" =~ ^[A-Za-z0-9._:-]{20,500}$ ]]; then echo "Ошибка: неверный формат MAX token"; return 1; fi
-      if ! [[ "$ADMIN" =~ ^[0-9]+(,[0-9]+)*$ ]]; then echo "Ошибка: MAX admin ID должен состоять из цифр через запятую"; return 1; fi
+      else read -r -p "MAX bot token от @MasterBot (Enter — настроить позже): " TOKEN; read -r -p "Ваш MAX numeric ID (admin, Enter — настроить позже): " ADMIN; fi
+      if [[ -n "$TOKEN" && ! "$TOKEN" =~ ^[A-Za-z0-9._:-]{20,500}$ ]]; then echo "Ошибка: неверный формат MAX token"; return 1; fi
+      if [[ -n "$ADMIN" && ! "$ADMIN" =~ ^[0-9]+(,[0-9]+)*$ ]]; then echo "Ошибка: MAX admin ID должен состоять из цифр через запятую"; return 1; fi
       set_env MAX_BOT_TOKEN "$TOKEN"; set_env MAX_ADMIN_IDS "$ADMIN"
       set_env MESSENGER_PROVIDER "max"
+      if [[ -z "$TOKEN" ]]; then echo "MAX будет запущен в безопасном режиме ожидания. Откройте Admin → Боты, чтобы добавить официальный token позднее."; fi
       ;;
     none)
       # Do not erase existing provider secrets: after the stack is running,

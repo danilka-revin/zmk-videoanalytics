@@ -180,3 +180,18 @@ def test_release_contains_installation_assets():
     for path in ['installers/install-windows.ps1','installers/install-windows.bat','installers/install-linux.sh']:
         assert (ROOT/path).exists()
         assert path in workflow
+
+
+def test_max_wizard_allows_safe_waiting_mode_without_token(tmp_path):
+    (tmp_path / '.env.example').write_text((ROOT / '.env.example').read_text())
+    result = subprocess.run(
+        ['bash', '-c', 'source "$1"; NONINTERACTIVE=1 MESSENGER_PROVIDER=max MAX_BOT_TOKEN="" MAX_ADMIN_IDS="" ENABLE_INFERENCE=false run_config', '_', str(ROOT / 'installers/wizard.sh')],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    config = (tmp_path / '.env').read_text()
+    assert 'MESSENGER_PROVIDER=max' in config and 'MAX_BOT_TOKEN=' in config
+    assert 'безопасном режиме ожидания' in result.stdout
