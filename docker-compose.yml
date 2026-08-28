@@ -16,6 +16,7 @@ services:
       MODEL_DIR: /models
       # Maximum size of a locally uploaded model artifact (2 GB by default).
       MODEL_UPLOAD_MAX_BYTES: ${MODEL_UPLOAD_MAX_BYTES:-2000000000}
+      MODEL_TEST_CONF: ${MODEL_TEST_CONF:-0.10}
       ZMK_PASSWORD_AUTH: ${ZMK_PASSWORD_AUTH:-true}
       ZMK_INITIAL_PASSWORD: ${ZMK_INITIAL_PASSWORD:-1234}
       ZMK_AUTH_SESSION_HOURS: ${ZMK_AUTH_SESSION_HOURS:-12}
@@ -131,6 +132,7 @@ services:
       ZMK_WORKER_TOKEN_FILE: ${ZMK_WORKER_TOKEN_FILE:-/models/.worker-token}
       INFERENCE_DEVICE: ${INFERENCE_DEVICE:-auto}
       INFERENCE_CONF: ${INFERENCE_CONF:-0.5}
+      MODEL_TEST_CONF: ${MODEL_TEST_CONF:-0.10}
       # ffmpeg is resilient to damaged RTP/H.264 streams; set opencv only for
       # troubleshooting a known-good local camera.
       CAMERA_DECODER: ${CAMERA_DECODER:-ffmpeg}

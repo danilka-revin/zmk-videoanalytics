@@ -171,3 +171,5 @@ def test_unvalidated_upload_can_start_a_safe_camera_test(model_dir):
         assert client.post("/api/models/person-box-test/activate").status_code == 409
         tested = client.post("/api/models/person-box-test/activate-test")
         assert tested.status_code == 200 and tested.json()["test_mode"] is True
+        internal = client.get("/api/internal/active-model", headers={"X-Worker-Token": main.WORKER_TOKEN})
+        assert internal.status_code == 200 and internal.json()["test_conf"] == .10

@@ -132,6 +132,7 @@ def test_compose_and_environment_are_consistent():
     assert 'healthcheck' in compose['services']['api']
     assert compose['services']['api']['environment']['VIDEOANALYTICS_DB'] == '/app/data/videoanalytics.db'
     assert compose['services']['api']['environment']['MODEL_UPLOAD_MAX_BYTES'] == '${MODEL_UPLOAD_MAX_BYTES:-2000000000}'
+    assert compose['services']['api']['environment']['MODEL_TEST_CONF'] == '${MODEL_TEST_CONF:-0.10}'
     assert compose['services']['api']['environment']['ZMK_PASSWORD_AUTH'] == '${ZMK_PASSWORD_AUTH:-true}'
     assert compose['services']['api']['environment']['ZMK_INITIAL_PASSWORD'] == '${ZMK_INITIAL_PASSWORD:-1234}'
     assert compose['services']['api']['environment']['TELEGRAM_ADMIN_USERNAMES'] == '${TELEGRAM_ADMIN_USERNAMES:-}'
@@ -163,6 +164,7 @@ def test_compose_and_environment_are_consistent():
     assert compose['services']['api']['environment']['TRAINING_WORKER_URL'] == '${TRAINING_WORKER_URL:-http://training-worker:8010}'
     assert compose['services']['inference-worker']['profiles'] == ['inference']
     assert compose['services']['inference-worker']['build'] == './services/inference_worker'
+    assert compose['services']['inference-worker']['environment']['MODEL_TEST_CONF'] == '${MODEL_TEST_CONF:-0.10}'
     assert 'RUN nginx -t' in (ROOT/'frontend/Dockerfile').read_text()
     nginx = (ROOT/'frontend/nginx.conf').read_text()
     assert 'set $api_upstream http://api:8000' in nginx and 'proxy_pass $api_upstream' in nginx

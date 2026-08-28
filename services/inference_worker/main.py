@@ -72,6 +72,9 @@ def _worker_token() -> str:
 # the file on every internal call so a token provisioned after startup works.
 WORKER_TOKEN = _worker_token()
 CONF = _bounded_float("INFERENCE_CONF", 0.5, 0.01, 1.0)
+# Test mode deliberately starts lower than production so an uploaded model can
+# prove that it sees people before its validation metrics are known.
+TEST_CONF = _bounded_float("MODEL_TEST_CONF", 0.10, 0.01, 0.95)
 RTSP_TRANSPORT = os.getenv("RTSP_TRANSPORT", "auto").strip().lower()
 if RTSP_TRANSPORT not in {"auto", "tcp", "udp"}:
     RTSP_TRANSPORT = "auto"
@@ -489,6 +492,7 @@ class Runtime:
         self.model_name = ""
         # Explicit camera tests draw boxes but never deliver detections/events.
         self.model_test_mode = False
+        self.model_test_conf = TEST_CONF
         self.device = DEVICE_SETTING
         self._model_task: asyncio.Task[tuple[str, Any, str]] | None = None
         self._model_loading_name = ""
@@ -722,7 +726,7 @@ class Runtime:
         status = "running" if self.sessions else "idle"
         model_name, model_status, model_error = self._model_runtime()
         slot_detail=",".join(f"{state.role}:{state.info.get('name')}:{'ready' if state.model is not None else 'loading' if state.task is not None else 'error' if state.error else 'waiting'}" for state in self.slot_models.values()) or "none"
-        detail = f"cameras={len(self.sessions)} model={model_name or 'none'} slots={slot_detail} state={model_status} test={str(self.model_test_mode).lower()}"
+        detail = f"cameras={len(self.sessions)} model={model_name or 'none'} slots={slot_detail} state={model_status} test={str(self.model_test_mode).lower()} test_conf={self.model_test_conf:.2f}"
         if model_error:
             detail += f" error={model_error}"
         try:
@@ -836,6 +840,7 @@ class Runtime:
             self.model = None
             self.model_name = ""
             self.model_test_mode = False
+            self.model_test_conf = TEST_CONF
             self._model_loading_name = ""
             self._model_error = ""
             if not self._no_model_announced:
@@ -845,9 +850,14 @@ class Runtime:
 
         wanted_name = str(info["name"])
         requested_test_mode = bool(info.get("test_mode"))
+        try:
+            requested_test_conf=max(.01,min(.95,float(info.get("test_conf") if info.get("test_conf") is not None else TEST_CONF)))
+        except (TypeError,ValueError):
+            requested_test_conf=TEST_CONF
         self._no_model_announced = False
         if self.model_name == wanted_name and self.model is not None:
             self.model_test_mode = requested_test_mode
+            self.model_test_conf = requested_test_conf
             self._model_loading_name = wanted_name
             self._model_error = ""
             return
@@ -855,6 +865,7 @@ class Runtime:
         if self._model_task is not None:
             if not self._model_task.done():
                 self.model_test_mode = requested_test_mode
+                self.model_test_conf = requested_test_conf
                 return
             task = self._model_task
             self._model_task = None
@@ -887,6 +898,7 @@ class Runtime:
             session.next_inference_at = 0
         self._model_loading_name = wanted_name
         self.model_test_mode = requested_test_mode
+        self.model_test_conf = requested_test_conf
         self._model_error = ""
         self._model_task = asyncio.create_task(self._load_model_async(dict(info)), name=f"model-load-{wanted_name}")
         self._log(f"loading active model {wanted_name} in background", force=True)
@@ -1219,7 +1231,8 @@ class Runtime:
         async with self._inference_lock:
             for model_name,model,device in ready:
                 try:
-                    result=(await asyncio.to_thread(model.predict,image,conf=CONF,device=device,verbose=False))[0]
+                    confidence=self.model_test_conf if self.model_test_mode else CONF
+                    result=(await asyncio.to_thread(model.predict,image,conf=confidence,device=device,verbose=False))[0]
                     names=getattr(result,"names",None) or getattr(model,"names",{})
                     declared.update(model_semantics(names))
                     values=zip(result.boxes.xyxy.cpu().tolist(),result.boxes.cls.cpu().tolist(),result.boxes.conf.cpu().tolist())

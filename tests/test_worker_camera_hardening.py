@@ -651,3 +651,32 @@ def test_pipeline_slot_loads_independently_of_primary(worker_mod):
     asyncio.run(scenario())
     assert runtime.slot_models["helmet"].model is loaded
     assert runtime._ready_models() == [("helmet-model", loaded, "cpu")]
+
+
+def test_camera_test_uses_lower_test_confidence(worker_mod):
+    class Tensor:
+        def __init__(self, value): self.value = value
+        def cpu(self): return self
+        def tolist(self): return self.value
+
+    result = types.SimpleNamespace(boxes=types.SimpleNamespace(
+        xyxy=Tensor([[1, 1, 18, 19]]), cls=Tensor([0]), conf=Tensor([.2]),
+    ))
+    seen = []
+
+    class PersonModel:
+        def __init__(self): self.names = {0: "person"}
+        def predict(self, *_args, **kwargs):
+            seen.append(kwargs["conf"])
+            return [result]
+
+    runtime = worker_mod.Runtime()
+    runtime.model = PersonModel()
+    runtime.model_name = "person-test-model"
+    runtime.model_test_mode = True
+    runtime.model_test_conf = .10
+    session = worker_mod.CameraSession(config=worker_mod.CameraConfig.from_api(_camera()))
+    visual = asyncio.run(runtime._infer(session, _FakeImage()))
+
+    assert visual is not None and visual.boxes
+    assert seen == [.10]

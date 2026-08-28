@@ -103,6 +103,8 @@ MODEL_DIR = Path(os.getenv("MODEL_DIR", "")) if os.getenv("MODEL_DIR") else (DB_
 # artifacts can legitimately be hundreds of megabytes.
 try: MODEL_UPLOAD_MAX_BYTES=max(1_000_000,min(2_000_000_000,int(os.getenv("MODEL_UPLOAD_MAX_BYTES","2_000_000_000"))))
 except ValueError: MODEL_UPLOAD_MAX_BYTES=2_000_000_000
+try: MODEL_TEST_CONF_DEFAULT=max(.01,min(.95,float(os.getenv("MODEL_TEST_CONF",".10") or .10)))
+except ValueError: MODEL_TEST_CONF_DEFAULT=.10
 WORKER_TOKEN_FILE = Path(os.getenv("ZMK_WORKER_TOKEN_FILE", "")) if os.getenv("ZMK_WORKER_TOKEN_FILE") else (MODEL_DIR / ".worker-token")
 
 def provision_worker_token(token_file: Path, env_token: str | None = None) -> str:
@@ -473,7 +475,7 @@ def init_db():
     config_defaults={
         "active_model":"", "active_model_slots":"{}", "active_model_disabled":"false", "ppe_trial_previous_model":"", "model_test_mode":"false", "auth_email":"", "auth_password_must_change":str(True).lower(), "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
         "retention_days":"90", "archive_quality":"90", "archive_clip_seconds":"10",
-        "inference_fps":"8", "inference_device":"cuda:0", "batch_size":"4", "nms_iou":"0.45",
+        "inference_fps":"8", "inference_device":"cuda:0", "batch_size":"4", "nms_iou":"0.45", "model_test_conf":str(MODEL_TEST_CONF_DEFAULT),
         "helmet_conf":"0.85", "vest_conf":"0.80", "phone_conf":"0.78", "smoking_conf":"0.80", "restricted_zone_conf":"0.82", "immobility_conf":"0.80", "min_model_precision":"90", "min_model_recall":"85",
         "telegram_enabled":"true" if legacy_telegram_enabled else "false", "telegram_chat_ids":legacy_telegram_chats_row[0] if legacy_telegram_chats_row else "", "critical_alerts":"true",
         # Bot tokens are intentionally outside SQLite/settings responses. They
@@ -1431,11 +1433,20 @@ def active_model_slots() -> dict[str,str]:
     return {role:name for role,name in raw.items() if role in MODEL_PIPELINE_ROLES and isinstance(name,str) and re.fullmatch(r"[A-Za-z0-9._-]{2,120}",name)}
 
 
+def _model_test_confidence() -> float:
+    try:
+        return max(.01,min(.95,float(_auth_setting("model_test_conf",str(MODEL_TEST_CONF_DEFAULT)))))
+    except (TypeError,ValueError):
+        return MODEL_TEST_CONF_DEFAULT
+
+
 def _internal_model_info(name: str, *, test_mode: bool = False) -> dict[str,Any] | None:
     data=rows("SELECT name,format,artifact_uri,checksum,source FROM model_registry WHERE name=? AND status='ready'",(name,))
     if not data:
         return None
     data[0]["test_mode"]=test_mode
+    if test_mode:
+        data[0]["test_conf"]=_model_test_confidence()
     return data[0]
 
 
@@ -1820,18 +1831,18 @@ def get_config():
     data={r["key"]:r["value"] for r in rows("SELECT * FROM settings")}
     groups={
       "general":["site_name","timezone","language","retention_days"],
-      "inference":["inference_fps","inference_device","batch_size","nms_iou","helmet_conf","vest_conf","phone_conf","smoking_conf","restricted_zone_conf","immobility_conf","min_model_precision","min_model_recall","event_cooldown_seconds"],
+      "inference":["inference_fps","inference_device","batch_size","nms_iou","model_test_conf","helmet_conf","vest_conf","phone_conf","smoking_conf","restricted_zone_conf","immobility_conf","min_model_precision","min_model_recall","event_cooldown_seconds"],
       "archive":["archive_quality","archive_clip_seconds","minio_endpoint","minio_bucket","minio_secure"],
       "notifications":["telegram_enabled","telegram_chat_ids","critical_alerts"],
       "integration":["webhook_enabled","webhook_url","webhook_timeout","rtsp_reconnect_seconds"]}
     return {g:{k:data.get(k,"") for k in keys} for g,keys in groups.items()}
 
-CONFIG_ALLOWED={"site_name","timezone","language","retention_days","inference_fps","inference_device","batch_size","nms_iou","helmet_conf","vest_conf","phone_conf","smoking_conf","restricted_zone_conf","immobility_conf","min_model_precision","min_model_recall","event_cooldown_seconds","archive_quality","archive_clip_seconds","minio_endpoint","minio_bucket","minio_secure","telegram_enabled","telegram_chat_ids","critical_alerts","webhook_enabled","webhook_url","webhook_timeout","rtsp_reconnect_seconds"}
+CONFIG_ALLOWED={"site_name","timezone","language","retention_days","inference_fps","inference_device","batch_size","nms_iou","model_test_conf","helmet_conf","vest_conf","phone_conf","smoking_conf","restricted_zone_conf","immobility_conf","min_model_precision","min_model_recall","event_cooldown_seconds","archive_quality","archive_clip_seconds","minio_endpoint","minio_bucket","minio_secure","telegram_enabled","telegram_chat_ids","critical_alerts","webhook_enabled","webhook_url","webhook_timeout","rtsp_reconnect_seconds"}
 @app.put("/api/admin/config")
 def update_config(payload:ConfigPatch):
     unknown=set(payload.values)-CONFIG_ALLOWED
     if unknown: raise HTTPException(422,f"Неизвестные параметры: {', '.join(sorted(unknown))}")
-    numeric={"retention_days":(1,3650),"inference_fps":(1,30),"batch_size":(1,64),"nms_iou":(.1,.95),"helmet_conf":(.1,1),"vest_conf":(.1,1),"phone_conf":(.1,1),"smoking_conf":(.1,1),"restricted_zone_conf":(.1,1),"immobility_conf":(.1,1),"min_model_precision":(0,100),"min_model_recall":(0,100),"event_cooldown_seconds":(0,3600),"archive_quality":(10,100),"archive_clip_seconds":(2,120),"webhook_timeout":(1,60),"rtsp_reconnect_seconds":(1,300)}
+    numeric={"retention_days":(1,3650),"inference_fps":(1,30),"batch_size":(1,64),"nms_iou":(.1,.95),"model_test_conf":(.01,.95),"helmet_conf":(.1,1),"vest_conf":(.1,1),"phone_conf":(.1,1),"smoking_conf":(.1,1),"restricted_zone_conf":(.1,1),"immobility_conf":(.1,1),"min_model_precision":(0,100),"min_model_recall":(0,100),"event_cooldown_seconds":(0,3600),"archive_quality":(10,100),"archive_clip_seconds":(2,120),"webhook_timeout":(1,60),"rtsp_reconnect_seconds":(1,300)}
     for key,(lo,hi) in numeric.items():
         if key in payload.values:
             try: value=float(payload.values[key])
