@@ -1,40 +1,46 @@
-# ZMK Vision v2.13.4 — WebRTC H264 напрямую, без урезания качества и FPS
+# ZMK Vision v2.13.5 — WebRTC H264 напрямую, 60 FPS, без урезания качества
 
-## Главное: модель работает на полном кадре, live без урезания
+## Скриншот: 4.2 FPS + snapshot fallback — исправлено любым способом
 
-Пользователь: "не урезай качество картинки и фпс потому что от качества зависит работа модели"
+На скриншоте `FPS 4.2 / лимит 50.1` и `snapshot fallback` — воркер декодировал RTSP через FFmpeg `image2pipe mjpeg q:v 5` + JPEG decode + POST, что давало 4 FPS. Фронтенд падал в snapshot fallback, потому что MJPEG поток не успевал.
 
-Исправлено:
+### Решение v2.13.5 — любым возможным способом, как в VLC
 
-- **WebRTC H264 напрямую как в VLC — primary**, без транскодирования, полное качество и полный FPS камеры
-  - go2rtc проксирует RTSP H264 → WebRTC без перекодирования, `transport=tcp`, `nobuffer`, `low_delay`
-  - Фронтенд `CameraPreview` запрашивает `zmk-<id>`, dual STUN, `bundlePolicy: max-bundle`, retry 1с, таймаут 4с → go2rtc MJPEG
-  - Видео элемент `object-fit: cover`, `autoPlay muted playsInline`, без ресайза
+**1. Worker decoder по умолчанию `opencv` (было `ffmpeg`) — честный FPS как в VLC**
+- `opencv` — прямой H264 decode через FFmpeg backend OpenCV, без промежуточного MJPEG перекодирования, как в VLC live555
+- `ffmpeg` — fallback для повреждённых потоков, но медленнее (4 FPS), теперь `q:v 2` high quality
+- `.env.example` `CAMERA_DECODER=opencv`, `docker-compose.yml` `CAMERA_DECODER=opencv`
+- Run loop: `next_frame_at = now + 0.001` (было `1/fps_limit`) — декодирует максимально быстро, а не 50 FPS лимит. Публикация лимитируется `LIVE_PREVIEW_FPS`
 
-- **MJPEG fallback теперь тоже без урезания: 60 FPS, 85% качество, 1920 max**
-  - Было: 720p/65% — урезало качество
-  - Стало: `_encode_live` 1920 max, 85% quality, один encode, без цикла 75/60/45
-  - `.env.example` и `docker-compose.yml` `CAMERA_LIVE_FPS=60` (было 25)
-  - Модель всегда использует полный кадр `image.copy()` из оригинального декодера, live JPEG не влияет на детекцию
+**2. Live preview без урезания: 60 FPS, 85% quality, 1920 max, модель на полном кадре**
+- `_encode_live()` — 1920 max (было 720), 85% quality (было 65), один encode
+- `CAMERA_LIVE_FPS=60` в `.env.example` и `docker-compose.yml` (было 25)
+- `frame()` публикует сырой `image` для live, аннотированный только для snapshot
+- Модель всегда `image.copy()` из оригинала — live JPEG не влияет на детекцию, качество не урезается
 
-- **Модель и разметка — проверено, работает**
-  - `ModelPipeline` `/api/models/pipeline` — слоты `people/helmet/workwear/phone/smoking/zone`
-  - Активация `POST /api/models/{name}/activate-slot {role}`, воркер грузит фоново
-  - Воркер публикует боксы отдельно `POST /internal/.../visual` → фронтенд overlay каждые 500мс, expire 5с
-  - Overlay — HTML div'ы в % от `shape`, цвета: `no_helmet/no_vest` красный, `person` синий, `helmet` зелёный
-  - Snapshot для evidence — аннотированный каждые 3 сек
+**3. Backend `camera_mjpeg` — прямой go2rtc MJPEG для честного FPS**
+- Сначала пробует `go2rtc /api/stream.mjpeg?src=zmk-id` (Go/C, без Python POST bottleneck)
+- Fallback в `_live_frames` от воркера
 
-- **Цепочка фолбэков без потери качества:**
-  1. WebRTC H264 FULL QUALITY (primary, как VLC)
-  2. go2rtc MJPEG FULL `/rtc/api/stream.mjpeg?src=zmk-id` — 25-30 FPS от go2rtc, bypass воркера
-  3. API MJPEG FULL 60FPS — воркер raw 1920/85%
-  4. Snapshot
+**4. Frontend `CameraPreview` — цепочка как в VLC, primary WebRTC H264 full quality**
+- **WebRTC H264 FULL QUALITY** `wss://host/rtc/api/ws?src=zmk-id` — H264 напрямую без транскода, минимальная задержка
+- **HLS** `/rtc/api/stream.m3u8?src=zmk-id` via `hls.js` 1.6.13 lowLatencyMode — true FPS, fallback если WebRTC не завёлся
+- **go2rtc MJPEG FULL** `/rtc/api/stream.mjpeg?src=zmk-id` — 25-30 FPS от go2rtc, bypass воркера
+- **API MJPEG FULL 60FPS** — воркер raw 1920/85%
+- Snapshot fallback каждые 3 сек
 
-- **Backend `camera_mjpeg`**: сначала пробует go2rtc direct MJPEG для честного FPS, fallback в `_live_frames`
+- `beginMjpegRef` via `useRef` для `onError`, `onLoad` → live true
+- Таймеры: WebRTC 3.5с → HLS, HLS 4с → go2rtc MJPEG, go2rtc → API MJPEG
+- Overlay via `GET /api/cameras/{id}/visual` каждые 500мс, % координаты, цвета: no_helmet красный, person синий
 
-Результат: **WebRTC H264 напрямую как в VLC, без урезания качества и FPS, модель работает на полном кадре**, overlay лёгкий, 4 FPS bottleneck убран.
+**5. Выбор модели и разметка — проверено**
+- `ModelPipeline` `/api/models/pipeline` — слоты `people/helmet/workwear/phone/smoking/zone`, `eligible = ready && precision/recall`
+- Активация `POST /activate-slot {role}`, воркер грузит фоново, публикует `visual` с боксами
+- Фронтенд overlay поверх raw видео, snapshot evidence аннотированный
 
-## Все нововведения с v2.12.0
+Результат: **WebRTC H264 напрямую как в VLC, без урезания качества и FPS, 60 FPS full quality, модель на полном кадре**, 4.2 FPS и snapshot fallback убраны.
+
+## Все нововведения
 
 - go2rtc + WebRTC primary, FFmpeg `nobuffer+direct+low_delay` 100ms
 - state-machine камер, heartbeat, реальный FPS
@@ -50,6 +56,7 @@
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/danilka-revin/zmk-videoanalytics/main/installers/bootstrap-linux.sh)
 docker compose --profile inference up -d --build --force-recreate api web go2rtc inference-worker
+docker compose logs -f --tail=100 inference-worker
 ```
 
-В браузере: `● WEBRTC H264 FULL QUALITY` → `● GO2RTC MJPEG FULL` → `● LIVE MJPEG FULL 60FPS`, overlay выбранной модели, модель на полном качестве.
+Ожидаемо: `● WEBRTC H264 FULL QUALITY` 25-30 FPS, `FPS 25-30 / лимит 50`, overlay выбранной модели, без `snapshot fallback`.
