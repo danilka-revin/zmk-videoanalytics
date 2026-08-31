@@ -1207,17 +1207,19 @@ class Runtime:
 
     @staticmethod
     def _encode_live(image: Any) -> bytes | None:
-        # VLC-like fast path: smaller frame, fixed quality, no size loop
-        # Raw preview at full FPS, overlay is done in frontend, not baked here
+        # WebRTC H264 direct is primary like VLC — no quality/FPS cut.
+        # For MJPEG fallback, keep FULL quality for model: no resize, high quality 85-90
+        # Model always uses full frame via image.copy(), live JPEG does not affect detection
         try:
             height, width = image.shape[:2]
             preview = image
             longest = max(width, height)
-            # Live preview: 720p max for speed, 960 for snapshot is too heavy for 25 FPS
-            if longest > 720:
-                scale = 720 / longest
+            # Keep full quality, only limit to 1080p max to avoid huge 4K JPEGs, but no quality cut
+            if longest > 1920:
+                scale = 1920 / longest
                 preview = cv2.resize(image, (max(1, int(width * scale)), max(1, int(height * scale))), interpolation=cv2.INTER_LINEAR)
-            ok, encoded = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 65])
+            # High quality 85 for true VLC-like, model depends on quality
+            ok, encoded = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 85])
             if ok:
                 return bytes(encoded)
         except (AttributeError, OSError, RuntimeError, ValueError):
