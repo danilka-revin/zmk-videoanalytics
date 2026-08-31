@@ -19,6 +19,12 @@ ZMK_REPO="${ZMK_REPO:-danilka-revin/zmk-videoanalytics}"
 ZMK_INSTALL_DIR="${ZMK_INSTALL_DIR:-$HOME/zmk-vision}"
 ZMK_GIT_URL="https://github.com/${ZMK_REPO}.git"
 ZMK_BIN_DIR="${HOME}/.local/bin"
+ZMK_REF="${ZMK_REF:-}"
+
+if [[ "${1:-}" == "--check" ]]; then
+  echo "ZMK bootstrap launcher: OK"
+  exit 0
+fi
 
 # Resolve the update ref:
 #   1) an explicit launcher/env override wins;
@@ -35,13 +41,12 @@ if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
   CURRENT_BRANCH="$(git -C "$ZMK_INSTALL_DIR" branch --show-current 2>/dev/null | tr -d '[:space:]' || true)"
 fi
 LEGACY_LAUNCHER="$ZMK_BIN_DIR/zmk-vision"
-if [[ "$ZMK_REF" == "main" && -x "$LEGACY_LAUNCHER" && "$CURRENT_BRANCH" != "main" && -n "$CURRENT_BRANCH" ]]; then
+if [[ "${ZMK_REF:-}" == "main" && -x "$LEGACY_LAUNCHER" && "$CURRENT_BRANCH" != "main" && -n "$CURRENT_BRANCH" ]]; then
   if grep -qE 'exec env ZMK_REF=main ' "$LEGACY_LAUNCHER" 2>/dev/null; then
-    info "Migrating legacy launcher to the current work branch: ${CURRENT_BRANCH}"
+    echo "[zmk-bootstrap] Migrating legacy launcher to the current work branch: ${CURRENT_BRANCH}"
     ZMK_REF="$CURRENT_BRANCH"
   fi
 fi
-ZMK_REF="${ZMK_REF:-}"
 if [[ "$ZMK_REF" == "auto" || -z "$ZMK_REF" ]]; then
   if [[ -f "$ZMK_INSTALL_DIR/.zmk-ref" ]]; then
     ZMK_REF="$(tr -d '[:space:]' < "$ZMK_INSTALL_DIR/.zmk-ref")"
@@ -65,11 +70,6 @@ ensure_command(){
   run_privileged apt-get update
   run_privileged apt-get install -y "$package_name"
 }
-
-if [[ "${1:-}" == "--check" ]]; then
-  echo "ZMK bootstrap launcher: OK"
-  exit 0
-fi
 
 ensure_command git git
 ensure_command curl curl
