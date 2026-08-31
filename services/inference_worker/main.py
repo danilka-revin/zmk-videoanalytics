@@ -625,15 +625,18 @@ class Runtime:
 
     def _open_capture(self, url: str, transport: str):
         """Open RTSP with timeouts supplied *before* FFmpeg connects.
-
-        Calling CAP_PROP_OPEN_TIMEOUT_MSEC after VideoCapture(url, ...) is too
-        late: OpenCV has already entered its 30-second default connection path.
-        The empty-capture + open(params=...) form is supported by modern OpenCV
-        and is the reason unreachable streams now fail in ~OPEN_TIMEOUT_MS.
+        v2.16.0: Add low-latency flags like VLC for true 25-60 FPS.
         """
+        # Low-latency like VLC: nobuffer, low_delay, max_delay 0, analyzeduration 0, probesize 32
         options = [
             f"rtsp_transport;{transport}",
             f"{RTSP_TIMEOUT_OPTION};{_RTSP_STIMEOUT}",
+            "fflags;nobuffer+genpts+discardcorrupt",
+            "flags;low_delay",
+            "max_delay;0",
+            "analyzeduration;0",
+            "probesize;32",
+            "reorder_queue_size;0",
         ]
         if _RTSP_BUFSIZE:
             options.append(f"buffer_size;{_RTSP_BUFSIZE}")
@@ -1327,30 +1330,30 @@ class Runtime:
             self._log(f"snapshot upload failed for {session.config.camera_id}: {redact_error(exc)}")
 
     async def _publish_live(self, session: CameraSession, image: Any) -> None:
-        # v2.15.0 BLACK SCREEN FIX: keep live frames even when go2rtc enabled, but at lower rate
-        # WebRTC H264 is primary like VLC (true 25-60 FPS), but backend MJPEG must have frames
-        # to avoid 503 black screen when WebRTC fails. Previously we skipped entirely, causing black screen.
-        # Now: when go2rtc enabled, publish at 10 FPS (enough for fallback, low CPU), when disabled at 60 FPS.
-        # Model always uses full-quality frame via image.copy(), not this JPEG.
+        # v2.16.0 REAL STREAM ONLY: go2rtc provides true H264 25-60 FPS via MSE/HLS directly to browser.
+        # MJPEG re-encode per frame is the 4 FPS bottleneck (JPEG encode + HTTP POST blocking decode loop).
+        # User explicitly banned MJPEG for preview: "только давай не через mjpeg а то там будет 4 фпс"
+        # So we DISABLE live-frame MJPEG publish when go2rtc is enabled, saving CPU and keeping decode at 60 FPS.
+        # Snapshot still published every 3 sec for evidence fallback, and boxes via /visual JSON.
+        if GO2RTC_PREVIEW_ENABLED and not GO2RTC_FORCE_MJPEG_FALLBACK:
+            return
         if LIVE_PREVIEW_FPS <= 0:
             return
         now = time.monotonic()
-        if GO2RTC_PREVIEW_ENABLED and not GO2RTC_FORCE_MJPEG_FALLBACK:
-            # Go2rtc enabled: keep 10 FPS live frames for reliable fallback, avoid 503
-            effective_fps = min(10.0, LIVE_PREVIEW_FPS, session.config.fps_limit)
-        else:
-            effective_fps = min(session.config.fps_limit, LIVE_PREVIEW_FPS)
+        effective_fps = min(session.config.fps_limit, LIVE_PREVIEW_FPS)
         if effective_fps <= 0 or now - session.last_live_at < 1 / effective_fps:
             return
-        # Update timestamp BEFORE encoding/upload to avoid POST latency throttling FPS to 4
         session.last_live_at = now
         try:
             encoded = await asyncio.to_thread(self._encode_live, image)
             if not encoded:
                 return
-            await self.post_internal_jpeg(f"/api/internal/cameras/{session.config.camera_id}/live-frame", encoded)
-        except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
-            self._log(f"live preview upload failed for {session.config.camera_id}: {redact_error(exc)}")
+            try:
+                await self.post_internal_jpeg(f"/api/internal/cameras/{session.config.camera_id}/live-frame", encoded)
+            except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
+                self._log(f"live preview upload failed for {session.config.camera_id}: {redact_error(exc)}")
+        except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+            self._log(f"live encode failed for {session.config.camera_id}: {redact_error(exc)}")
 
     async def _publish_visual(self, session: CameraSession, visual: Any | None) -> None:
         # Publish boxes for frontend overlay — lightweight, no image re-encode

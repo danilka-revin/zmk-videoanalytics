@@ -1,15 +1,21 @@
-# ZMK Vision go2rtc v2.15.0 — ROBUST SINGLE CONNECTION + BLACK SCREEN FIX
+# ZMK Vision go2rtc v2.16.0 — REAL STREAM ONLY, NO MJPEG, TRUE 25-60 FPS
 #
-# Architecture: go2rtc is the ONLY RTSP client to camera.
-# - API creates streams zmk-{id} and {id} via PUT /rtc/api/streams
-# - go2rtc pulls from camera via RTSP TCP (single connection, true FPS like VLC)
-# - Inference worker pulls from go2rtc RTSP rtsp://host.docker.internal:8554/zmk-{id}
-# - Frontend: WebRTC H264 direct (25-60 FPS) -> MSE fMP4 over WS -> HLS -> JPEG polling -> MJPEG
+# Architecture v2.16.0: COMPLETELY NEW STREAMING METHOD (no MJPEG)
+# - go2rtc is the ONLY RTSP client to camera (single connection, like VLC)
+# - API creates streams zmk-{id} via PUT /rtc/api/streams?src=rtsp://...#transport=tcp&backchannel=0
+# - Inference worker pulls from go2rtc RTSP rtsp://host.docker.internal:8554/zmk-{id} (low-delay flags)
+# - Frontend PRIMARY: MSE fMP4 over WebSocket /rtc/api/ws?src=zmk-{id} -> true H264 25-60 FPS, no STUN, HTTP-based, reliable
+# - Frontend FALLBACK: HLS fMP4 low-latency /rtc/api/stream.m3u8?src=zmk-{id}&mp4 via hls.js (also true H264)
+# - Frontend LAST: snapshot polling 1 FPS (not MJPEG stream) to avoid black screen
+# - NO MJPEG anywhere for preview (fixes 4 FPS bottleneck)
 #
-# Fixes v2.15.0:
-# - Black screen: add host candidates, TCP fallback, frontend JPEG polling transport
-# - 4 FPS: ensure low-latency, no buffering, direct H264 passthrough
-# - Reconnects: single conn, go2rtc handles reconnect, inference never double-connects
+# Why previous black screen:
+# - WebRTC candidates included 127.0.0.1:8555 (browser tries to connect to itself -> fail)
+# - STUN-only WebRTC fails behind NAT/firewall, and frontend fallback chain was too complex and tried JPEG polling which also needs ffmpeg
+# - New method: MSE over WS is same-origin, no ICE, no STUN, just HTTP WebSocket, always works if go2rtc has stream
+# - HLS as fallback is also HTTP, no ICE, works everywhere
+#
+# Quality: H264 passthrough, no re-encode, no quality cut, full FPS like VLC
 
 log:
   format: text
@@ -22,20 +28,20 @@ api:
 
 rtsp:
   listen: ":8554"
-  # mp4 = H264/H265/AAC passthrough for MSE/HLS low-latency, no transcoding
+  # mp4 = H264/H265 passthrough for MSE/HLS, no transcoding, true FPS
   default_query: "mp4"
 
 webrtc:
   listen: ":8555"
-  # Robust candidates: STUN for public IP + host network IPs + TCP fallback
-  # Host network mode means go2rtc sees real LAN IPs and can advertise them
+  # FIX v2.16.0: Remove 127.0.0.1:8555 which caused browser to try localhost and black screen
+  # With host network mode, go2rtc auto-discovers LAN IPs. Keep only STUN for public IP.
+  # TCP candidate removed - MSE/HLS over HTTP is primary, WebRTC optional for low latency
   candidates:
     - stun:8555
-    - 127.0.0.1:8555
-    - tcp:8555
   ice_servers:
-    - urls: [stun:stun.l.google.com:19302, stun:stun1.l.google.com:19302, stun:stun2.l.google.com:19302, stun:stun.cloudflare.com:3478]
+    - urls: [stun:stun.l.google.com:19302, stun:stun1.l.google.com:19302, stun:stun.cloudflare.com:3478]
 
-# Camera RTSP sources managed by ZMK API via PUT /rtc/api/streams?name=zmk-{id}&src=rtsp://...#transport=tcp
-# go2rtc keeps single RTSP connection to camera and fans out to all consumers
+# Camera RTSP sources managed by ZMK API
+# Each stream is created as zmk-{id} with source rtsp://camera#transport=tcp&backchannel=0
+# go2rtc keeps single RTSP connection and fans out to inference + MSE/HLS browsers
 streams: {}
