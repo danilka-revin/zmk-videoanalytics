@@ -53,9 +53,9 @@ DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().paren
 STARTED = time.time()
 API_KEY = os.getenv("ZMK_API_KEY", "").strip()
 PASSWORD_AUTH_ENABLED=os.getenv("ZMK_PASSWORD_AUTH","false").strip().lower() not in {"0","false","no","off"}
-DEFAULT_INITIAL_APP_PASSWORD="1234"
-LEGACY_INITIAL_APP_PASSWORD="1243"
-AUTH_INITIAL_PASSWORD_VERSION="2"
+DEFAULT_INITIAL_APP_PASSWORD="1234"  # nosec B105 - operator-visible bootstrap default, changed on first login
+LEGACY_INITIAL_APP_PASSWORD="1243"  # nosec B105 - legacy bootstrap default, corrected on upgrade
+AUTH_INITIAL_PASSWORD_VERSION="2"  # nosec B105 - version marker only, not a credential
 
 def _resolve_initial_app_password(value: str | None) -> str:
     """Keep the first-login default stable across older copied .env files."""
