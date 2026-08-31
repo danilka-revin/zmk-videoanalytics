@@ -26,6 +26,38 @@ if [[ "${1:-}" == "--check" ]]; then
   exit 0
 fi
 
+# --- helpers must be defined before first use (fix v2.15.1) ---
+fail(){ echo "ERROR: $*" >&2; exit 1; }
+info(){ echo "[zmk-bootstrap] $*"; }
+
+run_privileged(){
+  if [[ "${EUID}" -eq 0 ]]; then "$@"; else command -v sudo >/dev/null 2>&1 || fail "sudo is required to install missing dependencies"; sudo "$@"; fi
+}
+
+ensure_command(){
+  local command_name="$1" package_name="$2"
+  command -v "$command_name" >/dev/null 2>&1 && return 0
+  command -v apt-get >/dev/null 2>&1 || fail "Missing ${command_name}. Install it manually, then run this command again."
+  info "Installing ${package_name}..."
+  run_privileged apt-get update
+  run_privileged apt-get install -y "$package_name"
+}
+
+zmk_ensure_safe_git(){
+  local dir="$1"
+  [[ -n "$dir" ]] || return 0
+  git config --global --add safe.directory "$dir" >/dev/null 2>&1 || true
+  if command -v sudo >/dev/null 2>&1; then
+    sudo git config --global --add safe.directory "$dir" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    sudo -u "$SUDO_USER" git config --global --add safe.directory "$dir" >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_command git git
+ensure_command curl curl
+
 # Resolve the update ref:
 #   1) an explicit launcher/env override wins;
 #   2) a legacy launcher that pins ZMK_REF=main but currently sits on a work
@@ -55,37 +87,6 @@ if [[ "$ZMK_REF" == "auto" || -z "$ZMK_REF" ]]; then
     ZMK_REF="main"
   fi
 fi
-
-fail(){ echo "ERROR: $*" >&2; exit 1; }
-info(){ echo "[zmk-bootstrap] $*"; }
-
-run_privileged(){
-  if [[ "${EUID}" -eq 0 ]]; then "$@"; else command -v sudo >/dev/null 2>&1 || fail "sudo is required to install missing dependencies"; sudo "$@"; fi
-}
-
-ensure_command(){
-  local command_name="$1" package_name="$2"
-  command -v "$command_name" >/dev/null 2>&1 && return 0
-  command -v apt-get >/dev/null 2>&1 || fail "Missing ${command_name}. Install it manually, then run this command again."
-  info "Installing ${package_name}..."
-  run_privileged apt-get update
-  run_privileged apt-get install -y "$package_name"
-}
-
-ensure_command git git
-ensure_command curl curl
-
-zmk_ensure_safe_git(){
-  local dir="$1"
-  [[ -n "$dir" ]] || return 0
-  git config --global --add safe.directory "$dir" >/dev/null 2>&1 || true
-  if command -v sudo >/dev/null 2>&1; then
-    sudo git config --global --add safe.directory "$dir" >/dev/null 2>&1 || true
-  fi
-  if [[ -n "${SUDO_USER:-}" ]]; then
-    sudo -u "$SUDO_USER" git config --global --add safe.directory "$dir" >/dev/null 2>&1 || true
-  fi
-}
 
 if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
   zmk_ensure_safe_git "$ZMK_INSTALL_DIR"
