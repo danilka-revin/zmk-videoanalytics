@@ -18,14 +18,29 @@ set -Eeuo pipefail
 ZMK_REPO="${ZMK_REPO:-danilka-revin/zmk-videoanalytics}"
 ZMK_INSTALL_DIR="${ZMK_INSTALL_DIR:-$HOME/zmk-vision}"
 ZMK_GIT_URL="https://github.com/${ZMK_REPO}.git"
+ZMK_BIN_DIR="${HOME}/.local/bin"
 
 # Resolve the update ref:
 #   1) an explicit launcher/env override wins;
-#   2) otherwise the pinned ref recorded in .zmk-ref (set by a previous run);
-#   3) otherwise the public release channel (main).
+#   2) a legacy launcher that pins ZMK_REF=main but currently sits on a work
+#      branch is migrated to that branch once (so the previous one-command
+#      launcher does not silently revert to the release channel);
+#   3) otherwise the pinned ref recorded in .zmk-ref (set by a previous run);
+#   4) otherwise the public release channel (main).
 # The launcher stores ZMK_REF=auto so a one-command `zmk-vision` keeps tracking
 # the current work branch until it disappears after the PR is merged, and then
 # automatically falls back to main.
+CURRENT_BRANCH=""
+if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
+  CURRENT_BRANCH="$(git -C "$ZMK_INSTALL_DIR" branch --show-current 2>/dev/null | tr -d '[:space:]' || true)"
+fi
+LEGACY_LAUNCHER="$ZMK_BIN_DIR/zmk-vision"
+if [[ "$ZMK_REF" == "main" && -x "$LEGACY_LAUNCHER" && "$CURRENT_BRANCH" != "main" && -n "$CURRENT_BRANCH" ]]; then
+  if grep -qE 'exec env ZMK_REF=main ' "$LEGACY_LAUNCHER" 2>/dev/null; then
+    info "Migrating legacy launcher to the current work branch: ${CURRENT_BRANCH}"
+    ZMK_REF="$CURRENT_BRANCH"
+  fi
+fi
 ZMK_REF="${ZMK_REF:-}"
 if [[ "$ZMK_REF" == "auto" || -z "$ZMK_REF" ]]; then
   if [[ -f "$ZMK_INSTALL_DIR/.zmk-ref" ]]; then
