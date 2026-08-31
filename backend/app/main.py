@@ -41,7 +41,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-APP_VERSION = "2.16.3"
+APP_VERSION = "2.16.4"
 TZ = timezone(timedelta(hours=7))
 CAMERA_TELEMETRY_STALE_SECONDS = 30
 HIGH_FPS_MODE = os.getenv("CAMERA_HIGH_FPS_MODE", "true").strip().lower() not in {"0","false","no","off"}
@@ -438,7 +438,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS auth_recovery_codes(id TEXT PRIMARY KEY, email TEXT NOT NULL, code_hash TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, used_at TEXT NOT NULL DEFAULT '');
     """)
     camera_columns={r[1] for r in con.execute("PRAGMA table_info(cameras)").fetchall()}
-    for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''","telemetry_at":"TEXT NOT NULL DEFAULT ''","last_error":"TEXT NOT NULL DEFAULT ''","restart_requested_at":"TEXT NOT NULL DEFAULT ''"}.items():
+    for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''","telemetry_at":"TEXT NOT NULL DEFAULT ''","last_error":"TEXT NOT NULL DEFAULT ''","restart_requested_at":"TEXT NOT NULL DEFAULT ''","preview_mode":"TEXT NOT NULL DEFAULT 'mse'"}.items():
         if column not in camera_columns: con.execute(f"ALTER TABLE cameras ADD COLUMN {column} {ddl}")
     con.execute("UPDATE cameras SET created_at=updated_at WHERE created_at='' OR created_at IS NULL")
     # A live MJPEG browser stream has a deliberate upper bound: keep stored
@@ -961,6 +961,10 @@ class CameraIn(BaseModel):
     rtsp_url:str=Field(default="",max_length=2048)
     fps_limit:float=Field(default=30,ge=.1,le=60)
     enabled:bool=True
+    # Browser preview transport only. It never changes the inference worker's
+    # own RTSP connection (which always runs through go2rtc). mse = H.264 over
+    # Media Source via go2rtc (default); mjpeg = reliable multipart JPEG stream.
+    preview_mode:Literal["mse","mjpeg"]="mse"
     @field_validator("rtsp_url")
     @classmethod
     def validate_rtsp(cls,value:str):
@@ -972,6 +976,9 @@ class CameraUpdate(BaseModel):
     rtsp_url:str|None=Field(default=None,max_length=2048)
     fps_limit:float=Field(default=30,ge=.1,le=60)
     enabled:bool=True
+    # Optional so older clients that never heard of the toggle keep the current
+    # stored value unchanged on update.
+    preview_mode:Literal["mse","mjpeg"]|None=None
     @field_validator("rtsp_url")
     @classmethod
     def validate_rtsp(cls,value:str|None):
@@ -1649,44 +1656,47 @@ def camera_with_snapshot(row:dict|sqlite3.Row) -> dict:
 
 @app.get("/api/cameras")
 def cameras():
-    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,last_error,restart_requested_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras ORDER BY created_at,id")
+    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,last_error,restart_requested_at,preview_mode,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras ORDER BY created_at,id")
     return [camera_with_snapshot(r) for r in data]
 
 @app.get("/api/cameras/{camera_id}")
 def camera_detail(camera_id:str):
-    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,last_error,restart_requested_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras WHERE id=?",(camera_id,))
+    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,last_error,restart_requested_at,preview_mode,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras WHERE id=?",(camera_id,))
     if not data: raise HTTPException(404,"Камера не найдена")
     return camera_with_snapshot(data[0])
 
 @app.post("/api/cameras",status_code=201)
 def add_camera(payload:CameraIn):
     cid=f"cam_{uuid.uuid4().hex[:12]}"; timestamp=now_iso(); con=db(); status="connecting" if payload.enabled and payload.rtsp_url else "unknown"
-    con.execute("INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,restart_requested_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(cid,payload.name,payload.zone,payload.description,payload.rtsp_url,payload.fps_limit,status,0,0,int(payload.enabled),timestamp,timestamp,timestamp if status=="connecting" else "")); con.commit(); con.close()
+    con.execute("INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,restart_requested_at,preview_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(cid,payload.name,payload.zone,payload.description,payload.rtsp_url,payload.fps_limit,status,0,0,int(payload.enabled),timestamp,timestamp,timestamp if status=="connecting" else "",payload.preview_mode)); con.commit(); con.close()
     sync_go2rtc_cameras()
-    return {"id":cid,"name":payload.name,"zone":payload.zone,"description":payload.description,"fps_limit":payload.fps_limit,"enabled":payload.enabled,"configured":bool(payload.rtsp_url),"status":status}
+    return {"id":cid,"name":payload.name,"zone":payload.zone,"description":payload.description,"fps_limit":payload.fps_limit,"enabled":payload.enabled,"preview_mode":payload.preview_mode,"configured":bool(payload.rtsp_url),"status":status}
 
 @app.put("/api/cameras/{camera_id}")
 def update_camera(camera_id:str,payload:CameraUpdate):
-    con=db(); current=con.execute("SELECT rtsp_url,enabled FROM cameras WHERE id=?",(camera_id,)).fetchone()
+    con=db(); current=con.execute("SELECT rtsp_url,enabled,preview_mode FROM cameras WHERE id=?",(camera_id,)).fetchone()
     if not current: con.close(); raise HTTPException(404,"Камера не найдена")
     # The RTSP URL is a secret and is never returned by the API. It is only
     # replaced when the client supplies a non-empty value; null or "" ("leave
     # as is" from the edit form) keeps the existing URL.
     new_rtsp=payload.rtsp_url if payload.rtsp_url else current[0]
+    # preview_mode is optional in the payload; keep the stored value when the
+    # client (or an older frontend) does not send it.
+    new_preview=payload.preview_mode or current[2]
     rtsp_updated=bool(payload.rtsp_url)
     stream_changed=new_rtsp != current[0] or bool(payload.enabled) != bool(current[1])
     timestamp=now_iso()
     if stream_changed:
         # A frame and telemetry from the old endpoint must not be shown as if
         # they belonged to the newly configured camera.
-        con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,status='connecting',fps=0,latency_ms=0,last_error='',updated_at=?,telemetry_at='',restart_requested_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),timestamp,timestamp,camera_id))
+        con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,preview_mode=?,status='connecting',fps=0,latency_ms=0,last_error='',updated_at=?,telemetry_at='',restart_requested_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),new_preview,timestamp,timestamp,camera_id))
     else:
-        con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,updated_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),timestamp,camera_id))
+        con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,preview_mode=?,updated_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),new_preview,timestamp,camera_id))
     con.commit(); con.close()
     if stream_changed:
         snapshot_path_for(camera_id).unlink(missing_ok=True); clear_live_frame(camera_id)
     sync_go2rtc_cameras()
-    return {"id":camera_id,"updated":True,"configured":bool(new_rtsp),"rtsp_updated":rtsp_updated,"stream_reset":stream_changed}
+    return {"id":camera_id,"updated":True,"configured":bool(new_rtsp),"rtsp_updated":rtsp_updated,"stream_reset":stream_changed,"preview_mode":new_preview}
 
 @app.delete("/api/cameras/{camera_id}")
 def delete_camera(camera_id:str,delete_events:bool=False):

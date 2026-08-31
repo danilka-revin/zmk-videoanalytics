@@ -54,7 +54,7 @@ def test_camera_schema_migrates_existing_database(tmp_path, monkeypatch):
     columns = {row[1] for row in con.execute("PRAGMA table_info(cameras)")}
     tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     con.close()
-    assert {"telemetry_at", "last_error", "restart_requested_at"} <= columns
+    assert {"telemetry_at", "last_error", "restart_requested_at", "preview_mode"} <= columns
     assert "worker_status" in tables
 
 
