@@ -36,8 +36,15 @@ if CAMERA_DECODER not in {"ffmpeg", "opencv"}:
 # via image.copy() — preview quality never affects detection.
 # Set CAMERA_LIVE_FPS=0 to fully disable the MJPEG fallback and reduce CPU.
 # Set CAMERA_LIVE_FORCE_MJPEG=true to force MJPEG even when go2rtc is enabled (debug).
+# NEW ARCHITECTURE v2.14.0: go2rtc is the ONLY RTSP client to camera.
+# Inference worker pulls from go2rtc RTSP (rtsp://host.docker.internal:8554/zmk-{id})
+# instead of direct camera, giving single connection to camera and true 25-60 FPS.
 GO2RTC_PREVIEW_ENABLED = os.getenv("GO2RTC_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 GO2RTC_FORCE_MJPEG_FALLBACK = os.getenv("CAMERA_LIVE_FORCE_MJPEG", "false").strip().lower() in {"1", "true", "yes", "on"}
+GO2RTC_RTSP_URL = os.getenv("GO2RTC_RTSP_URL", "rtsp://host.docker.internal:8554").rstrip("/")
+GO2RTC_USE_FOR_INFERENCE = os.getenv("GO2RTC_USE_FOR_INFERENCE", "true").strip().lower() not in {"0", "false", "no", "off"}
+GO2RTC_INFERENCE_MAX_FAILURES = 5  # fallback to direct after N go2rtc failures
+
 
 
 def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -54,6 +61,17 @@ def _bounded_float(name: str, default: float, minimum: float, maximum: float) ->
     except (TypeError, ValueError):
         value = default
     return max(minimum, min(maximum, value))
+
+
+def _go2rtc_rtsp_url_for(camera_id: str) -> str:
+    """Build RTSP URL that pulls from go2rtc instead of direct camera.
+    This gives single connection to camera (go2rtc -> camera) and
+    go2rtc fans out to inference + WebRTC browser, like VLC proxy.
+    """
+    if not GO2RTC_RTSP_URL:
+        return ""
+    # go2rtc stream names are zmk-{id} and plain {id}, we prefer zmk-{id}
+    return f"{GO2RTC_RTSP_URL}/zmk-{camera_id}"
 
 
 def _buffer_size() -> str:
@@ -486,6 +504,8 @@ class CameraSession:
     status: str = "connecting"
     transport_index: int = 0
     failures: int = 0
+    go2rtc_failures: int = 0
+    using_go2rtc: bool = False
     next_attempt_at: float = 0.0
     next_frame_at: float = 0.0
     last_telemetry_at: float = 0.0
@@ -805,6 +825,8 @@ class Runtime:
                 session.status = "connecting"
                 session.transport_index = 0
                 session.failures = 0
+                session.go2rtc_failures = 0
+                session.using_go2rtc = False
                 session.next_attempt_at = 0
                 session.next_frame_at = 0
                 session.last_error = ""
@@ -989,33 +1011,74 @@ class Runtime:
             return False
 
         await self._report(session, "connecting", error="", force=session.status != "connecting")
+
+        # NEW ARCHITECTURE: Try go2rtc RTSP first when enabled (single connection to camera)
+        # go2rtc -> camera (1 connection), inference -> go2rtc (local), browser WebRTC -> go2rtc
+        # This gives true 25-60 FPS like VLC and avoids camera overload/reconnects.
+        urls_to_try = []
+        if (
+            GO2RTC_PREVIEW_ENABLED
+            and GO2RTC_USE_FOR_INFERENCE
+            and GO2RTC_RTSP_URL
+            and session.go2rtc_failures < GO2RTC_INFERENCE_MAX_FAILURES
+        ):
+            go2rtc_url = _go2rtc_rtsp_url_for(session.config.camera_id)
+            if go2rtc_url:
+                    urls_to_try.append((go2rtc_url, True))  # True = is go2rtc
+        # Direct camera URL always as fallback
+        urls_to_try.append((session.config.rtsp_url, False))
+
         transport = session.transport
         started = time.perf_counter()
-        try:
-            # FFmpeg options are process-global in OpenCV, so serialise only
-            # the tiny open section; reads for other cameras remain concurrent.
-            async with self._capture_open_lock:
-                # Do not wrap native OpenCV open() in wait_for(). Cancelling
-                # the asyncio wrapper while FFmpeg is still inside C++ can
-                # leave a live native object behind and later crash Python
-                # (exit 139). The params passed to open() enforce the timeout.
-                capture = await asyncio.to_thread(self._open_capture, session.config.rtsp_url, transport)
-        except (TimeoutError, OSError, RuntimeError, ValueError) as exc:
-            await self._failed_open(session, redact_error(exc), round((time.perf_counter() - started) * 1000))
-            return False
+        last_error = ""
+        for rtsp_url, is_go2rtc in urls_to_try:
+            # For go2rtc local RTSP, always use TCP (more reliable, low latency)
+            try_transport = "tcp" if is_go2rtc else transport
+            try:
+                async with self._capture_open_lock:
+                    capture = await asyncio.to_thread(self._open_capture, rtsp_url, try_transport)
+            except (TimeoutError, OSError, RuntimeError, ValueError) as exc:
+                last_error = redact_error(exc)
+                if is_go2rtc:
+                    session.go2rtc_failures += 1
+                    self._log(f"camera {session.config.camera_id} go2rtc RTSP failed ({session.go2rtc_failures}/{GO2RTC_INFERENCE_MAX_FAILURES}): {last_error} - will try direct")
+                    continue
+                else:
+                    await self._failed_open(session, last_error, round((time.perf_counter() - started) * 1000))
+                    return False
 
-        if not self._is_open(capture):
-            self._release(capture)
-            await self._failed_open(session, f"не удалось открыть RTSP по {transport.upper()}", round((time.perf_counter() - started) * 1000))
-            return False
+            if not self._is_open(capture):
+                self._release(capture)
+                last_error = f"не удалось открыть RTSP по {try_transport.upper()} ({'go2rtc' if is_go2rtc else 'direct'})"
+                if is_go2rtc:
+                    session.go2rtc_failures += 1
+                    self._log(f"camera {session.config.camera_id} go2rtc RTSP open failed ({session.go2rtc_failures}/{GO2RTC_INFERENCE_MAX_FAILURES}): {last_error}")
+                    continue
+                else:
+                    await self._failed_open(session, last_error, round((time.perf_counter() - started) * 1000))
+                    return False
 
-        session.capture = capture
-        session.failures = 0
-        session.next_attempt_at = 0
-        session.opened_at = time.monotonic()
-        session.received_first_frame = False
-        self._log(f"camera {session.config.camera_id} opened via {transport.upper()}", force=True)
-        return True
+            # Success
+            session.capture = capture
+            session.failures = 0
+            session.using_go2rtc = is_go2rtc
+            if is_go2rtc:
+                # Reset failures on success, but keep go2rtc_failures low
+                session.go2rtc_failures = max(0, session.go2rtc_failures - 1)
+                self._log(f"camera {session.config.camera_id} opened via GO2RTC RTSP {try_transport.upper()} (single connection to camera, true FPS)", force=True)
+            else:
+                if GO2RTC_PREVIEW_ENABLED and GO2RTC_USE_FOR_INFERENCE:
+                    self._log(f"camera {session.config.camera_id} opened via DIRECT RTSP {try_transport.upper()} (go2rtc fallback, {session.go2rtc_failures} go2rtc fails)", force=True)
+                else:
+                    self._log(f"camera {session.config.camera_id} opened via {try_transport.upper()}", force=True)
+            session.next_attempt_at = 0
+            session.opened_at = time.monotonic()
+            session.received_first_frame = False
+            return True
+
+        # All URLs failed
+        await self._failed_open(session, last_error or "не удалось открыть RTSP", round((time.perf_counter() - started) * 1000))
+        return False
 
     async def _drain_ffmpeg_stderr(self, session: CameraSession, process: asyncio.subprocess.Process) -> None:
         if process.stderr is None:
@@ -1152,14 +1215,17 @@ class Runtime:
 
     async def _failed_open(self, session: CameraSession, reason: str, latency_ms: int) -> None:
         session.failures += 1
-        # A connection-level failure should try the other transport immediately
-        # on the next reconnect, not after three identical TCP attempts.
-        session.transport_index = (session.transport_index + 1) % len(TRANSPORT_ORDER)
+        # For go2rtc, always TCP and don't toggle transport, but count go2rtc failures
+        if not session.using_go2rtc:
+            session.transport_index = (session.transport_index + 1) % len(TRANSPORT_ORDER)
+        else:
+            # If we were using go2rtc and failed, increment go2rtc failures to eventually fallback to direct
+            session.go2rtc_failures += 1
         session.next_attempt_at = time.monotonic() + RECONNECT_MIN
         session.next_frame_at = max(session.next_frame_at, session.next_attempt_at)
         status = "offline" if session.failures >= OFFLINE_AFTER else "recovering"
         await self._report(session, status, latency_ms, reason, force=True)
-        self._log(f"camera {session.config.camera_id} open failed: {reason}")
+        self._log(f"camera {session.config.camera_id} open failed ({'go2rtc' if session.using_go2rtc else 'direct'}): {reason}")
 
     async def _failed_read(self, session: CameraSession, reason: str, latency_ms: int) -> None:
         now = time.monotonic()
@@ -1169,9 +1235,6 @@ class Runtime:
             and now - session.opened_at < KEYFRAME_GRACE_SECONDS
         )
         if waiting_for_keyframe:
-            # H.264 decoding errors immediately after RTSP open are expected
-            # when the server starts at a delta frame. Reopening here loses the
-            # upcoming IDR frame and creates a permanent black-preview loop.
             session.next_frame_at = max(session.next_frame_at, now + KEYFRAME_RETRY_SECONDS)
             await self._report(
                 session,
@@ -1187,11 +1250,18 @@ class Runtime:
         status = "offline" if session.failures >= OFFLINE_AFTER else "recovering"
         if session.failures >= OFFLINE_AFTER:
             self._release_session(session)
-            session.transport_index = (session.transport_index + 1) % len(TRANSPORT_ORDER)
+            # For go2rtc, don't toggle transport, just count failures and try direct after threshold
+            if session.using_go2rtc:
+                session.go2rtc_failures += 1
+                if session.go2rtc_failures >= GO2RTC_INFERENCE_MAX_FAILURES:
+                    self._log(f"camera {session.config.camera_id} go2rtc failed {session.go2rtc_failures} times, will fallback to direct RTSP", force=True)
+                    session.using_go2rtc = False
+            else:
+                session.transport_index = (session.transport_index + 1) % len(TRANSPORT_ORDER)
             session.next_attempt_at = now + RECONNECT_MIN
             session.next_frame_at = max(session.next_frame_at, session.next_attempt_at)
         await self._report(session, status, latency_ms, reason, force=True)
-        self._log(f"camera {session.config.camera_id} frame failed: {reason}")
+        self._log(f"camera {session.config.camera_id} frame failed ({'go2rtc' if session.using_go2rtc else 'direct'}): {reason}")
 
     @staticmethod
     def _encode_snapshot(image: Any) -> bytes | None:

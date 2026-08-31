@@ -100,24 +100,111 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
  const containerRef=useRef<HTMLDivElement|null>(null);
  const beginMjpegRef=useRef<()=>void>(()=>{});
  const hlsRef=useRef<any>(null);
+ const mseRef=useRef<{ws:WebSocket|null,pc?:any,buffer:SourceBuffer|null}>({ws:null,buffer:null});
  const[src,setSrc]=useState('');
  const[live,setLive]=useState(false);
  const[streamFailed,setStreamFailed]=useState(false);
- const[transport,setTransport]=useState<'webrtc'|'hls'|'mjpeg'|'go2rtc-mjpeg'|'waiting'>('waiting');
+ const[transport,setTransport]=useState<'webrtc'|'mse'|'hls'|'mjpeg'|'go2rtc-mjpeg'|'waiting'>('waiting');
  const[boxes,setBoxes]=useState<{bbox:number[],label:string,semantic:string,confidence:number}[]>([]);
  const[shape,setShape]=useState<[number,number]|null>(null);
+ const[reconnectCount,setReconnectCount]=useState(0);
  const apiKey=localStorage.getItem('zmk_api_key')||'';
  useEffect(()=>{
-  let cancelled=false;let current='';let fallbackTimer=0;let mjpegStarted=false;let go2rtcMjpegStarted=false;let hlsStarted=false;
-  let pc:RTCPeerConnection|null=null;let ws:WebSocket|null=null;let webrtcTimer=0;let retryTimer=0;let visualTimer=0;let hlsTimer=0;let webrtcAttempts=0;
+  let cancelled=false;let current='';let fallbackTimer=0;let mjpegStarted=false;let go2rtcMjpegStarted=false;let hlsStarted=false;let mseStarted=false;
+  let pc:RTCPeerConnection|null=null;let ws:WebSocket|null=null;let webrtcTimer=0;let retryTimer=0;let visualTimer=0;let hlsTimer=0;let mseTimer=0;let webrtcAttempts=0;let totalAttempts=0;
   const controller=new AbortController();
   const replace=(next:string)=>{if(cancelled){try{URL.revokeObjectURL(next)}catch{};return}setSrc(old=>{if(old&&old!==next&&old.startsWith('blob:'))try{URL.revokeObjectURL(old)}catch{};return next});current=next};
   const snapshot=async()=>{try{const headers:Record<string,string>={};if(apiKey)headers['X-API-Key']=apiKey;const r=await fetch(`/api/cameras/${id}/snapshot?t=${Date.now()}`,{headers,signal:controller.signal});if(!r.ok)return;replace(URL.createObjectURL(await r.blob()))}catch{}};
   const marker=(data:Uint8Array,a:number,b:number,from=0)=>{for(let i=from;i<data.length-1;i++)if(data[i]===a&&data[i+1]===b)return i;return-1};
+
+  const beginMSE=async(srcNames?:string[])=>{
+    if(cancelled||mseStarted)return;
+    mseStarted=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(hlsTimer);clearTimeout(mseTimer);
+    try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};
+    if(hlsRef.current){try{hlsRef.current.destroy()}catch{};hlsRef.current=null}
+    if(videoRef.current)videoRef.current.srcObject=null;
+    setTransport('mse');
+    const names=srcNames||[`zmk-${id}`,id];
+    for(const streamName of names){
+      if(cancelled)break;
+      try{
+        // go2rtc MSE via MP4 - low-latency H264 over WebSocket, works when WebRTC blocked by firewall
+        const mseUrl=`${location.protocol==='https:'?'wss':'ws'}://${location.host}/rtc/api/ws?src=${encodeURIComponent(streamName)}`;
+        const mseWs=new WebSocket(mseUrl);
+        mseRef.current.ws=mseWs;
+        let mediaSource:MediaSource|null=null;
+        let sourceBuffer:SourceBuffer|null=null;
+        let queue:Uint8Array[]=[];
+        mseWs.binaryType='arraybuffer';
+        mseWs.onopen=()=>{
+          if(cancelled)return;
+          // Request MP4 stream for MSE
+          mseWs.send(JSON.stringify({type:'mse',value:'mp4'}));
+        };
+        mseWs.onmessage=async(event)=>{
+          if(cancelled)return;
+          if(typeof event.data==='string'){
+            try{
+              const msg=JSON.parse(event.data);
+              if(msg.type==='mse'&&msg.value){
+                // Init segment
+                if(!mediaSource){
+                  mediaSource=new MediaSource();
+                  if(videoRef.current){
+                    videoRef.current.src=URL.createObjectURL(mediaSource);
+                    mediaSource.addEventListener('sourceopen',()=>{
+                      if(!mediaSource||mediaSource.readyState!=='open')return;
+                      try{
+                        sourceBuffer=mediaSource.addSourceBuffer('video/mp4; codecs="avc1.640029"');
+                        mseRef.current.buffer=sourceBuffer;
+                        sourceBuffer.addEventListener('updateend',()=>{
+                          if(queue.length&&sourceBuffer&&!sourceBuffer.updating){
+                            try{sourceBuffer.appendBuffer(queue.shift()!)}catch{}
+                          }
+                        });
+                        // Append init segment
+                        const init=Uint8Array.from(atob(msg.value),c=>c.charCodeAt(0));
+                        if(sourceBuffer.updating)queue.push(init);
+                        else try{sourceBuffer.appendBuffer(init)}catch{queue.push(init)}
+                        setLive(true);setStreamFailed(false);setTransport('mse');
+                        if(videoRef.current)void videoRef.current.play().catch(()=>{});
+                      }catch{
+                        // Codec not supported, fallback to HLS
+                        try{mseWs.close()}catch{};void beginHls(names);
+                      }
+                    });
+                  }
+                }else if(sourceBuffer){
+                  const seg=Uint8Array.from(atob(msg.value),c=>c.charCodeAt(0));
+                  if(sourceBuffer.updating)queue.push(seg);
+                  else try{sourceBuffer.appendBuffer(seg)}catch{queue.push(seg)}
+                }
+              }
+            }catch{}
+          }else if(event.data instanceof ArrayBuffer){
+            const seg=new Uint8Array(event.data);
+            if(sourceBuffer){
+              if(sourceBuffer.updating)queue.push(seg);
+              else try{sourceBuffer.appendBuffer(seg)}catch{queue.push(seg)}
+            }
+          }
+        };
+        mseWs.onerror=()=>{try{mseWs.close()}catch{};if(streamName===names[names.length-1])void beginHls(names);else beginMSE(names.slice(1))};
+        mseWs.onclose=()=>{if(!cancelled&&!live){if(streamName===names[names.length-1]){mseTimer=window.setTimeout(()=>{if(!cancelled)void beginHls(names)},800)} }};
+        // Timeout for MSE
+        mseTimer=window.setTimeout(()=>{if(!live){try{mseWs.close()}catch{};if(streamName===names[names.length-1])void beginHls(names)}},6000);
+        return;
+      }catch{
+        continue;
+      }
+    }
+    void beginHls(names);
+  };
+
   const beginHls=async(srcNames?:string[])=>{
     if(cancelled||hlsStarted)return;
-    hlsStarted=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);
-    try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};
+    hlsStarted=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(mseTimer);
+    try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};if(mseRef.current.ws){try{mseRef.current.ws.close()}catch{}}
     if(videoRef.current)videoRef.current.srcObject=null;
     setTransport('hls');
     const names=srcNames||[`zmk-${id}`,id];
@@ -129,7 +216,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
         if(videoRef.current){
           if(Hls.isSupported()){
             if(hlsRef.current){try{hlsRef.current.destroy()}catch{}}
-            const hls=new Hls({lowLatencyMode:true,backBufferLength:90,enableWorker:true});
+            const hls=new Hls({lowLatencyMode:true,backBufferLength:90,enableWorker:true,maxBufferLength:10,liveSyncDuration:1,liveMaxLatencyDuration:3});
             hlsRef.current=hls;
             hls.loadSource(hlsUrl);
             hls.attachMedia(videoRef.current);
@@ -147,8 +234,8 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
   };
   const beginGo2rtcMjpeg=(srcNames?:string[])=>{
     if(cancelled||go2rtcMjpegStarted)return;
-    go2rtcMjpegStarted=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(hlsTimer);
-    try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};
+    go2rtcMjpegStarted=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(hlsTimer);clearTimeout(mseTimer);
+    try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};if(mseRef.current.ws){try{mseRef.current.ws.close()}catch{}}
     if(hlsRef.current){try{hlsRef.current.destroy()}catch{};hlsRef.current=null}
     if(videoRef.current)videoRef.current.srcObject=null;
     setLive(false);setTransport('go2rtc-mjpeg');
@@ -159,8 +246,8 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
   };
   const beginMjpeg=()=>{
     if(cancelled||mjpegStarted)return;
-    mjpegStarted=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(hlsTimer);
-    try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};
+    mjpegStarted=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(hlsTimer);clearTimeout(mseTimer);
+    try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};if(mseRef.current.ws){try{mseRef.current.ws.close()}catch{}}
     if(hlsRef.current){try{hlsRef.current.destroy()}catch{};hlsRef.current=null}
     if(videoRef.current)videoRef.current.srcObject=null;
     setLive(false);setTransport('mjpeg');void stream()
@@ -190,23 +277,39 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
   const startWebRTC=(srcNames?:string[])=>{
     if(cancelled)return;
     const names=srcNames||[`zmk-${id}`,id];
+    totalAttempts++;setReconnectCount(totalAttempts);
     const tryName=(idx:number)=>{
-      if(cancelled||idx>=names.length){void beginHls(names);return}
+      if(cancelled||idx>=names.length){
+        // WebRTC failed, try MSE (low-latency H264 over WS, works when UDP blocked) then HLS
+        void beginMSE(names);
+        return;
+      }
       const streamName=names[idx];
       webrtcAttempts++;
       try{
         setTransport('webrtc');
         const wsUrl=`${location.protocol==='https:'?'wss':'ws'}://${location.host}/rtc/api/ws?src=${encodeURIComponent(streamName)}`;
         ws=new WebSocket(wsUrl);
-        pc=new RTCPeerConnection({iceServers:[{urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302','stun:stun2.l.google.com:19302']}],bundlePolicy:'max-bundle'});
+        pc=new RTCPeerConnection({iceServers:[{urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302','stun:stun2.l.google.com:19302','stun:stun3.l.google.com:19302']}],bundlePolicy:'max-bundle',iceTransportPolicy:'all'});
         pc.addTransceiver('video',{direction:'recvonly'});
         pc.ontrack=(event)=>{
           if(cancelled)return;
           const remote=event.streams[0];
           if(videoRef.current){videoRef.current.srcObject=remote;void videoRef.current.play().catch(()=>{})}
-          setLive(true);setStreamFailed(false);setTransport('webrtc');clearTimeout(webrtcTimer)
+          setLive(true);setStreamFailed(false);setTransport('webrtc');clearTimeout(webrtcTimer);
         };
         pc.onicecandidate=(event)=>{if(!cancelled&&event.candidate&&ws&&ws.readyState===1)ws.send(JSON.stringify({type:'webrtc/candidate',value:event.candidate.candidate}))};
+        pc.onconnectionstatechange=()=>{
+          if(cancelled||!pc)return;
+          if(pc.connectionState==='failed'||pc.connectionState==='disconnected'){
+            if(!live){
+              try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};
+              // Exponential backoff retry
+              const delay=Math.min(1000*Math.pow(1.5,totalAttempts),10000);
+              clearTimeout(retryTimer);retryTimer=window.setTimeout(()=>{if(!cancelled)tryName(idx+1)},delay);
+            }
+          }
+        };
         ws.onopen=async()=>{
           if(cancelled)return;
           try{
@@ -223,14 +326,17 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
             else if(msg.type==='webrtc/candidate'&&pc&&msg.value){await pc.addIceCandidate({candidate:msg.value})}
           }catch{}
         };
-        ws.onerror=()=>{try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};tryName(idx+1)};
+        ws.onerror=()=>{try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};const delay=Math.min(800*Math.pow(1.3,totalAttempts),8000);clearTimeout(retryTimer);retryTimer=window.setTimeout(()=>tryName(idx+1),delay)};
         ws.onclose=()=>{
           if(cancelled)return;
           if(live)return;
           if(idx+1<names.length){clearTimeout(retryTimer);retryTimer=window.setTimeout(()=>tryName(idx+1),400)}
-          else if(!mjpegStarted&&!go2rtcMjpegStarted&&!hlsStarted){clearTimeout(retryTimer);retryTimer=window.setTimeout(()=>{if(!cancelled)void beginHls(names)},600)}
+          else if(!mjpegStarted&&!go2rtcMjpegStarted&&!hlsStarted&&!mseStarted){
+            const delay=Math.min(1000*Math.pow(1.5,totalAttempts),10000);
+            clearTimeout(retryTimer);retryTimer=window.setTimeout(()=>{if(!cancelled)void beginMSE(names)},delay)
+          }
         };
-        webrtcTimer=window.setTimeout(()=>{if(!live){try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};tryName(idx+1)}},6000);
+        webrtcTimer=window.setTimeout(()=>{if(!live){try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};tryName(idx+1)}},8000);
       }catch{tryName(idx+1)}
     };
     tryName(0);
@@ -247,9 +353,18 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
   void snapshot();
   if(['online','connecting','recovering'].includes(status))startWebRTC();
   void fetchVisual();visualTimer=window.setInterval(fetchVisual,400);
+  // Periodic WebRTC health check - if we are in fallback but camera is online, retry WebRTC
+  const healthTimer=window.setInterval(()=>{
+    if(cancelled)return;
+    if(!live&&['online','connecting','recovering'].includes(status)&&totalAttempts<20){
+      // Reset flags and retry WebRTC
+      mjpegStarted=false;go2rtcMjpegStarted=false;hlsStarted=false;mseStarted=false;
+      startWebRTC();
+    }
+  },15000);
   return()=>{
-    cancelled=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(hlsTimer);clearInterval(visualTimer);
-    controller.abort();try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};
+    cancelled=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(hlsTimer);clearTimeout(mseTimer);clearInterval(visualTimer);clearInterval(healthTimer);
+    controller.abort();try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};if(mseRef.current.ws){try{mseRef.current.ws.close()}catch{}}
     if(hlsRef.current){try{hlsRef.current.destroy()}catch{};hlsRef.current=null}
     if(videoRef.current)videoRef.current.srcObject=null;
     if(fallbackTimer)clearInterval(fallbackTimer);
@@ -258,11 +373,12 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
  },[id,apiKey,status]);
  const ageText=age===null?null:(age<5?'только что':(age<60?`${age} сек назад`:`${Math.floor(age/60)} мин назад`));
  const renderOverlay=()=>{if(!boxes.length||!shape)return null;const [h,w]=shape;if(!h||!w)return null;return <div className="camera-overlay">{boxes.map((b,i)=>{const [x1,y1,x2,y2]=b.bbox;const left=(x1/w)*100;const top=(y1/h)*100;const width=Math.max(1,((x2-x1)/w)*100);const height=Math.max(1,((y2-y1)/h)*100);const isNoHelmet=b.semantic==='no_helmet';const isNoVest=b.semantic==='no_vest';const isPerson=b.semantic==='person';const color=isNoHelmet||isNoVest?'#ff3b30':isPerson?'#007aff':b.semantic==='helmet'?'#34c759':b.semantic==='vest'?'#af52de':'#ff9500';const label=b.semantic==='no_helmet'?'NO HELMET':b.semantic==='no_vest'?'NO VEST':b.semantic.toUpperCase();return <div key={i} className="camera-box" style={{left:`${left}%`,top:`${top}%`,width:`${width}%`,height:`${height}%`,borderColor:color}}><span style={{background:color}}>{label} {Math.round(b.confidence*100)}%</span></div>})}</div>};
- if(transport==='webrtc')return <div className="camera-feed-wrap" ref={containerRef}><video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline aria-label={`Прямой эфир камеры ${id}`}/>{renderOverlay()}<em className="frame-age">{live?'● WEBRTC H264 FULL QUALITY 25-60 FPS':streamFailed?'WebRTC disconnected':'● WebRTC подключение'}</em></div>;
- if(transport==='hls')return <div className="camera-feed-wrap" ref={containerRef}><video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline controls={false} aria-label={`HLS поток камеры ${id}`}/>{renderOverlay()}<em className="frame-age">{live?'● HLS FULL QUALITY':'● HLS подключение'}</em></div>;
- if(transport==='go2rtc-mjpeg')return <div className="camera-feed-wrap" ref={containerRef}><img className="camera-snapshot" src={src} alt={`Прямой эфир go2rtc ${id}`} onLoad={()=>{setLive(true);setStreamFailed(false);}} onError={()=>{setLive(false);setStreamFailed(true);void (async()=>{try{beginMjpegRef.current();}catch{}})();}} />{renderOverlay()}<em className="frame-age">{live?'● GO2RTC MJPEG FULL':'● GO2RTC подключение'}</em></div>;
- if(!src)return <div className="feed-empty">{telemetryStale?<><WifiOff size={20}/><span>Нет телеметрии</span><small>worker давно не подтверждал поток</small></>:status==='connecting'?<><RefreshCw className="spin" size={20}/><span>Подключение к потоку</span><small>{lastError||'worker открывает RTSP-камеру'}</small></>:status==='offline'||status==='error'||status==='unknown'?<><WifiOff size={20}/><span>Поток не подключён</span><small>{lastError|| (status==='unknown'?'нет данных о статусе':'RTSP недоступен')}</small></>:<><Camera size={20}/><span>Кадр не получен</span><small>{lastError||'Нет свежего снимка от inference worker'}</small></>}</div>;
- return <div className="camera-feed-wrap" ref={containerRef}><img className="camera-snapshot" src={src} alt={live?'Прямой эфир камеры':'Последний кадр камеры'}/>{renderOverlay()}<em className="frame-age">{live?'● LIVE MJPEG FALLBACK':(streamFailed?'snapshot fallback':ageText||'кадр')}</em></div>;
+ if(transport==='webrtc')return <div className="camera-feed-wrap" ref={containerRef}><video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline aria-label={`Прямой эфир камеры ${id}`}/>{renderOverlay()}<em className="frame-age">{live?'● WEBRTC H264 25-60 FPS (single conn via go2rtc)':streamFailed?`WebRTC retry ${reconnectCount}...`:'● WebRTC подключение'}<button onClick={()=>{setReconnectCount(0);beginMjpegRef.current();}} style={{marginLeft:8,fontSize:10,padding:'2px 6px'}}>retry</button></em></div>;
+ if(transport==='mse')return <div className="camera-feed-wrap" ref={containerRef}><video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline aria-label={`MSE поток камеры ${id}`}/>{renderOverlay()}<em className="frame-age">{live?'● MSE H264 LOW-LATENCY (go2rtc)':'● MSE подключение'}</em></div>;
+ if(transport==='hls')return <div className="camera-feed-wrap" ref={containerRef}><video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline controls={false} aria-label={`HLS поток камеры ${id}`}/>{renderOverlay()}<em className="frame-age">{live?'● HLS H264 FULL QUALITY':'● HLS подключение'}</em></div>;
+ if(transport==='go2rtc-mjpeg')return <div className="camera-feed-wrap" ref={containerRef}><img className="camera-snapshot" src={src} alt={`Прямой эфир go2rtc ${id}`} onLoad={()=>{setLive(true);setStreamFailed(false);}} onError={()=>{setLive(false);setStreamFailed(true);void (async()=>{try{beginMjpegRef.current();}catch{}})();}} />{renderOverlay()}<em className="frame-age">{live?'● GO2RTC MJPEG (Go fast)':'● GO2RTC подключение'}</em></div>;
+ if(!src)return <div className="feed-empty">{telemetryStale?<><WifiOff size={20}/><span>Нет телеметрии</span><small>worker давно не подтверждал поток (go2rtc->inference RTSP single conn)</small></>:status==='connecting'?<><RefreshCw className="spin" size={20}/><span>Подключение к потоку</span><small>{lastError||'go2rtc открывает RTSP (single conn) → inference → WebRTC'}</small></>:status==='offline'||status==='error'||status==='unknown'?<><WifiOff size={20}/><span>Поток не подключён</span><small>{lastError|| (status==='unknown'?'нет данных о статусе':'RTSP недоступен, проверь go2rtc logs')}</small></>:<><Camera size={20}/><span>Кадр не получен</span><small>{lastError||'Нет свежего снимка от inference worker (проверь go2rtc->inference RTSP)'}</small></>}</div>;
+ return <div className="camera-feed-wrap" ref={containerRef}><img className="camera-snapshot" src={src} alt={live?'Прямой эфир камеры':'Последний кадр камеры'}/>{renderOverlay()}<em className="frame-age">{live?'● LIVE MJPEG FALLBACK':(streamFailed?`snapshot fallback retry ${reconnectCount}`:ageText||'кадр')}</em></div>;
 }
 function Cameras({cams,changed,searchIntent,clearSearchIntent}:{cams:Cam[],changed:()=>Promise<void>,searchIntent?:SearchItem|null,clearSearchIntent?:()=>void}){
  const[editing,setEditing]=useState<Cam|null|undefined>(undefined);const[selectionMode,setSelectionMode]=useState(false);const[selectedIds,setSelectedIds]=useState<string[]>([]);const[bulkConfirm,setBulkConfirm]=useState(false);const[form,setForm]=useState({name:'',zone:'',description:'',rtsp_url:'',fps_limit:'30',enabled:true});const[busy,setBusy]=useState(false);const[diag,setDiag]=useState<Record<string,string>>({});const[editRtsp,setEditRtsp]=useState(false);const[cardSize,setCardSize]=useState<'compact'|'normal'|'large'>(()=>{const saved=localStorage.getItem('zmk_camera_card_size');return saved==='compact'||saved==='large'?'compact'===saved?'compact':'large':'normal'});
