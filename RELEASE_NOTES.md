@@ -1,55 +1,48 @@
-# ZMK Vision v2.13.3 — true 25FPS via go2rtc direct + overlay
+# ZMK Vision v2.13.4 — WebRTC H264 напрямую, без урезания качества и FPS
 
-## Исправление 4 FPS: настоящий live как в VLC
+## Главное: модель работает на полном кадре, live без урезания
 
-Проблема 4 FPS осталась, потому что fallback MJPEG шёл через воркер:
-`RTSP → FFmpeg → JPEG → HTTP POST → API memory → multipart` — каждый POST 200-300мс троттлил FPS.
+Пользователь: "не урезай качество картинки и фпс потому что от качества зависит работа модели"
 
-### Решение v2.13.3 — прямой путь через go2rtc
+Исправлено:
 
-**Backend `camera_mjpeg`:**
-- Теперь сначала пробует `go2rtc /api/stream.mjpeg?src=zmk-<id>` напрямую, а не `_live_frames` от воркера
-- go2rtc сам транскодирует RTSP H264 → MJPEG на C/Go, без Python POST, поэтому даёт честные 25 FPS как в VLC
-- Если go2rtc недоступен — fallback в старый `_live_frames` от воркера (25 FPS)
+- **WebRTC H264 напрямую как в VLC — primary**, без транскодирования, полное качество и полный FPS камеры
+  - go2rtc проксирует RTSP H264 → WebRTC без перекодирования, `transport=tcp`, `nobuffer`, `low_delay`
+  - Фронтенд `CameraPreview` запрашивает `zmk-<id>`, dual STUN, `bundlePolicy: max-bundle`, retry 1с, таймаут 4с → go2rtc MJPEG
+  - Видео элемент `object-fit: cover`, `autoPlay muted playsInline`, без ресайза
 
-**Frontend `CameraPreview` цепочка фолбэков:**
-1. **WebRTC** `wss://host/rtc/api/ws?src=zmk-<id>` — H264 напрямую, минимальная задержка, как в VLC
-2. **go2rtc MJPEG direct** `/rtc/api/stream.mjpeg?src=zmk-<id>` — честный 25 FPS от go2rtc, bypass воркера
-3. **API MJPEG** `/api/cameras/{id}/mjpeg` — воркер 25 FPS raw (720p/65%)
-4. **Snapshot** каждые 3 сек — последний шанс
+- **MJPEG fallback теперь тоже без урезания: 60 FPS, 85% качество, 1920 max**
+  - Было: 720p/65% — урезало качество
+  - Стало: `_encode_live` 1920 max, 85% quality, один encode, без цикла 75/60/45
+  - `.env.example` и `docker-compose.yml` `CAMERA_LIVE_FPS=60` (было 25)
+  - Модель всегда использует полный кадр `image.copy()` из оригинального декодера, live JPEG не влияет на детекцию
 
-- `beginGo2rtcMjpeg` ставит `src` на go2rtc URL, `onLoad` → `live=true`, `onError` → `beginMjpegRef.current()` (API MJPEG)
-- `beginMjpegRef` через `useRef` чтобы избежать reference error
-- Таймеры: WebRTC 4с → go2rtc MJPEG, go2rtc MJPEG → API MJPEG
+- **Модель и разметка — проверено, работает**
+  - `ModelPipeline` `/api/models/pipeline` — слоты `people/helmet/workwear/phone/smoking/zone`
+  - Активация `POST /api/models/{name}/activate-slot {role}`, воркер грузит фоново
+  - Воркер публикует боксы отдельно `POST /internal/.../visual` → фронтенд overlay каждые 500мс, expire 5с
+  - Overlay — HTML div'ы в % от `shape`, цвета: `no_helmet/no_vest` красный, `person` синий, `helmet` зелёный
+  - Snapshot для evidence — аннотированный каждые 3 сек
 
-**Worker `inference_worker` (v2.13.2, сохранено):**
-- Сырой кадр для live без боксов, `_encode_live` 720p/65% fast path
-- `last_live_at` до encode, а не после POST
-- Боксы отдельно via `POST /visual`, фронтенд рисует overlay поверх видео, а не запекает в JPEG
+- **Цепочка фолбэков без потери качества:**
+  1. WebRTC H264 FULL QUALITY (primary, как VLC)
+  2. go2rtc MJPEG FULL `/rtc/api/stream.mjpeg?src=zmk-id` — 25-30 FPS от go2rtc, bypass воркера
+  3. API MJPEG FULL 60FPS — воркер raw 1920/85%
+  4. Snapshot
 
-**Overlay:**
-- `GET /api/cameras/{id}/visual` каждые 500мс, expire 5с
-- `%` координаты от `shape`, цвета: `no_helmet/no_vest` красный, `person` синий, `helmet` зелёный, `vest` фиолетовый
+- **Backend `camera_mjpeg`**: сначала пробует go2rtc direct MJPEG для честного FPS, fallback в `_live_frames`
 
-### Выбор модели и разметка — проверено
-
-- **ModelPipeline** `/api/models/pipeline` — слоты `people/helmet/workwear/phone/smoking/zone`, фильтр `status=ready && precision/recall != null`
-- Активация слота `POST /api/models/{name}/activate-slot {role}`, удаление `DELETE /api/models/pipeline/{role}`
-- Воркер загружает модели фоново, `model_test_mode` не отправляет тревоги, но рисует боксы
-- После выбора модели воркер публикует `visual` с боксами, фронтенд overlay показывает их поверх raw видео
-- Snapshot для evidence — аннотированный с боксами каждые 3 сек
-
-Результат: **WebRTC 25FPS H264 как в VLC + overlay только когда найден человек**, fallback go2rtc MJPEG 25FPS тоже как в VLC, без 4 FPS bottleneck.
+Результат: **WebRTC H264 напрямую как в VLC, без урезания качества и FPS, модель работает на полном кадре**, overlay лёгкий, 4 FPS bottleneck убран.
 
 ## Все нововведения с v2.12.0
 
 - go2rtc + WebRTC primary, FFmpeg `nobuffer+direct+low_delay` 100ms
 - state-machine камер, heartbeat, реальный FPS
-- TCP-first/UDP fallback, timeouts до open(), keyframe grace 15с
+- TCP-first/UDP fallback, timeouts, keyframe grace 15с
 - карточки Компакт/Обычные/Крупные, fullscreen
-- мульти-модельный пайплайн, upload 2GB, safe test, bulk delete
+- мульти-модельный пайплайн, upload 2GB, safe test
 - кириллица «Человек/Без каски» → `person/no_helmet`, `without_hardhat` fix
-- password auth + email recovery, bot tokens private volume, Telegram Mini App dark
+- password auth, bot tokens private volume, Telegram Mini App dark
 - support bundle, event evidence zip, smart search
 
 ## Обновление
@@ -57,7 +50,6 @@
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/danilka-revin/zmk-videoanalytics/main/installers/bootstrap-linux.sh)
 docker compose --profile inference up -d --build --force-recreate api web go2rtc inference-worker
-docker compose logs -f --tail=150 inference-worker go2rtc
 ```
 
-В браузере: `● WEBRTC REAL-TIME 25FPS` → `● GO2RTC MJPEG 25FPS` → `● LIVE MJPEG 25FPS`, все с overlay разметки выбранной модели.
+В браузере: `● WEBRTC H264 FULL QUALITY` → `● GO2RTC MJPEG FULL` → `● LIVE MJPEG FULL 60FPS`, overlay выбранной модели, модель на полном качестве.
