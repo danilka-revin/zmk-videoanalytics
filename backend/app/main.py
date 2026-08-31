@@ -1784,6 +1784,24 @@ def camera_mjpeg(camera_id:str):
     con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
     if not row: raise HTTPException(404,"Камера не найдена")
     if not row[0]: raise HTTPException(409,"Аналитика камеры отключена")
+    # Try go2rtc direct MJPEG first for true VLC-like FPS
+    if GO2RTC_ENABLED and GO2RTC_API_URL:
+        for candidate_name in (f"zmk-{camera_id}", camera_id):
+            try:
+                with httpx.Client(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
+                    chk = client.get(f"{GO2RTC_API_URL}/api/frame.jpeg", params={"src": candidate_name}, timeout=2.0)
+                    if chk.status_code==200 and chk.content.startswith(b"\xff\xd8"):
+                        def go2rtc_generate(src_name: str = candidate_name):
+                            try:
+                                with httpx.stream("GET", f"{GO2RTC_API_URL}/api/stream.mjpeg", params={"src": src_name}, timeout=httpx.Timeout(60.0, connect=2.0)) as r:
+                                    for chunk in r.iter_bytes(chunk_size=8192):
+                                        if chunk:
+                                            yield chunk
+                            except (httpx.HTTPError, OSError, RuntimeError, ValueError):
+                                return
+                        return StreamingResponse(go2rtc_generate(), media_type="multipart/x-mixed-replace; boundary=--go2rtc", headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
+            except (httpx.HTTPError, OSError, RuntimeError, ValueError):
+                continue
     def generate():
         sequence=-1
         while True:
