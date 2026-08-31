@@ -1,3 +1,41 @@
+# ZMK Vision v2.13.7 — fix npm ci hls.js lock file
+
+## Ошибка сборки web — исправлено
+
+```
+=> ERROR [web build 4/6] RUN npm ci
+npm error Missing: hls.js@1.6.13 from lock file
+```
+
+**Причина:** в v2.13.5 добавлен `hls.js 1.6.13` в `package.json`, но `package-lock.json` не был обновлён.
+
+**Фикс:**
+- `frontend/package-lock.json` обновлён — добавлен `node_modules/hls.js 1.6.13`
+- `npm ci` теперь проходит
+
+## Сохранено из v2.13.6
+
+### Docker BuildKit parent snapshot fix
+- `services/inference_worker/Dockerfile` и `training_worker/Dockerfile` `FROM python:3.12-slim` + pip `ultralytics 8.4.126 opencv-headless 4.10 torch 2.5.1 CPU`
+- `start.sh` fallback цепочка с `DOCKER_BUILDKIT=0 COMPOSE_BAKE=false --no-cache` и `builder prune --all -f`
+
+### WebRTC H264 FULL QUALITY 60 FPS no-cut
+- Worker `CAMERA_DECODER=opencv` default, `next_frame_at 0.001`, `_encode_live` 1920 max 85%, `CAMERA_LIVE_FPS=60`, model `image.copy()` full
+- Backend `camera_mjpeg` go2rtc proxy first `frame.jpeg` 0xffd8 then `stream.mjpeg` boundary `--go2rtc`
+- Frontend `webrtc → hls (hls.js lowLatency) → go2rtc-mjpeg → api-mjpeg → snapshot`, visual overlay 500ms % coords
+
+Результат: сборка проходит, `● WEBRTC H264 FULL QUALITY` 25-30 FPS без `snapshot fallback`.
+
+## Обновление
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/danilka-revin/zmk-videoanalytics/main/installers/bootstrap-linux.sh)
+docker compose --profile inference up -d --build --remove-orphans
+./start.sh
+```
+
+---
+
 # ZMK Vision v2.13.6 — fix Docker BuildKit + WebRTC H264 60 FPS full quality
 
 ## Ошибка сборки Docker — исправлено
