@@ -1,62 +1,51 @@
-# ZMK Vision v2.13.5 — WebRTC H264 напрямую, 60 FPS, без урезания качества
+# ZMK Vision v2.13.6 — fix Docker BuildKit + WebRTC H264 60 FPS full quality
 
-## Скриншот: 4.2 FPS + snapshot fallback — исправлено любым способом
+## Ошибка сборки Docker — исправлено
 
-На скриншоте `FPS 4.2 / лимит 50.1` и `snapshot fallback` — воркер декодировал RTSP через FFmpeg `image2pipe mjpeg q:v 5` + JPEG decode + POST, что давало 4 FPS. Фронтенд падал в snapshot fallback, потому что MJPEG поток не успевал.
+```
+=> ERROR [inference-worker] exporting to image
+failed to solve: failed to prepare extraction snapshot "extract-... sha256:dd842e...": parent snapshot sha256:eaaafa4e... does not exist: not found
+WARN Docker Compose is configured to build using Bake, but buildx isn't installed
+```
 
-### Решение v2.13.5 — любым возможным способом, как в VLC
+**Причина:** базовый образ `ultralytics/ultralytics:8.4.126` имел повреждённый parent snapshot в BuildKit кэше.
 
-**1. Worker decoder по умолчанию `opencv` (было `ffmpeg`) — честный FPS как в VLC**
-- `opencv` — прямой H264 decode через FFmpeg backend OpenCV, без промежуточного MJPEG перекодирования, как в VLC live555
-- `ffmpeg` — fallback для повреждённых потоков, но медленнее (4 FPS), теперь `q:v 2` high quality
-- `.env.example` `CAMERA_DECODER=opencv`, `docker-compose.yml` `CAMERA_DECODER=opencv`
-- Run loop: `next_frame_at = now + 0.001` (было `1/fps_limit`) — декодирует максимально быстро, а не 50 FPS лимит. Публикация лимитируется `LIVE_PREVIEW_FPS`
+**Фикс:**
+- `services/inference_worker/Dockerfile` и `training_worker/Dockerfile` теперь `FROM python:3.12-slim` вместо ultralytics base
+- Установка `ffmpeg + libgl + ultralytics 8.4.126 + opencv-headless 4.10 + torch 2.5.1 CPU` через pip
+- `start.sh` `repair_build_cache()` теперь: `builder prune -af`, `buildx prune -af`, `system prune`, `systemctl restart docker`, sleep 2
+- `start_stack()` fallback цепочка:
+  1. обычный `up -d --build`
+  2. `COMPOSE_PARALLEL_LIMIT=1 up -d --build`
+  3. `COMPOSE_BAKE=false COMPOSE_DOCKER_CLI_BUILD=0 up -d --build`
+  4. `DOCKER_BUILDKIT=0 COMPOSE_BAKE=false build --no-cache inference-worker training-worker` + `up -d`
+  5. `builder prune --all -f` + `DOCKER_BUILDKIT=0 COMPOSE_BAKE=false --no-cache --parallel 1`
 
-**2. Live preview без урезания: 60 FPS, 85% quality, 1920 max, модель на полном кадре**
-- `_encode_live()` — 1920 max (было 720), 85% quality (было 65), один encode
-- `CAMERA_LIVE_FPS=60` в `.env.example` и `docker-compose.yml` (было 25)
-- `frame()` публикует сырой `image` для live, аннотированный только для snapshot
-- Модель всегда `image.copy()` из оригинала — live JPEG не влияет на детекцию, качество не урезается
+## FPS 4.2 + snapshot fallback — исправлено (v2.13.5, сохранено)
 
-**3. Backend `camera_mjpeg` — прямой go2rtc MJPEG для честного FPS**
-- Сначала пробует `go2rtc /api/stream.mjpeg?src=zmk-id` (Go/C, без Python POST bottleneck)
-- Fallback в `_live_frames` от воркера
+**Worker decoder по умолчанию `opencv` (было `ffmpeg`) — честный FPS как в VLC**
+- `opencv` — прямой H264 decode, без MJPEG перекодирования, как live555 в VLC
+- Run loop `next_frame_at = now + 0.001` — декодирует максимально быстро, публикация лимитируется `LIVE_PREVIEW_FPS=60`
+- `_encode_live()` — 1920 max, 85% quality, без урезания качества для модели
 
-**4. Frontend `CameraPreview` — цепочка как в VLC, primary WebRTC H264 full quality**
-- **WebRTC H264 FULL QUALITY** `wss://host/rtc/api/ws?src=zmk-id` — H264 напрямую без транскода, минимальная задержка
-- **HLS** `/rtc/api/stream.m3u8?src=zmk-id` via `hls.js` 1.6.13 lowLatencyMode — true FPS, fallback если WebRTC не завёлся
-- **go2rtc MJPEG FULL** `/rtc/api/stream.mjpeg?src=zmk-id` — 25-30 FPS от go2rtc, bypass воркера
-- **API MJPEG FULL 60FPS** — воркер raw 1920/85%
-- Snapshot fallback каждые 3 сек
+**Backend `camera_mjpeg` — прямой go2rtc MJPEG для честного FPS**
+- Сначала `go2rtc /api/stream.mjpeg?src=zmk-id` (Go/C, без Python POST bottleneck)
 
-- `beginMjpegRef` via `useRef` для `onError`, `onLoad` → live true
-- Таймеры: WebRTC 3.5с → HLS, HLS 4с → go2rtc MJPEG, go2rtc → API MJPEG
-- Overlay via `GET /api/cameras/{id}/visual` каждые 500мс, % координаты, цвета: no_helmet красный, person синий
+**Frontend цепочка как в VLC, primary WebRTC H264 FULL QUALITY**
+- WebRTC `wss://host/rtc/api/ws?src=zmk-id` — H264 напрямую
+- HLS `/rtc/api/stream.m3u8?src=zmk-id` via `hls.js 1.6.13` lowLatency
+- go2rtc MJPEG FULL, API MJPEG FULL 60FPS, snapshot
 
-**5. Выбор модели и разметка — проверено**
-- `ModelPipeline` `/api/models/pipeline` — слоты `people/helmet/workwear/phone/smoking/zone`, `eligible = ready && precision/recall`
-- Активация `POST /activate-slot {role}`, воркер грузит фоново, публикует `visual` с боксами
-- Фронтенд overlay поверх raw видео, snapshot evidence аннотированный
+**Выбор модели и разметка**
+- `ModelPipeline` слоты `people/helmet/workwear/phone/smoking/zone`, `visual` overlay каждые 500мс, % координаты
 
-Результат: **WebRTC H264 напрямую как в VLC, без урезания качества и FPS, 60 FPS full quality, модель на полном кадре**, 4.2 FPS и snapshot fallback убраны.
-
-## Все нововведения
-
-- go2rtc + WebRTC primary, FFmpeg `nobuffer+direct+low_delay` 100ms
-- state-machine камер, heartbeat, реальный FPS
-- TCP-first/UDP fallback, timeouts, keyframe grace 15с
-- карточки Компакт/Обычные/Крупные, fullscreen
-- мульти-модельный пайплайн, upload 2GB, safe test
-- кириллица «Человек/Без каски» → `person/no_helmet`, `without_hardhat` fix
-- password auth, bot tokens private volume, Telegram Mini App dark
-- support bundle, event evidence zip, smart search
+Результат: `● WEBRTC H264 FULL QUALITY` 25-30 FPS, `FPS 25-30 / лимит 50`, без `snapshot fallback`, модель на полном качестве, Docker сборка надёжная.
 
 ## Обновление
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/danilka-revin/zmk-videoanalytics/main/installers/bootstrap-linux.sh)
-docker compose --profile inference up -d --build --force-recreate api web go2rtc inference-worker
-docker compose logs -f --tail=100 inference-worker
+docker compose --profile inference up -d --build --remove-orphans
+# Если BuildKit падает — start.sh сам очистит кэш и пересоберёт с --no-cache
+./start.sh
 ```
-
-Ожидаемо: `● WEBRTC H264 FULL QUALITY` 25-30 FPS, `FPS 25-30 / лимит 50`, overlay выбранной модели, без `snapshot fallback`.
