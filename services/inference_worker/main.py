@@ -203,9 +203,15 @@ def normalise_model_label(value: object) -> str:
     # Custom datasets frequently use compounds that are not in the exact alias
     # set ("Person without Hardhat", "без каски человек", "NO-HELMET", ...).
     # Match the meaningful stems before falling back to the raw label.
-    if any(token in raw for token in ("without_helmet", "withouthelmet", "no_helmet", "nohelmet", "no_hardhat", "nohardhat", "без_каск", "нет_каск", "без_шлем", "bare_head", "barehead", "no_hat")):
+    if any(token in raw for token in ("without_helmet", "withouthelmet", "no_helmet", "nohelmet", "no_hardhat", "nohardhat", "without_hardhat", "without_hard_hat", "without_hard", "without_hat", "без_каск", "нет_каск", "без_шлем", "bare_head", "barehead", "no_hat")):
         return "no_helmet"
-    if any(token in raw for token in ("without_vest", "withoutvest", "no_vest", "novest", "без_жилет", "нет_жилет", "no_workwear", "noworkwear")):
+    if any(token in raw for token in ("without_vest", "withoutvest", "no_vest", "novest", "without_vest", "без_жилет", "нет_жилет", "no_workwear", "noworkwear", "without_workwear")):
+        return "no_vest"
+    # Explicit no_helmet / no_vest must be checked before generic helmet/vest/person
+    # to avoid misclassifying "Person without Hardhat" as helmet or person.
+    if "without" in raw and any(k in raw for k in ("helmet", "hardhat", "hard_hat", "hat", "каск", "шлем")):
+        return "no_helmet"
+    if "without" in raw and any(k in raw for k in ("vest", "жилет", "workwear", "спецодежд", "coverall")):
         return "no_vest"
     if any(token in raw for token in ("helmet", "hardhat", "hard_hat", "каск", "шлем", "helm")):
         return "helmet"
