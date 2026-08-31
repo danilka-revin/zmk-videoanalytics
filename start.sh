@@ -147,6 +147,37 @@ start_stack(){
   fi
   echo "[start] Последняя попытка: полная очистка builder и no-cache..."
   "${DOCKER[@]}" builder prune --all -f >/dev/null 2>&1 || true
+  if DOCKER_BUILDKIT=0 COMPOSE_BAKE=false COMPOSE_PARALLEL_LIMIT=1 "${DC[@]}" "${PROFILE[@]}" up -d --build --no-cache --remove-orphans; then
+    return 0
+  fi
+  echo "[start] Пробую slim Dockerfiles (python:3.12-slim + pip) как fallback для ultralytics base..."
+  # Build workers with slim Dockerfile if ultralytics base keeps failing (parent snapshot corruption or slow pip)
+  if [[ -f services/inference_worker/Dockerfile.slim && -f services/training_worker/Dockerfile.slim ]]; then
+    echo "[start] Собираю inference-worker с Dockerfile.slim..."
+    if DOCKER_BUILDKIT=0 "${DOCKER[@]}" build -f services/inference_worker/Dockerfile.slim -t zmk-vision-inference-worker:latest services/inference_worker 2>&1 | tail -30; then
+      echo "[start] inference-worker slim собран, собираю training-worker..."
+      DOCKER_BUILDKIT=0 "${DOCKER[@]}" build -f services/training_worker/Dockerfile.slim -t zmk-vision-training-worker:latest services/training_worker 2>&1 | tail -20 || true
+      # Now up with --no-build to use the manually built images
+      if "${DC[@]}" "${PROFILE[@]}" up -d --remove-orphans --no-build; then
+        return 0
+      fi
+      # Fallback: try compose up with build but using slim via override
+      echo "[start] Пробую compose с slim через временный Dockerfile..."
+      cp services/inference_worker/Dockerfile services/inference_worker/Dockerfile.bak 2>/dev/null || true
+      cp services/training_worker/Dockerfile services/training_worker/Dockerfile.bak 2>/dev/null || true
+      cp services/inference_worker/Dockerfile.slim services/inference_worker/Dockerfile
+      cp services/training_worker/Dockerfile.slim services/training_worker/Dockerfile
+      if DOCKER_BUILDKIT=0 COMPOSE_BAKE=false "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
+        # Restore original Dockerfiles
+        mv services/inference_worker/Dockerfile.bak services/inference_worker/Dockerfile 2>/dev/null || true
+        mv services/training_worker/Dockerfile.bak services/training_worker/Dockerfile 2>/dev/null || true
+        return 0
+      fi
+      mv services/inference_worker/Dockerfile.bak services/inference_worker/Dockerfile 2>/dev/null || true
+      mv services/training_worker/Dockerfile.bak services/training_worker/Dockerfile 2>/dev/null || true
+    fi
+  fi
+  # Final attempt: try with parallel limit 1 and no cache, classic builder
   DOCKER_BUILDKIT=0 COMPOSE_BAKE=false COMPOSE_PARALLEL_LIMIT=1 "${DC[@]}" "${PROFILE[@]}" up -d --build --no-cache --remove-orphans
 }
 
