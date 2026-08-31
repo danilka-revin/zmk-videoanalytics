@@ -1,6 +1,8 @@
+import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
 
+from app import main as app_main
 from app.main import app, db, now_iso
 from fastapi.testclient import TestClient
 
@@ -95,7 +97,31 @@ def test_model_below_quality_gate_cannot_be_activated():
         assert 'ниже' in result.json()['detail']
 
 
-def test_training_has_single_job_guard_and_can_be_cancelled():
+def test_training_has_single_job_guard_and_can_be_cancelled(monkeypatch):
+    release_training = asyncio.Event()
+
+    async def blocked_training(job_id: int) -> None:
+        # The cancel assertion must not race with the fixture worker completing
+        # in ~0.1s on slow CI runners. Keep the fake job blocked until the
+        # operator cancellation gets a chance to run.
+        await release_training.wait()
+        con = app_main.db()
+        job = con.execute(
+            "SELECT target_name,camera_id FROM training_jobs WHERE id=?",
+            (job_id,),
+        ).fetchone()
+        con.execute(
+            "UPDATE training_jobs SET status='completed',progress=100,stage='Fixture complete',updated_at=? WHERE id=?",
+            (app_main.now_iso(), job_id),
+        )
+        con.execute(
+            "INSERT INTO model_registry(name,format,status,precision,recall,trained_at,source,artifact_uri,checksum) VALUES(?,?,?,?,?,?,?,?,?)",
+            (job[0], "ONNX FP16", "ready", 93.0, 88.0, app_main.now_iso(), f"fixture:{job[1]}", f"file:///test/{job[0]}.onnx", ""),
+        )
+        con.commit()
+        con.close()
+
+    monkeypatch.setattr(app_main, "run_training", blocked_training)
     with TestClient(app) as c:
         target = f'cancel-test-{uuid.uuid4().hex[:10]}'
         started = c.post('/api/training/jobs', json={
@@ -112,3 +138,4 @@ def test_training_has_single_job_guard_and_can_be_cancelled():
         assert cancelled.status_code == 200
         assert c.get(f'/api/training/jobs/{job_id}').json()['status'] == 'cancelled'
         assert c.post(f'/api/training/jobs/{job_id}/cancel').status_code == 409
+    release_training.set()
