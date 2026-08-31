@@ -41,7 +41,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-APP_VERSION = "2.16.2"
+APP_VERSION = "2.16.3"
 TZ = timezone(timedelta(hours=7))
 CAMERA_TELEMETRY_STALE_SECONDS = 30
 HIGH_FPS_MODE = os.getenv("CAMERA_HIGH_FPS_MODE", "true").strip().lower() not in {"0","false","no","off"}
@@ -1096,24 +1096,36 @@ def rows(query,args=()):
 
 def _go2rtc_source_url(rtsp_url: str) -> str:
     """Build a low-latency go2rtc source URL like VLC: TCP transport, no buffering.
+
+    go2rtc parses RTSP source options as ``#key=value`` fragments separated by
+    ``#`` (see go2rtc internal/streams/helpers.go ParseQuery). Joining them with
+    ``&`` makes go2rtc read the whole ``tcp&backchannel=0`` string as the
+    ``transport`` value and try to dial it as a WebSocket URL, failing with
+    ``unsupported protocol scheme \"\"`` so the camera never comes online.
+
     v2.14.0: Adds mp4 query for MSE/HLS low-latency and ensures single connection to camera.
     v2.14.2: Preserve operator-specified transport if already present (e.g. udp), else default to tcp.
     v2.15.0: Add backchannel=0 for low latency (disable audio backchannel), keep single conn.
+    v2.16.3: Join source options with ``#`` (not ``&``) — fixes go2rtc
+    ``unsupported protocol scheme ""`` and cameras stuck offline.
     """
     if not rtsp_url:
         return rtsp_url
-    base = rtsp_url.split("#")[0]
-    existing_frag = rtsp_url.split("#", 1)[1] if "#" in rtsp_url else ""
-    # Preserve existing transport if operator already specified it (test expects udp kept)
-    if existing_frag and "transport=" in existing_frag:
-        # Ensure backchannel disabled if not already set
-        if "backchannel" not in existing_frag:
-            return f"{base}#{existing_frag}&backchannel=0"
-        return f"{base}#{existing_frag}"
-    if not existing_frag:
-        return f"{base}#transport={GO2RTC_RTSP_TRANSPORT}&backchannel=0"
-    # Existing fragment without transport -> append tcp + backchannel
-    return f"{base}#{existing_frag}&transport={GO2RTC_RTSP_TRANSPORT}&backchannel=0"
+    base, _, fragment = rtsp_url.partition("#")
+    # go2rtc source options are `#`-separated `key=value` tokens; preserve any
+    # operator-supplied ones (e.g. media=video) and only fill in the defaults.
+    options: dict[str, str] = {}
+    for token in fragment.split("#"):
+        if not token:
+            continue
+        key, _, value = token.partition("=")
+        if key:
+            options[key] = value
+    # Disable the ONVIF audio backchannel by default (backchannel=0) and force
+    # the configured RTSP transport, without overriding explicit operator values.
+    options.setdefault("transport", GO2RTC_RTSP_TRANSPORT)
+    options.setdefault("backchannel", "0")
+    return base + "#" + "#".join(f"{key}={value}" for key, value in options.items())
 
 def sync_go2rtc_cameras() -> dict[str, Any]:
     """Mirror enabled cameras from SQLite into go2rtc with VLC-like low latency.

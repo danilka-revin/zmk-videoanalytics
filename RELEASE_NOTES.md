@@ -1,3 +1,45 @@
+# ZMK Vision v2.16.3 — fix go2rtc RTSP source options separator (cameras offline)
+
+## Ошибка в логах go2rtc
+
+```
+WRN [rtsp] error="streams: Get \"tcp&backchannel=0\": unsupported protocol scheme \"\"" stream=zmk-cam_env_01
+```
+
+## Причина
+
+go2rtc парсит опции RTSP-источника как `#key=value`-фрагменты, разделённые символом `#`
+(`internal/streams/helpers.go ParseQuery`). Бэкенд собирал источник как
+`rtsp://...#transport=tcp&backchannel=0`, то есть через `&`. Из-за этого go2rtc
+считал всю строку `tcp&backchannel=0` значением `transport`, уходил в ветку
+WebSocket-подключения и падал с `unsupported protocol scheme ""` — камера оставалась офлайн.
+
+## Фикс
+
+**backend/app/main.py `_go2rtc_source_url`:** опции теперь склеиваются через `#`:
+
+```
+rtsp://admin:…@…:554/h264/ch01/main/av_stream#transport=tcp#backchannel=0
+```
+
+- операторский `transport` (например `udp`) сохраняется, дефолт добавляется только если отсутствует;
+- явный `backchannel` оператора не перезаписывается и не дублируется;
+- неизвестные опции (например `media=video`) сохраняются;
+- `httpx` кодирует `#` в `%23`, поэтому go2rtc получает корректный `src`.
+
+**VERSION / APP_VERSION / package.json:** 2.16.2 → 2.16.3
+
+## Проверка
+
+```bash
+cd backend && pytest tests/test_camera_runtime.py -q   # 9 passed
+curl "http://HOST:1984/rtc/api/streams" | jq '.zmk-cam_env_01.producers[0].url'
+# rtsp://…/av_stream#transport=tcp#backchannel=0
+docker logs zmk-vision-go2rtc-1 --tail 20   # больше нет "unsupported protocol scheme"
+```
+
+---
+
 # ZMK Vision v2.14.2 — fix frontend build TS1382 + TS2345
 
 ## Ошибка пользователя после обновления на v2.14.1 (из start.sh лога)

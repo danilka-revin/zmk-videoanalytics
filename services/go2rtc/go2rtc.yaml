@@ -2,7 +2,7 @@
 #
 # Architecture v2.16.0: COMPLETELY NEW STREAMING METHOD (no MJPEG)
 # - go2rtc is the ONLY RTSP client to camera (single connection, like VLC)
-# - API creates streams zmk-{id} via PUT /rtc/api/streams?src=rtsp://...#transport=tcp&backchannel=0
+# - API creates streams zmk-{id} via PUT /rtc/api/streams?src=rtsp://...#transport=tcp#backchannel=0
 # - Inference worker pulls from go2rtc RTSP rtsp://host.docker.internal:8554/zmk-{id} (low-delay flags)
 # - Frontend PRIMARY: MSE fMP4 over WebSocket /rtc/api/ws?src=zmk-{id} -> true H264 25-60 FPS, no STUN, HTTP-based, reliable
 # - Frontend FALLBACK: HLS fMP4 low-latency /rtc/api/stream.m3u8?src=zmk-{id}&mp4 via hls.js (also true H264)
@@ -42,6 +42,6 @@ webrtc:
     - urls: [stun:stun.l.google.com:19302, stun:stun1.l.google.com:19302, stun:stun.cloudflare.com:3478]
 
 # Camera RTSP sources managed by ZMK API
-# Each stream is created as zmk-{id} with source rtsp://camera#transport=tcp&backchannel=0
+# Each stream is created as zmk-{id} with source rtsp://camera#transport=tcp#backchannel=0
 # go2rtc keeps single RTSP connection and fans out to inference + MSE/HLS browsers
 streams: {}
