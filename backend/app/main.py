@@ -1140,7 +1140,7 @@ def sync_go2rtc_cameras() -> dict[str, Any]:
 
             for name in existing - set(desired_map):
                 # Clean up both prefixed and legacy plain names owned by this app
-                if name.startswith("zmk-") or name.startswith("cam_"):
+                if name.startswith(("zmk-", "cam_")):
                     client.delete(f"{GO2RTC_API_URL}/api/streams", params=[("name", name)])
     except (httpx.HTTPError, OSError, RuntimeError, ValueError, TypeError) as exc:
         # Keep the application camera workflow fully usable if go2rtc is not
