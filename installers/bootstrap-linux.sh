@@ -38,6 +38,7 @@ fi
 # automatically falls back to main.
 CURRENT_BRANCH=""
 if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
+  zmk_ensure_safe_git "$ZMK_INSTALL_DIR"
   CURRENT_BRANCH="$(git -C "$ZMK_INSTALL_DIR" branch --show-current 2>/dev/null | tr -d '[:space:]' || true)"
 fi
 LEGACY_LAUNCHER="$ZMK_BIN_DIR/zmk-vision"
@@ -74,7 +75,20 @@ ensure_command(){
 ensure_command git git
 ensure_command curl curl
 
+zmk_ensure_safe_git(){
+  local dir="$1"
+  [[ -n "$dir" ]] || return 0
+  git config --global --add safe.directory "$dir" >/dev/null 2>&1 || true
+  if command -v sudo >/dev/null 2>&1; then
+    sudo git config --global --add safe.directory "$dir" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    sudo -u "$SUDO_USER" git config --global --add safe.directory "$dir" >/dev/null 2>&1 || true
+  fi
+}
+
 if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
+  zmk_ensure_safe_git "$ZMK_INSTALL_DIR"
   info "Existing installation found: $ZMK_INSTALL_DIR"
   current_origin=$(git -C "$ZMK_INSTALL_DIR" remote get-url origin 2>/dev/null || true)
   [[ "$current_origin" == "$ZMK_GIT_URL" ]] || fail "The target has another git origin: ${current_origin}"
@@ -92,7 +106,9 @@ if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
   fi
 
   info "Downloading ${ZMK_REF} from GitHub..."
-  # Fix divergent branches fatal error: set pull strategy and prune tags
+  # Fix dubious ownership + divergent branches
+  zmk_ensure_safe_git "$ZMK_INSTALL_DIR"
+  git -C "$ZMK_INSTALL_DIR" config --global --add safe.directory "$ZMK_INSTALL_DIR" >/dev/null 2>&1 || true
   git -C "$ZMK_INSTALL_DIR" config pull.rebase false >/dev/null 2>&1 || true
   git -C "$ZMK_INSTALL_DIR" config pull.ff only >/dev/null 2>&1 || true
   git -C "$ZMK_INSTALL_DIR" fetch --prune --tags --force origin 2>&1 | tail -5 || true

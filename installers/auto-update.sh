@@ -30,6 +30,20 @@ ZMK_REPO="${ZMK_REPO:-danilka-revin/zmk-videoanalytics}"
 ZMK_API="${ZMK_API:-https://api.github.com/repos/${ZMK_REPO}/releases/latest}"
 ZMK_DL_BASE="${ZMK_DL_BASE:-https://github.com/${ZMK_REPO}/releases/download}"
 
+# Fix for "fatal: detected dubious ownership in repository" when running as root
+# or via sudo on a directory owned by another user (e.g. /root/zmk-vision).
+zmk_ensure_safe_git(){
+  local dir="$1"
+  [[ -n "$dir" ]] || return 0
+  git config --global --add safe.directory "$dir" >/dev/null 2>&1 || true
+  if command -v sudo >/dev/null 2>&1; then
+    sudo git config --global --add safe.directory "$dir" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${SUDO_USER:-}" ]]; then
+    sudo -u "$SUDO_USER" git config --global --add safe.directory "$dir" >/dev/null 2>&1 || true
+  fi
+}
+
 zmk_err(){ echo "ERROR: $*" >&2; }
 
 zmk_current_version(){
@@ -109,6 +123,7 @@ zmk_apply_update(){
 zmk_check_and_update(){
   local root="$1" relaunch="$2"
   local cur latest wd
+  if [[ -d "$root/.git" ]]; then zmk_ensure_safe_git "$root"; fi
   cur=$(zmk_current_version "$root")
   if ! latest=$(zmk_latest_version); then
     echo "[auto-update] Could not reach GitHub (offline or rate-limited); skipping update check. Current version: ${cur}."
@@ -160,8 +175,11 @@ zmk_check_and_update(){
   # Fallback: git-based update if tarball not available (e.g. 404 before Release assets uploaded)
   if [[ -d "$root/.git" ]]; then
     echo "[auto-update] Tarball unavailable, trying git fetch for ${latest}..."
-    # Fix divergent branches config
+    # Fix dubious ownership + divergent branches
+    zmk_ensure_safe_git "$root"
+    git -C "$root" config --global --add safe.directory "$root" >/dev/null 2>&1 || true
     git -C "$root" config pull.rebase false >/dev/null 2>&1 || true
+    git -C "$root" config pull.ff only >/dev/null 2>&1 || true
     git -C "$root" fetch --prune --tags --force origin 2>&1 | tail -5 || true
     # Try to checkout the tag directly, then main if tag checkout fails
     if git -C "$root" fetch --depth=1 origin "$latest" 2>&1; then
@@ -172,6 +190,7 @@ zmk_check_and_update(){
       fi
     fi
     # Last resort: fetch main
+    zmk_ensure_safe_git "$root"
     if git -C "$root" fetch --depth=1 origin main 2>&1; then
       if git -C "$root" checkout -B main FETCH_HEAD 2>&1; then
         echo "[auto-update] Git update to main succeeded, relaunching ${relaunch}..."

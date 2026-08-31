@@ -29,8 +29,11 @@ run_privileged(){
 }
 
 # --- auto-update (optional) ---
-# Fix divergent branches fatal error for users who ran `git pull` manually
+# Fix dubious ownership + divergent branches fatal error for users who ran `git pull` manually
+# This is critical when /root/zmk-vision is owned by different UID or when running via sudo
 if [[ -d .git ]]; then
+  git config --global --add safe.directory "$(pwd)" >/dev/null 2>&1 || true
+  if command -v sudo >/dev/null 2>&1; then sudo git config --global --add safe.directory "$(pwd)" >/dev/null 2>&1 || true; fi
   git config pull.rebase false >/dev/null 2>&1 || true
   git config pull.ff only >/dev/null 2>&1 || true
 fi
@@ -38,6 +41,7 @@ fi
 # one-command launch re-checkouts main and silently removes the current
 # go2rtc/WebRTC build. main is the only channel auto-update may rewrite.
 if [[ "${1:-}" != "--no-update" && -z "${ZMK_NO_AUTO_UPDATE:-}" && -f installers/auto-update.sh ]]; then
+  if [[ -d .git ]]; then git config --global --add safe.directory "$(pwd)" >/dev/null 2>&1 || true; fi
   if [[ -d .git ]] && git branch --show-current 2>/dev/null | grep -qvE '^(main|master)$'; then
     echo "[start] Feature branch active; release auto-update is skipped to preserve this build."
   else
@@ -118,6 +122,8 @@ repair_build_cache(){
   sleep 2
   # Fix divergent git state that can break future pulls
   if [[ -d .git ]]; then
+    git config --global --add safe.directory "$(pwd)" >/dev/null 2>&1 || true
+    if command -v sudo >/dev/null 2>&1; then sudo git config --global --add safe.directory "$(pwd)" >/dev/null 2>&1 || true; fi
     git config pull.rebase false >/dev/null 2>&1 || true
     git fetch --prune --tags --force origin 2>&1 | tail -3 || true
   fi

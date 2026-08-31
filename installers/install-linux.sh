@@ -123,6 +123,7 @@ print_install_summary(){
   local version ref revision profile compose_display launch_command
   version=$(tr -d '[:space:]' < VERSION 2>/dev/null || printf 'DEV')
   if command -v git >/dev/null 2>&1 && [[ -d .git ]]; then
+    git config --global --add safe.directory "$(pwd)" >/dev/null 2>&1 || true
     ref=$(git branch --show-current 2>/dev/null || printf 'DETACHED')
     revision=$(git rev-parse --short HEAD 2>/dev/null || printf 'UNKNOWN')
   else
