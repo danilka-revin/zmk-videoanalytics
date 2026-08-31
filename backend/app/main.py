@@ -41,7 +41,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-APP_VERSION = "2.13.11"
+APP_VERSION = "2.13.12"
 TZ = timezone(timedelta(hours=7))
 CAMERA_TELEMETRY_STALE_SECONDS = 30
 HIGH_FPS_MODE = os.getenv("CAMERA_HIGH_FPS_MODE", "true").strip().lower() not in {"0","false","no","off"}
