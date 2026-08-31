@@ -16,9 +16,24 @@
 set -Eeuo pipefail
 
 ZMK_REPO="${ZMK_REPO:-danilka-revin/zmk-videoanalytics}"
-ZMK_REF="${ZMK_REF:-main}"
 ZMK_INSTALL_DIR="${ZMK_INSTALL_DIR:-$HOME/zmk-vision}"
 ZMK_GIT_URL="https://github.com/${ZMK_REPO}.git"
+
+# Resolve the update ref:
+#   1) an explicit launcher/env override wins;
+#   2) otherwise the pinned ref recorded in .zmk-ref (set by a previous run);
+#   3) otherwise the public release channel (main).
+# The launcher stores ZMK_REF=auto so a one-command `zmk-vision` keeps tracking
+# the current work branch until it disappears after the PR is merged, and then
+# automatically falls back to main.
+ZMK_REF="${ZMK_REF:-}"
+if [[ "$ZMK_REF" == "auto" || -z "$ZMK_REF" ]]; then
+  if [[ -f "$ZMK_INSTALL_DIR/.zmk-ref" ]]; then
+    ZMK_REF="$(tr -d '[:space:]' < "$ZMK_INSTALL_DIR/.zmk-ref")"
+  else
+    ZMK_REF="main"
+  fi
+fi
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }
 info(){ echo "[zmk-bootstrap] $*"; }
@@ -50,6 +65,17 @@ if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
   [[ "$current_origin" == "$ZMK_GIT_URL" ]] || fail "The target has another git origin: ${current_origin}"
   changes=$(git -C "$ZMK_INSTALL_DIR" status --porcelain --untracked-files=no)
   [[ -z "$changes" ]] || fail "Tracked local changes found. They were not overwritten; commit or stash them first."
+
+  # A pinned feature branch that no longer exists on the remote has normally
+  # been merged and deleted. Fall back to the public release channel so the
+  # one-command launcher keeps working without manual maintenance.
+  if [[ "$ZMK_REF" != "main" ]]; then
+    if ! git ls-remote --heads "$ZMK_GIT_URL" "$ZMK_REF" >/dev/null 2>&1; then
+      info "Pinned ref ${ZMK_REF} is gone (probably merged); switching to main."
+      ZMK_REF="main"
+    fi
+  fi
+
   info "Downloading ${ZMK_REF} from GitHub..."
   # An explicit `git fetch origin <branch>` records the commit in FETCH_HEAD
   # but does not necessarily create origin/<branch> in shallow checkouts.
@@ -66,11 +92,15 @@ fi
 cd "$ZMK_INSTALL_DIR"
 chmod +x start.sh install.sh installers/*.sh 2>/dev/null || true
 
+# Remember the branch the launcher should keep tracking.
+printf '%s\n' "$ZMK_REF" > "$ZMK_INSTALL_DIR/.zmk-ref"
+
 # Install a short repeatable command. It updates the same Git ref and starts
 # the stack, so the operator no longer has to remember a long curl command.
+# ZMK_REF=auto lets .zmk-ref drive updates and fall back to main after merge.
 ZMK_BIN_DIR="${HOME}/.local/bin"
 mkdir -p "$ZMK_BIN_DIR"
-printf '#!/usr/bin/env bash\nexec env ZMK_REF=%q ZMK_INSTALL_DIR=%q bash %q "$@"\n' "$ZMK_REF" "$ZMK_INSTALL_DIR" "$ZMK_INSTALL_DIR/installers/bootstrap-linux.sh" > "$ZMK_BIN_DIR/zmk-vision"
+printf '#!/usr/bin/env bash\nexec env ZMK_REF=auto ZMK_INSTALL_DIR=%q bash %q "$@"\n' "$ZMK_INSTALL_DIR" "$ZMK_INSTALL_DIR/installers/bootstrap-linux.sh" > "$ZMK_BIN_DIR/zmk-vision"
 chmod +x "$ZMK_BIN_DIR/zmk-vision"
 
 # A clean install uses the same host ports as older ZMK stacks. Stop only

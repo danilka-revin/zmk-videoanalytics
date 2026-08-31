@@ -85,6 +85,12 @@ services:
     - 5173:80
     extra_hosts:
     - host.docker.internal:host-gateway
+    environment:
+      # Host address of go2rtc used by the web nginx proxy under /rtc/. Keep in
+      # sync with GO2RTC_API_URL; on Docker for Linux you may need the host LAN
+      # IP (e.g. http://192.168.0.109:1984) if host.docker.internal is not
+      # resolvable inside the nginx container.
+      GO2RTC_UPSTREAM: ${GO2RTC_UPSTREAM:-http://host.docker.internal:1984}
     depends_on:
       api:
         condition: service_healthy
