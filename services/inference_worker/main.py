@@ -39,17 +39,6 @@ if CAMERA_DECODER not in {"ffmpeg", "opencv"}:
 # NEW ARCHITECTURE v2.14.0: go2rtc is the ONLY RTSP client to camera.
 # Inference worker pulls from go2rtc RTSP (rtsp://host.docker.internal:8554/zmk-{id})
 # instead of direct camera, giving single connection to camera and true 25-60 FPS.
-GO2RTC_PREVIEW_ENABLED = os.getenv("GO2RTC_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
-GO2RTC_FORCE_MJPEG_FALLBACK = os.getenv("CAMERA_LIVE_FORCE_MJPEG", "false").strip().lower() in {"1", "true", "yes", "on"}
-GO2RTC_RTSP_URL = os.getenv("GO2RTC_RTSP_URL", "rtsp://host.docker.internal:8554").rstrip("/")
-GO2RTC_USE_FOR_INFERENCE = os.getenv("GO2RTC_USE_FOR_INFERENCE", "true").strip().lower() not in {"0", "false", "no", "off"}
-# v2.15.0: Never fallback to direct quickly - go2rtc is single connection, stable.
-# Increase to 100 so it stays on go2rtc RTSP and doesn't cause double connections + 4 FPS.
-# Operator can set GO2RTC_INFERENCE_MAX_FAILURES env to lower if needed.
-GO2RTC_INFERENCE_MAX_FAILURES = _bounded_int("GO2RTC_INFERENCE_MAX_FAILURES", 100, 1, 10000)
-
-
-
 def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
     try:
         value = int(os.getenv(name, str(default)))
@@ -64,6 +53,14 @@ def _bounded_float(name: str, default: float, minimum: float, maximum: float) ->
     except (TypeError, ValueError):
         value = default
     return max(minimum, min(maximum, value))
+
+
+GO2RTC_PREVIEW_ENABLED = os.getenv("GO2RTC_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+GO2RTC_FORCE_MJPEG_FALLBACK = os.getenv("CAMERA_LIVE_FORCE_MJPEG", "false").strip().lower() in {"1", "true", "yes", "on"}
+GO2RTC_RTSP_URL = os.getenv("GO2RTC_RTSP_URL", "rtsp://host.docker.internal:8554").rstrip("/")
+GO2RTC_USE_FOR_INFERENCE = os.getenv("GO2RTC_USE_FOR_INFERENCE", "true").strip().lower() not in {"0", "false", "no", "off"}
+# v2.16.1: Fast fallback to direct after 5 failures to avoid infinite connecting when go2rtc can't reach camera
+GO2RTC_INFERENCE_MAX_FAILURES = _bounded_int("GO2RTC_INFERENCE_MAX_FAILURES", 5, 1, 10000)
 
 
 def _go2rtc_rtsp_url_for(camera_id: str) -> str:
@@ -1335,7 +1332,8 @@ class Runtime:
         # User explicitly banned MJPEG for preview: "только давай не через mjpeg а то там будет 4 фпс"
         # So we DISABLE live-frame MJPEG publish when go2rtc is enabled, saving CPU and keeping decode at 60 FPS.
         # Snapshot still published every 3 sec for evidence fallback, and boxes via /visual JSON.
-        if GO2RTC_PREVIEW_ENABLED and not GO2RTC_FORCE_MJPEG_FALLBACK:
+        if GO2RTC_PREVIEW_ENABLED and not GO2RTC_FORCE_MJPEG_FALLBACK and session.using_go2rtc:
+            # Using go2rtc -> frontend gets MSE/HLS directly, no need for MJPEG re-encode
             return
         if LIVE_PREVIEW_FPS <= 0:
             return
