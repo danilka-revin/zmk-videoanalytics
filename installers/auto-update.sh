@@ -126,31 +126,63 @@ zmk_check_and_update(){
   local base="zmk-videoanalytics-${latest}"
   local dl="${ZMK_DL_BASE}/${latest}"
   local tarball="${base}.tar.gz"
-  if ! curl -fsSL --retry 3 --retry-delay 2 --max-time 900 -o "$wd/$tarball" "$dl/$tarball"; then
-    zmk_err "download failed: ${dl}/${tarball}"; rm -rf "$wd"; return 1
+  local dl_ok=0
+  if curl -fsSL --retry 3 --retry-delay 2 --max-time 900 -o "$wd/$tarball" "$dl/$tarball"; then
+    if curl -fsSL --retry 3 --max-time 60 -o "$wd/SHA256SUMS.txt" "$dl/SHA256SUMS.txt"; then
+      local expected actual
+      expected=$(awk -v f="$tarball" '$2==f{print $1}' "$wd/SHA256SUMS.txt")
+      if [[ -n "$expected" ]]; then
+        actual=$(sha256sum "$wd/$tarball" | awk '{print $1}')
+        if [[ "$expected" == "$actual" ]]; then
+          echo "[auto-update] SHA256 verified."
+          dl_ok=1
+        else
+          zmk_err "SHA256 mismatch for ${tarball} (expected ${expected}, got ${actual})"
+        fi
+      else
+        zmk_err "no checksum for ${tarball} in SHA256SUMS.txt"
+      fi
+    else
+      zmk_err "could not fetch SHA256SUMS.txt from $dl"
+    fi
+  else
+    zmk_err "download failed: ${dl}/${tarball} (will try git fallback)"
   fi
-  if ! curl -fsSL --retry 3 --max-time 60 -o "$wd/SHA256SUMS.txt" "$dl/SHA256SUMS.txt"; then
-    zmk_err "could not fetch SHA256SUMS.txt"; rm -rf "$wd"; return 1
+  if [[ "$dl_ok" == "1" ]]; then
+    if ! tar -xzf "$wd/$tarball" -C "$wd"; then
+      zmk_err "failed to extract ${tarball}"; rm -rf "$wd"; return 1
+    fi
+    local staged="$wd/zmk-videoanalytics"
+    [[ -d "$staged" ]] || { zmk_err "archive has no zmk-videoanalytics directory"; rm -rf "$wd"; return 1; }
+    # Run the NEW updater from the staging tree in apply mode
+    exec env ZMK_RELAUNCHED_AFTER_UPDATE=1 bash "$staged/installers/auto-update.sh" apply "${relaunch}" "$staged" "$root"
   fi
-  local expected actual
-  expected=$(awk -v f="$tarball" '$2==f{print $1}' "$wd/SHA256SUMS.txt")
-  if [[ -z "$expected" ]]; then
-    zmk_err "no checksum for ${tarball} in SHA256SUMS.txt"; rm -rf "$wd"; return 1
+  # Fallback: git-based update if tarball not available (e.g. 404 before Release assets uploaded)
+  if [[ -d "$root/.git" ]]; then
+    echo "[auto-update] Tarball unavailable, trying git fetch for ${latest}..."
+    # Fix divergent branches config
+    git -C "$root" config pull.rebase false >/dev/null 2>&1 || true
+    git -C "$root" fetch --prune --tags --force origin 2>&1 | tail -5 || true
+    # Try to checkout the tag directly, then main if tag checkout fails
+    if git -C "$root" fetch --depth=1 origin "$latest" 2>&1; then
+      if git -C "$root" checkout -B main FETCH_HEAD 2>&1 || git -C "$root" checkout -B main "origin/$latest" 2>&1 || git -C "$root" checkout "$latest" 2>&1; then
+        echo "[auto-update] Git update to ${latest} succeeded, relaunching ${relaunch}..."
+        rm -rf "$wd"
+        exec env ZMK_RELAUNCHED_AFTER_UPDATE=1 bash "$root/${relaunch}"
+      fi
+    fi
+    # Last resort: fetch main
+    if git -C "$root" fetch --depth=1 origin main 2>&1; then
+      if git -C "$root" checkout -B main FETCH_HEAD 2>&1; then
+        echo "[auto-update] Git update to main succeeded, relaunching ${relaunch}..."
+        rm -rf "$wd"
+        exec env ZMK_RELAUNCHED_AFTER_UPDATE=1 bash "$root/${relaunch}"
+      fi
+    fi
+    zmk_err "git fallback also failed"
   fi
-  actual=$(sha256sum "$wd/$tarball" | awk '{print $1}')
-  if [[ "$expected" != "$actual" ]]; then
-    zmk_err "SHA256 mismatch for ${tarball} (expected ${expected}, got ${actual})"; rm -rf "$wd"; return 1
-  fi
-  echo "[auto-update] SHA256 verified."
-  if ! tar -xzf "$wd/$tarball" -C "$wd"; then
-    zmk_err "failed to extract ${tarball}"; rm -rf "$wd"; return 1
-  fi
-  local staged="$wd/zmk-videoanalytics"
-  [[ -d "$staged" ]] || { zmk_err "archive has no zmk-videoanalytics directory"; rm -rf "$wd"; return 1; }
-  # Run the NEW updater from the staging tree in apply mode; it swaps files
-  # into $root, then relaunches $relaunch. Reading from staging (not $root)
-  # keeps the currently running script safe while files are replaced.
-  exec env ZMK_RELAUNCHED_AFTER_UPDATE=1 bash "$staged/installers/auto-update.sh" apply "${relaunch}" "$staged" "$root"
+  rm -rf "$wd"
+  return 1
 }
 
 # Only run the auto-update flow when this file is executed directly
