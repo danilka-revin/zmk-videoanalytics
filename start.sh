@@ -29,6 +29,11 @@ run_privileged(){
 }
 
 # --- auto-update (optional) ---
+# Fix divergent branches fatal error for users who ran `git pull` manually
+if [[ -d .git ]]; then
+  git config pull.rebase false >/dev/null 2>&1 || true
+  git config pull.ff only >/dev/null 2>&1 || true
+fi
 # Release updater is intentionally skipped on feature branches. Otherwise a
 # one-command launch re-checkouts main and silently removes the current
 # go2rtc/WebRTC build. main is the only channel auto-update may rewrite.
@@ -105,11 +110,17 @@ repair_build_cache(){
   # never touch named volumes, data, models or bot tokens.
   echo "[start] Docker BuildKit не собрал образы. Очищаю только кэш сборки и повторяю один раз..."
   "${DOCKER[@]}" builder prune -af >/dev/null 2>&1 || true
+  "${DOCKER[@]}" builder prune --all -f >/dev/null 2>&1 || true
   "${DOCKER[@]}" buildx prune -af >/dev/null 2>&1 || true
   # Also clear Buildx cache that can hold corrupted parent snapshots
   "${DOCKER[@]}" system prune -f --filter "until=24h" >/dev/null 2>&1 || true
   run_privileged systemctl restart docker 2>/dev/null || true
   sleep 2
+  # Fix divergent git state that can break future pulls
+  if [[ -d .git ]]; then
+    git config pull.rebase false >/dev/null 2>&1 || true
+    git fetch --prune --tags --force origin 2>&1 | tail -3 || true
+  fi
 }
 
 start_stack(){

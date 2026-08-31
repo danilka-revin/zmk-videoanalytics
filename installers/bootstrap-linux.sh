@@ -92,12 +92,19 @@ if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
   fi
 
   info "Downloading ${ZMK_REF} from GitHub..."
+  # Fix divergent branches fatal error: set pull strategy and prune tags
+  git -C "$ZMK_INSTALL_DIR" config pull.rebase false >/dev/null 2>&1 || true
+  git -C "$ZMK_INSTALL_DIR" config pull.ff only >/dev/null 2>&1 || true
+  git -C "$ZMK_INSTALL_DIR" fetch --prune --tags --force origin 2>&1 | tail -5 || true
   # An explicit `git fetch origin <branch>` records the commit in FETCH_HEAD
   # but does not necessarily create origin/<branch> in shallow checkouts.
   # Checking out FETCH_HEAD works for main as well as slash-containing feature
   # branches (e.g. arena/...) and keeps the one-command launcher repeatable.
-  git -C "$ZMK_INSTALL_DIR" fetch --depth=1 origin "$ZMK_REF"
-  git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" FETCH_HEAD
+  # Use --depth=1 for speed, fallback to full fetch if shallow fails
+  if ! git -C "$ZMK_INSTALL_DIR" fetch --depth=1 origin "$ZMK_REF" 2>&1; then
+    git -C "$ZMK_INSTALL_DIR" fetch origin "$ZMK_REF" --prune --tags 2>&1 | tail -5 || true
+  fi
+  git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" FETCH_HEAD 2>&1 || git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" "origin/$ZMK_REF" 2>&1 || git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" "$ZMK_REF" 
 else
   [[ ! -e "$ZMK_INSTALL_DIR" ]] || fail "Target exists but is not a git checkout: $ZMK_INSTALL_DIR"
   info "Downloading a fresh copy of ${ZMK_REF} from GitHub..."
