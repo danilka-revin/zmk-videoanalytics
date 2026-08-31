@@ -29,11 +29,15 @@ DEVICE_SETTING = os.getenv("INFERENCE_DEVICE", "auto").strip() or "auto"
 CAMERA_DECODER = os.getenv("CAMERA_DECODER", "opencv").strip().lower()
 if CAMERA_DECODER not in {"ffmpeg", "opencv"}:
     CAMERA_DECODER = "ffmpeg"
-# go2rtc provides the preferred WebRTC path (H.264/H.265 direct to browser).
-# The worker still publishes a high-FPS MJPEG fallback so the panel remains
-# truly live like VLC even if go2rtc is temporarily unreachable.
+# go2rtc provides the preferred WebRTC path (H.264/H.265 direct to browser) like VLC.
+# When enabled, the worker skips expensive MJPEG re-encode (the 4 FPS bottleneck)
+# and lets the browser receive H264 directly via WebRTC. Boxes are sent as
+# lightweight JSON overlay via /visual. Model always uses full-quality frame
+# via image.copy() — preview quality never affects detection.
 # Set CAMERA_LIVE_FPS=0 to fully disable the MJPEG fallback and reduce CPU.
+# Set CAMERA_LIVE_FORCE_MJPEG=true to force MJPEG even when go2rtc is enabled (debug).
 GO2RTC_PREVIEW_ENABLED = os.getenv("GO2RTC_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+GO2RTC_FORCE_MJPEG_FALLBACK = os.getenv("CAMERA_LIVE_FORCE_MJPEG", "false").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -1250,9 +1254,13 @@ class Runtime:
             self._log(f"snapshot upload failed for {session.config.camera_id}: {redact_error(exc)}")
 
     async def _publish_live(self, session: CameraSession, image: Any) -> None:
-        # VLC-like live preview: raw frame at full FPS, overlay done in frontend
-        # This is the fast path — no copy, no boxes baked, just raw JPEG at 720p/65%
-        # Boxes are sent separately via _publish_visual and drawn as HTML overlay
+        # FIX 4 FPS bottleneck: when go2rtc is enabled, skip expensive MJPEG re-encode
+        # WebRTC H264 direct is primary like VLC — true 25-60 FPS, no quality cut.
+        # Model always uses full-quality frame via image.copy(), not this JPEG.
+        # MJPEG is only fallback when go2rtc disabled or CAMERA_LIVE_FPS=0 disables it,
+        # or when CAMERA_LIVE_FORCE_MJPEG=true forces it for debugging.
+        if GO2RTC_PREVIEW_ENABLED and not GO2RTC_FORCE_MJPEG_FALLBACK:
+            return
         if LIVE_PREVIEW_FPS <= 0:
             return
         now = time.monotonic()

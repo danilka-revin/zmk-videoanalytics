@@ -41,7 +41,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-APP_VERSION = "2.12.0"
+APP_VERSION = "2.13.11"
 TZ = timezone(timedelta(hours=7))
 CAMERA_TELEMETRY_STALE_SECONDS = 30
 HIGH_FPS_MODE = os.getenv("CAMERA_HIGH_FPS_MODE", "true").strip().lower() not in {"0","false","no","off"}
@@ -1784,7 +1784,8 @@ def camera_mjpeg(camera_id:str):
     con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
     if not row: raise HTTPException(404,"Камера не найдена")
     if not row[0]: raise HTTPException(409,"Аналитика камеры отключена")
-    # Try go2rtc direct MJPEG first for true VLC-like FPS
+    # WebRTC H264 direct is primary like VLC. This MJPEG endpoint is fallback only.
+    # Try go2rtc direct MJPEG first for true VLC-like FPS (Go implementation faster than Python)
     if GO2RTC_ENABLED and GO2RTC_API_URL:
         for candidate_name in (f"zmk-{camera_id}", camera_id):
             try:
@@ -1802,14 +1803,25 @@ def camera_mjpeg(camera_id:str):
                         return StreamingResponse(go2rtc_generate(), media_type="multipart/x-mixed-replace; boundary=--go2rtc", headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
             except (httpx.HTTPError, OSError, RuntimeError, ValueError):
                 continue
+        # If go2rtc enabled but stream not ready, return 503 quickly so frontend retries WebRTC
+        # instead of hanging on empty worker MJPEG (which is now disabled when go2rtc enabled)
+        if not _live_frames.get(camera_id):
+            raise HTTPException(503,"go2rtc stream not ready, retry WebRTC")
     def generate():
         sequence=-1
+        idle=0
         while True:
             with _live_frames_lock:
                 item=_live_frames.get(camera_id)
             if item and item[0]!=sequence:
                 sequence,_,image=item
+                idle=0
                 yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "+str(len(image)).encode()+b"\r\n\r\n"+image+b"\r\n"
+            else:
+                idle+=1
+                # If no frame for 5 sec, break so frontend can fallback to snapshot and retry WebRTC
+                if idle>250:  # 250 * 0.02 = 5 sec
+                    break
             time.sleep(.02)
     return StreamingResponse(generate(),media_type="multipart/x-mixed-replace; boundary=frame",headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
 
