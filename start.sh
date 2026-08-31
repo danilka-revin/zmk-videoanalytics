@@ -124,13 +124,21 @@ repair_build_cache(){
 }
 
 start_stack(){
+  # Always disable Bake to avoid WARN when buildx isn't installed - use classic builder path
+  export COMPOSE_BAKE=false
+  export COMPOSE_DOCKER_CLI_BUILD=0
+  # First attempt with Bake disabled to avoid warning and use reliable path
+  if COMPOSE_BAKE=false COMPOSE_DOCKER_CLI_BUILD=0 "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
+    return 0
+  fi
+  # Fallback to default (with Bake) in case user has buildx
   if "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
     return 0
   fi
   repair_build_cache
   # Serial service builds avoid a second concurrent snapshot/export race.
   echo "[start] Повторная сборка с лимитом параллелизма..."
-  if COMPOSE_PARALLEL_LIMIT=1 "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
+  if COMPOSE_PARALLEL_LIMIT=1 COMPOSE_BAKE=false COMPOSE_DOCKER_CLI_BUILD=0 "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
     return 0
   fi
   echo "[start] BuildKit всё ещё падает, пробую без BuildKit и без Bake..."

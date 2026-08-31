@@ -1,10 +1,8 @@
-FROM python:3.12-slim
+FROM python:3.12-alpine
 
-# Docker CLI + Compose v2 plugin (used to redeploy the stack through the
-# mounted /var/run/docker.sock after an in-app update).
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends curl docker.io \
-    && rm -rf /var/lib/apt/lists/*
+# Use Alpine for fast apk install - docker-cli is small, unlike apt docker.io
+# docker-cli + docker-cli-compose provides `docker compose` via mounted /var/run/docker.sock
+RUN apk add --no-cache curl docker-cli docker-cli-compose
 
 WORKDIR /app
 COPY requirements.txt .
