@@ -66,8 +66,9 @@ ensure_command curl curl
 #   3) otherwise the pinned ref recorded in .zmk-ref (set by a previous run);
 #   4) otherwise the public release channel (main).
 # The launcher stores ZMK_REF=auto so a one-command `zmk-vision` keeps tracking
-# the current work branch until it disappears after the PR is merged, and then
-# automatically falls back to main.
+# the current work branch while it is open, and automatically falls back to
+# main as soon as that branch has been merged (arena/* branches stay on the
+# remote after merge, so the switch is detected by ancestry, not deletion).
 CURRENT_BRANCH=""
 if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
   zmk_ensure_safe_git "$ZMK_INSTALL_DIR"
@@ -117,16 +118,38 @@ if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
   git -C "$ZMK_INSTALL_DIR" fetch --prune --tags --force origin 2>&1 | tail -5 || true
   # An explicit `git fetch origin <branch>` records the commit in FETCH_HEAD
   # but does not necessarily create origin/<branch> in shallow checkouts.
-  # Checking out FETCH_HEAD works for main as well as slash-containing feature
-  # branches (e.g. arena/...) and keeps the one-command launcher repeatable.
-  # Use --depth=1 for speed, fallback to full fetch if shallow fails
+  # Checking out the fetched commit works for main as well as slash-containing
+  # feature branches (e.g. arena/...) and keeps the one-command launcher
+  # repeatable. Use --depth=1 for speed, fallback to full fetch if shallow fails
   if ! git -C "$ZMK_INSTALL_DIR" fetch --depth=1 origin "$ZMK_REF" 2>&1; then
     git -C "$ZMK_INSTALL_DIR" fetch origin "$ZMK_REF" --prune --tags 2>&1 | tail -5 || true
   fi
+  checkout_target="$(git -C "$ZMK_INSTALL_DIR" rev-parse FETCH_HEAD 2>/dev/null || true)"
+
+  # arena/* work branches stay on the remote after their PR is merged, so the
+  # existence check above cannot detect a merge. When the pinned tip is already
+  # part of main's history the branch can never move again; switch the
+  # one-command launcher to the release channel instead of tracking it forever.
+  if [[ "$ZMK_REF" != "main" && -n "$checkout_target" ]]; then
+    # A shallow checkout hides the merge commit's second parent, so unshallow
+    # main once to compare ancestry exactly; later runs use a plain fetch.
+    if [[ -f "$ZMK_INSTALL_DIR/.git/shallow" ]]; then
+      git -C "$ZMK_INSTALL_DIR" fetch --unshallow origin main >/dev/null 2>&1 || true
+    else
+      git -C "$ZMK_INSTALL_DIR" fetch origin main >/dev/null 2>&1 || true
+    fi
+    main_tip="$(git -C "$ZMK_INSTALL_DIR" rev-parse FETCH_HEAD 2>/dev/null || true)"
+    if [[ -n "$main_tip" ]] && git -C "$ZMK_INSTALL_DIR" merge-base --is-ancestor "$checkout_target" "$main_tip" 2>/dev/null; then
+      info "Pinned ref ${ZMK_REF} is already merged into main; switching to main."
+      ZMK_REF="main"
+      checkout_target="$main_tip"
+    fi
+  fi
+
   git -C "$ZMK_INSTALL_DIR" reset --hard HEAD >/dev/null 2>&1 || true
   git -C "$ZMK_INSTALL_DIR" clean -fd >/dev/null 2>&1 || true
   # Try tag first, then branch - handle both v2.14.0 tag and main branch
-  git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" FETCH_HEAD 2>&1 || git -C "$ZMK_INSTALL_DIR" checkout -B main origin/main 2>&1 || git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" "origin/$ZMK_REF" 2>&1 || git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" "$ZMK_REF" 2>&1 || git -C "$ZMK_INSTALL_DIR" checkout "$ZMK_REF" 2>&1
+  git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" "$checkout_target" 2>&1 || git -C "$ZMK_INSTALL_DIR" checkout -B main origin/main 2>&1 || git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" "origin/$ZMK_REF" 2>&1 || git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" "$ZMK_REF" 2>&1 || git -C "$ZMK_INSTALL_DIR" checkout "$ZMK_REF" 2>&1
 
 else
   [[ ! -e "$ZMK_INSTALL_DIR" ]] || fail "Target exists but is not a git checkout: $ZMK_INSTALL_DIR"

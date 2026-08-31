@@ -38,6 +38,31 @@ curl "http://HOST:1984/rtc/api/streams" | jq '.zmk-cam_env_01.producers[0].url'
 docker logs zmk-vision-go2rtc-1 --tail 20   # больше нет "unsupported protocol scheme"
 ```
 
+# ZMK Vision v2.16.3 — одна команда снова ведёт на main после merge PR
+
+## Проблема
+
+После merge PR рабочая ветка `arena/…` остаётся на remote (она не удаляется), поэтому
+launcher `zmk-vision` продолжал «сидеть» на ней вечно и больше не получал обновления
+релизного канала `main`. Одной командой обновить и запустить `main` не получалось.
+
+## Фикс
+
+**installers/bootstrap-linux.sh:** после `git fetch` закреплённой ветки launcher сверяет её
+верхний коммит с историей `main` через `git merge-base --is-ancestor`:
+
+- shallow-клоны один раз распаковываются (`git fetch --unshallow origin main`), чтобы
+  merge-коммит с его вторым родителем был виден для точной проверки;
+- если закреплённый коммит уже в `main` — launcher переключается на `main` и дальше
+  `zmk-vision` (одна команда) обновляет и запускает релизный канал, как раньше;
+- если ветка ещё не слита — работа на ней продолжается без изменений.
+
+## Проверка
+
+```bash
+pytest tests/test_installers.py -q   # в т.ч. test_launcher_detects_merged_branch_and_switches_to_main
+```
+
 ---
 
 # ZMK Vision v2.14.2 — fix frontend build TS1382 + TS2345

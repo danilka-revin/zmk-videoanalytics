@@ -47,8 +47,14 @@ def test_bootstrap_launcher_and_rtsp_wizard_escape_credentials(tmp_path):
     assert 'TELEGRAM_ADMIN_USERNAMES' in (ROOT/'installers/wizard.sh').read_text()
     # Explicit shallow fetches populate FETCH_HEAD, but do not guarantee a
     # remote-tracking origin/<slash-containing-branch> ref. The repeat launcher
-    # must therefore check out the fetched commit directly.
-    assert 'checkout -B "$ZMK_REF" FETCH_HEAD' in bootstrap
+    # must therefore check out the fetched commit (captured as checkout_target)
+    # directly rather than relying on an origin/<branch> tracking ref.
+    assert 'checkout_target="$(git -C "$ZMK_INSTALL_DIR" rev-parse FETCH_HEAD' in bootstrap
+    assert 'checkout -B "$ZMK_REF" "$checkout_target"' in bootstrap
+    # A merged arena/* branch stays on the remote, so the launcher must detect
+    # the merge by ancestry and switch the one-command channel back to main.
+    assert 'merge-base --is-ancestor' in bootstrap
+    assert 'is already merged into main; switching to main' in bootstrap
     # bootstrap has already checked out the requested Git ref; the release
     # updater must not replace a feature branch immediately afterwards.
     assert 'ZMK_NO_AUTO_UPDATE=1' in bootstrap
@@ -105,6 +111,83 @@ def test_shallow_fetch_of_feature_branch_checks_out_fetch_head(tmp_path):
     assert missing_tracking.returncode != 0
     git('checkout', '-B', 'arena/test-launcher', 'FETCH_HEAD', cwd=clone)
     assert git('rev-parse', 'HEAD', cwd=clone).stdout.strip() == expected
+
+
+def _build_git_remote(path: Path, merged: bool):
+    """Create a local bare remote with main + arena/test-launcher.
+
+    When ``merged`` is True the feature branch is merged into main with a
+    no-ff merge commit (like a GitHub PR merge) while the branch ref itself
+    stays on the remote.  Returns (remote_url, feature_tip).
+    """
+    def git(*args, cwd):
+        return subprocess.run(['git', *args], cwd=cwd, text=True, capture_output=True, check=True)
+
+    path.mkdir(parents=True, exist_ok=True)
+    remote = path / 'remote.git'
+    source = path / 'source'
+    git('init', '--bare', str(remote), cwd=path)
+    git('init', '-b', 'main', str(source), cwd=path)
+    git('config', 'user.email', 'test@example.invalid', cwd=source)
+    git('config', 'user.name', 'Test', cwd=source)
+    (source / 'f.txt').write_text('main\n')
+    git('add', '.', cwd=source); git('commit', '-m', 'base', cwd=source)
+    git('remote', 'add', 'origin', str(remote), cwd=source)
+    git('push', '-u', 'origin', 'main', cwd=source)
+    git('checkout', '-b', 'arena/test-launcher', cwd=source)
+    (source / 'f.txt').write_text('feature\n')
+    git('commit', '-am', 'feature', cwd=source)
+    feature_tip = git('rev-parse', 'HEAD', cwd=source).stdout.strip()
+    git('push', 'origin', 'arena/test-launcher', cwd=source)
+    if merged:
+        git('checkout', 'main', cwd=source)
+        git('merge', '--no-ff', 'arena/test-launcher', '-m', 'merge PR', cwd=source)
+        git('push', 'origin', 'main', cwd=source)
+    else:
+        git('checkout', 'main', cwd=source)
+        (source / 'm.txt').write_text('main moves on\n')
+        git('add', '.', cwd=source); git('commit', '-m', 'main moves on', cwd=source)
+        git('push', 'origin', 'main', cwd=source)
+    return f'file://{remote}', feature_tip
+
+
+def test_launcher_detects_merged_branch_and_switches_to_main(tmp_path):
+    """A merged arena/* branch stays on the remote, so the bootstrap must
+    switch back to main by ancestry, not by branch deletion.
+
+    Reproduces the exact fetch/compare sequence from bootstrap-linux.sh
+    against a local bare remote (no network dependency).
+    """
+    def git(*args, cwd):
+        return subprocess.run(['git', *args], cwd=cwd, text=True, capture_output=True, check=True)
+
+    def merged_into_main(clone: Path) -> bool:
+        # Mirror bootstrap-linux.sh: shallow-fetch the pinned ref, then decide
+        # whether its tip is already an ancestor of main's tip.
+        git('fetch', '--depth=1', 'origin', 'arena/test-launcher', cwd=clone)
+        pinned = git('rev-parse', 'FETCH_HEAD', cwd=clone).stdout.strip()
+        if (clone / '.git' / 'shallow').exists():
+            git('fetch', '--unshallow', 'origin', 'main', cwd=clone)
+        else:
+            git('fetch', 'origin', 'main', cwd=clone)
+        main_tip = git('rev-parse', 'FETCH_HEAD', cwd=clone).stdout.strip()
+        result = subprocess.run(
+            ['git', 'merge-base', '--is-ancestor', pinned, main_tip],
+            cwd=clone, text=True, capture_output=True, check=False,
+        )
+        return result.returncode == 0
+
+    # Not merged yet: the one-command launcher must keep tracking the branch.
+    remote, _feature_tip = _build_git_remote(tmp_path / 'case-not-merged', merged=False)
+    clone = tmp_path / 'clone-not-merged'
+    git('clone', '--depth=1', '--branch', 'arena/test-launcher', '--single-branch', remote, str(clone), cwd=tmp_path)
+    assert merged_into_main(clone) is False
+
+    # Merged (branch still on remote): the launcher must switch to main.
+    remote2, _feature_tip2 = _build_git_remote(tmp_path / 'case-merged', merged=True)
+    clone2 = tmp_path / 'clone-merged'
+    git('clone', '--depth=1', '--branch', 'arena/test-launcher', '--single-branch', remote2, str(clone2), cwd=tmp_path)
+    assert merged_into_main(clone2) is True
 
 
 def test_windows_wrapper_and_powershell_structure():
