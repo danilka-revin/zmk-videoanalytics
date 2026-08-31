@@ -1205,6 +1205,25 @@ class Runtime:
                 return bytes(encoded)
         return None
 
+    @staticmethod
+    def _encode_live(image: Any) -> bytes | None:
+        # VLC-like fast path: smaller frame, fixed quality, no size loop
+        # Raw preview at full FPS, overlay is done in frontend, not baked here
+        try:
+            height, width = image.shape[:2]
+            preview = image
+            longest = max(width, height)
+            # Live preview: 720p max for speed, 960 for snapshot is too heavy for 25 FPS
+            if longest > 720:
+                scale = 720 / longest
+                preview = cv2.resize(image, (max(1, int(width * scale)), max(1, int(height * scale))), interpolation=cv2.INTER_LINEAR)
+            ok, encoded = cv2.imencode(".jpg", preview, [cv2.IMWRITE_JPEG_QUALITY, 65])
+            if ok:
+                return bytes(encoded)
+        except (AttributeError, OSError, RuntimeError, ValueError):
+            return None
+        return None
+
     async def _publish_snapshot(self, session: CameraSession, image: Any) -> None:
         now = time.monotonic()
         if now - session.last_snapshot_at < SNAPSHOT_INTERVAL_SECONDS:
@@ -1230,23 +1249,52 @@ class Runtime:
             self._log(f"snapshot upload failed for {session.config.camera_id}: {redact_error(exc)}")
 
     async def _publish_live(self, session: CameraSession, image: Any) -> None:
-        # VLC-like live preview: always publish MJPEG when LIVE_FPS>0, even
-        # if go2rtc is enabled. This gives a real high-FPS fallback and prevents
-        # the 3-second snapshot slideshow when WebRTC signalling fails.
+        # VLC-like live preview: raw frame at full FPS, overlay done in frontend
+        # This is the fast path — no copy, no boxes baked, just raw JPEG at 720p/65%
+        # Boxes are sent separately via _publish_visual and drawn as HTML overlay
         if LIVE_PREVIEW_FPS <= 0:
             return
         now = time.monotonic()
         rate = min(session.config.fps_limit, LIVE_PREVIEW_FPS)
         if rate <= 0 or now - session.last_live_at < 1 / rate:
             return
+        # Update timestamp BEFORE encoding/upload to avoid POST latency throttling FPS to 4
+        session.last_live_at = now
         try:
-            encoded = await asyncio.to_thread(self._encode_snapshot, image)
+            encoded = await asyncio.to_thread(self._encode_live, image)
             if not encoded:
                 return
+            # Fire-and-forget style: we already updated last_live_at, so next frame can be scheduled
+            # even if this POST is still in flight. Await it but don't block rate limiter.
             await self.post_internal_jpeg(f"/api/internal/cameras/{session.config.camera_id}/live-frame", encoded)
-            session.last_live_at = now
         except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
             self._log(f"live preview upload failed for {session.config.camera_id}: {redact_error(exc)}")
+
+    async def _publish_visual(self, session: CameraSession, visual: Any | None) -> None:
+        # Publish boxes for frontend overlay — lightweight, no image re-encode
+        # Frontend draws boxes on top of raw video, not baked into JPEG
+        if visual is None:
+            return
+        try:
+            # Convert boxes to frontend-friendly format
+            boxes = []
+            for b in visual.boxes:
+                x1,y1,x2,y2 = b.bbox
+                boxes.append({
+                    "bbox": [float(x1), float(y1), float(x2), float(y2)],
+                    "label": str(b.label),
+                    "semantic": str(b.semantic),
+                    "confidence": float(b.confidence),
+                    "model": str(b.model_name),
+                })
+            payload = {
+                "shape": [int(visual.shape[0]), int(visual.shape[1])],
+                "boxes": boxes,
+                "timestamp": __import__("datetime").datetime.now(__import__("datetime").timezone.utc).isoformat(),
+            }
+            await self.post_internal(f"/api/internal/cameras/{session.config.camera_id}/visual", payload)
+        except (httpx.HTTPError, OSError, RuntimeError, ValueError, TypeError) as exc:
+            self._log(f"visual publish failed for {session.config.camera_id}: {redact_error(exc)}")
 
     async def _publish_event_evidence(self, session: CameraSession, result: Any, image: Any) -> None:
         """Attach the annotated source frame to newly accepted events."""
@@ -1424,14 +1472,20 @@ class Runtime:
         # for a new YOLO pass, so preview FPS follows the RTSP source rather
         # than the much slower inference cadence.
         self._collect_inference_result(session)
-        preview=image
         visual=session.latest_visual
+        # VLC-like: live preview is RAW at full FPS, no baked boxes
+        # Overlay is done in frontend via /api/cameras/{id}/visual
+        await self._publish_live(session, image)
+        # Publish visual boxes for overlay (lightweight)
+        if visual is not None:
+            await self._publish_visual(session, visual)
+        # Snapshot for evidence: annotated with boxes (every 3 sec)
+        preview=image
         try:
             if visual is not None and visual.shape==tuple(image.shape[:2]):
                 preview=draw_detection_overlay(image,visual.boxes,visual.helmet_violations,visual.vest_violations) or image
         except (AttributeError,TypeError,ValueError):
             preview=image
-        await self._publish_live(session, preview)
         await self._publish_snapshot(session, preview)
 
         now=time.monotonic()
