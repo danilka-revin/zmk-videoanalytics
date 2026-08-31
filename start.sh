@@ -29,8 +29,15 @@ run_privileged(){
 }
 
 # --- auto-update (optional) ---
-if [[ "${1:-}" != "--no-update" && -f installers/auto-update.sh ]]; then
-  bash installers/auto-update.sh start.sh || echo "[start] auto-update check skipped."
+# Release updater is intentionally skipped on feature branches. Otherwise a
+# one-command launch re-checkouts main and silently removes the current
+# go2rtc/WebRTC build. main is the only channel auto-update may rewrite.
+if [[ "${1:-}" != "--no-update" && -z "${ZMK_NO_AUTO_UPDATE:-}" && -f installers/auto-update.sh ]]; then
+  if [[ -d .git ]] && git branch --show-current 2>/dev/null | grep -qvE '^(main|master)$'; then
+    echo "[start] Feature branch active; release auto-update is skipped to preserve this build."
+  else
+    bash installers/auto-update.sh start.sh || echo "[start] auto-update check skipped."
+  fi
 fi
 
 # required project files
@@ -150,6 +157,7 @@ print_launch_summary(){
   printf ' TELEGRAM MINI APP   : http://localhost:5173/telegram\n'
   printf ' API DOCUMENTATION   : http://localhost:8000/docs\n'
   printf ' API HEALTH CHECK    : http://localhost:8000/api/health\n'
+  printf ' WEBRTC UPSTREAM     : GO2RTC_ENABLED=%s GO2RTC_UPSTREAM=%s\n' "${GO2RTC_ENABLED:-true}" "${GO2RTC_UPSTREAM:-http://host.docker.internal:1984}"
   printf '%s\n' '----------------------------------------------------------------'
   printf ' UPDATE / START      : %s\n' "$launch_command"
   printf ' PROJECT START       : ./start.sh\n'
