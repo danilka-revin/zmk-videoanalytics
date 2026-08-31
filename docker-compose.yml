@@ -162,9 +162,9 @@ services:
       INFERENCE_DEVICE: ${INFERENCE_DEVICE:-auto}
       INFERENCE_CONF: ${INFERENCE_CONF:-0.5}
       MODEL_TEST_CONF: ${MODEL_TEST_CONF:-0.10}
-      # ffmpeg is resilient to damaged RTP/H.264 streams; set opencv only for
-      # troubleshooting a known-good local camera.
-      CAMERA_DECODER: ${CAMERA_DECODER:-ffmpeg}
+      # opencv is default for true VLC-like FPS (direct H264 decode, no MJPEG re-encode)
+      # ffmpeg is fallback for damaged streams, but slower (4 FPS).
+      CAMERA_DECODER: ${CAMERA_DECODER:-opencv}
       # Forward every RTSP knob declared in .env. Previously these values
       # were documented but never reached the worker container.
       RTSP_TRANSPORT: ${RTSP_TRANSPORT:-auto}

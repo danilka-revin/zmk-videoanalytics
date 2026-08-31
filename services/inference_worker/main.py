@@ -24,9 +24,9 @@ import httpx
 API = os.getenv("ZMK_API_URL", "http://api:8000").rstrip("/")
 API_KEY = os.getenv("ZMK_API_KEY", "")
 DEVICE_SETTING = os.getenv("INFERENCE_DEVICE", "auto").strip() or "auto"
-# FFmpeg subprocess decoding is the default because it can discard corrupt RTP
-# packets and survive a damaged H.264 GOP much better than OpenCV VideoCapture.
-CAMERA_DECODER = os.getenv("CAMERA_DECODER", "ffmpeg").strip().lower()
+# OpenCV is default for true VLC-like FPS (direct H264 decode, no MJPEG re-encode)
+# FFmpeg is fallback for damaged streams, but slower (4 FPS). Use opencv for 25-60 FPS like VLC.
+CAMERA_DECODER = os.getenv("CAMERA_DECODER", "opencv").strip().lower()
 if CAMERA_DECODER not in {"ffmpeg", "opencv"}:
     CAMERA_DECODER = "ffmpeg"
 # go2rtc provides the preferred WebRTC path (H.264/H.265 direct to browser).
@@ -1049,14 +1049,13 @@ class Runtime:
         command = (
             'exec ffmpeg -hide_banner -nostdin -loglevel warning '
             '-rtsp_transport "$ZMK_RTSP_TRANSPORT" '
-            # Worker-owned asyncio timeout safely terminates this subprocess;
-            # avoid version-specific FFmpeg timeout flags that make some
-            # packaged builds exit immediately with status 255.
             '-fflags +nobuffer+genpts+discardcorrupt -avioflags direct '
             '-err_detect ignore_err -flags low_delay '
             '-max_delay "${ZMK_RTSP_MAX_DELAY_US}" -analyzeduration 0 -probesize 32768 '
             '-i "$ZMK_RTSP_URL" -an -sn -dn -vsync 0 '
-            '-flush_packets 1 -f image2pipe -vcodec mjpeg -q:v 5 pipe:1'
+            # For true FPS like VLC, output MJPEG at high quality but fast
+            # q:v 2 is faster and higher quality than 5, or use rawvideo for max speed
+            '-flush_packets 1 -f image2pipe -vcodec mjpeg -q:v 2 pipe:1'
         )
         process = await asyncio.create_subprocess_exec(
             "sh",
@@ -1540,7 +1539,10 @@ class Runtime:
                         now = time.monotonic()
                         if now < session.next_frame_at:
                             continue
-                        session.next_frame_at = now + 1 / session.config.fps_limit
+                        # For true VLC-like FPS, decode as fast as possible, not limited by fps_limit
+                        # fps_limit only limits published preview rate, not decode rate
+                        # Use 1ms min delay for max 1000 FPS decode, actual FPS limited by camera and decoder
+                        session.next_frame_at = now + 0.001
                         session.frame_task = asyncio.create_task(
                             self.frame(session.config),
                             name=f"camera-frame-{session.config.camera_id}",
