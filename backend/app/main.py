@@ -93,6 +93,11 @@ _dataset_capture_tasks: dict[int,asyncio.Task] = {}
 _live_frames: dict[str, tuple[int, float, bytes]] = {}
 _live_frames_lock = threading.Lock()
 _live_frame_sequence = 0
+# Live visual boxes for overlay: camera_id -> (timestamp, visual_dict)
+# Visual dict contains boxes with bbox/label/semantic/confidence, not baked into JPEG
+# This allows true VLC-like raw preview at full FPS with lightweight overlay on top
+_live_visuals: dict[str, tuple[float, dict[str, Any]]] = {}
+_live_visuals_lock = threading.Lock()
 MESSENGER_PROVIDER = os.getenv("MESSENGER_PROVIDER", "none").lower()
 if MESSENGER_PROVIDER not in {"none", "telegram", "max"}: MESSENGER_PROVIDER = "none"
 # go2rtc is the preferred WebRTC transport for the browser camera preview. The
@@ -1729,6 +1734,38 @@ async def internal_live_frame(camera_id:str,request:Request):
     with _live_frames_lock:
         _live_frame_sequence+=1
         _live_frames[camera_id]=(_live_frame_sequence,time.time(),image)
+
+@app.post("/api/internal/cameras/{camera_id}/visual",status_code=204)
+async def internal_live_visual(camera_id:str,request:Request):
+    con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
+    if not row: raise HTTPException(404,"Камера не найдена")
+    if not row[0]: return
+    try:
+        payload=await request.json()
+    except (ValueError,TypeError):
+        raise HTTPException(422,"Некорректный visual JSON")
+    # payload should contain shape and boxes
+    if not isinstance(payload, dict): raise HTTPException(422,"Некорректный visual")
+    with _live_visuals_lock:
+        _live_visuals[camera_id]=(time.time(), payload)
+
+@app.get("/api/cameras/{camera_id}/visual")
+def camera_visual(camera_id:str):
+    con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
+    if not row: raise HTTPException(404,"Камера не найдена")
+    if not row[0]: raise HTTPException(409,"Аналитика камеры отключена")
+    with _live_visuals_lock:
+        item=_live_visuals.get(camera_id)
+    if not item: return {"camera_id":camera_id,"timestamp":None,"shape":None,"boxes":[],"age_seconds":None}
+    ts, payload = item
+    age = round(time.time()-ts,2)
+    # Expire old visuals after 5 seconds of no inference
+    if age>5:
+        return {"camera_id":camera_id,"timestamp":None,"shape":None,"boxes":[],"age_seconds":age}
+    result=dict(payload)
+    result["camera_id"]=camera_id
+    result["age_seconds"]=age
+    return result
 
 @app.post("/api/internal/events/{event_id}/frame",status_code=204)
 async def internal_event_frame(event_id:int,request:Request):
