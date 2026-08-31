@@ -41,7 +41,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-APP_VERSION = "2.14.1"
+APP_VERSION = "2.14.2"
 TZ = timezone(timedelta(hours=7))
 CAMERA_TELEMETRY_STALE_SECONDS = 30
 HIGH_FPS_MODE = os.getenv("CAMERA_HIGH_FPS_MODE", "true").strip().lower() not in {"0","false","no","off"}
@@ -1097,22 +1097,19 @@ def rows(query,args=()):
 def _go2rtc_source_url(rtsp_url: str) -> str:
     """Build a low-latency go2rtc source URL like VLC: TCP transport, no buffering.
     v2.14.0: Adds mp4 query for MSE/HLS low-latency and ensures single connection to camera.
+    v2.14.2: Preserve operator-specified transport if already present (e.g. udp), else default to tcp.
     """
     if not rtsp_url:
         return rtsp_url
     base = rtsp_url.split("#")[0]
     existing_frag = rtsp_url.split("#", 1)[1] if "#" in rtsp_url else ""
-    # Always enforce TCP and low-delay params like VLC
-    parts = []
-    if existing_frag and "transport=" not in existing_frag:
-        parts.append(existing_frag)
-    # Add VLC-like low-latency params
-    if GO2RTC_RTSP_TRANSPORT not in (existing_frag or ""):
-        parts.append(f"transport={GO2RTC_RTSP_TRANSPORT}")
-    # mp4 query enables MSE/HLS direct H264 without transcoding
-    # go2rtc will use this for webrtc/hls/mse passthrough
-    fragment = "&".join(parts) if parts else f"transport={GO2RTC_RTSP_TRANSPORT}"
-    return f"{base}#{fragment}"
+    # Preserve existing transport if operator already specified it (test expects udp kept)
+    if existing_frag and "transport=" in existing_frag:
+        return f"{base}#{existing_frag}"
+    if not existing_frag:
+        return f"{base}#transport={GO2RTC_RTSP_TRANSPORT}"
+    # Existing fragment without transport -> append tcp
+    return f"{base}#{existing_frag}&transport={GO2RTC_RTSP_TRANSPORT}"
 
 def sync_go2rtc_cameras() -> dict[str, Any]:
     """Mirror enabled cameras from SQLite into go2rtc with VLC-like low latency.
