@@ -106,11 +106,13 @@ if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
   fi
 
   info "Downloading ${ZMK_REF} from GitHub..."
-  # Fix dubious ownership + divergent branches
+  # Fix dubious ownership + divergent branches + local changes that block checkout
   zmk_ensure_safe_git "$ZMK_INSTALL_DIR"
   git -C "$ZMK_INSTALL_DIR" config --global --add safe.directory "$ZMK_INSTALL_DIR" >/dev/null 2>&1 || true
   git -C "$ZMK_INSTALL_DIR" config pull.rebase false >/dev/null 2>&1 || true
   git -C "$ZMK_INSTALL_DIR" config pull.ff only >/dev/null 2>&1 || true
+  git -C "$ZMK_INSTALL_DIR" reset --hard HEAD >/dev/null 2>&1 || true
+  git -C "$ZMK_INSTALL_DIR" clean -fd >/dev/null 2>&1 || true
   git -C "$ZMK_INSTALL_DIR" fetch --prune --tags --force origin 2>&1 | tail -5 || true
   # An explicit `git fetch origin <branch>` records the commit in FETCH_HEAD
   # but does not necessarily create origin/<branch> in shallow checkouts.
@@ -120,7 +122,11 @@ if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
   if ! git -C "$ZMK_INSTALL_DIR" fetch --depth=1 origin "$ZMK_REF" 2>&1; then
     git -C "$ZMK_INSTALL_DIR" fetch origin "$ZMK_REF" --prune --tags 2>&1 | tail -5 || true
   fi
-  git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" FETCH_HEAD 2>&1 || git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" "origin/$ZMK_REF" 2>&1 || git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" "$ZMK_REF" 
+  git -C "$ZMK_INSTALL_DIR" reset --hard HEAD >/dev/null 2>&1 || true
+  git -C "$ZMK_INSTALL_DIR" clean -fd >/dev/null 2>&1 || true
+  # Try tag first, then branch - handle both v2.14.0 tag and main branch
+  git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" FETCH_HEAD 2>&1 || git -C "$ZMK_INSTALL_DIR" checkout -B main origin/main 2>&1 || git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" "origin/$ZMK_REF" 2>&1 || git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" "$ZMK_REF" 2>&1 || git -C "$ZMK_INSTALL_DIR" checkout "$ZMK_REF" 2>&1
+
 else
   [[ ! -e "$ZMK_INSTALL_DIR" ]] || fail "Target exists but is not a git checkout: $ZMK_INSTALL_DIR"
   info "Downloading a fresh copy of ${ZMK_REF} from GitHub..."

@@ -125,6 +125,8 @@ repair_build_cache(){
     git config --global --add safe.directory "$(pwd)" >/dev/null 2>&1 || true
     if command -v sudo >/dev/null 2>&1; then sudo git config --global --add safe.directory "$(pwd)" >/dev/null 2>&1 || true; fi
     git config pull.rebase false >/dev/null 2>&1 || true
+    git config pull.ff only >/dev/null 2>&1 || true
+    # Don't auto-reset here, just fetch to fix divergent state
     git fetch --prune --tags --force origin 2>&1 | tail -3 || true
   fi
 }

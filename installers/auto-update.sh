@@ -175,15 +175,21 @@ zmk_check_and_update(){
   # Fallback: git-based update if tarball not available (e.g. 404 before Release assets uploaded)
   if [[ -d "$root/.git" ]]; then
     echo "[auto-update] Tarball unavailable, trying git fetch for ${latest}..."
-    # Fix dubious ownership + divergent branches
+    # Fix dubious ownership + divergent branches + local changes
     zmk_ensure_safe_git "$root"
     git -C "$root" config --global --add safe.directory "$root" >/dev/null 2>&1 || true
     git -C "$root" config pull.rebase false >/dev/null 2>&1 || true
     git -C "$root" config pull.ff only >/dev/null 2>&1 || true
+    # Stash or discard local changes that would block checkout (VERSION, RELEASE_NOTES, Dockerfiles)
+    git -C "$root" reset --hard HEAD >/dev/null 2>&1 || true
+    git -C "$root" clean -fd >/dev/null 2>&1 || true
     git -C "$root" fetch --prune --tags --force origin 2>&1 | tail -5 || true
     # Try to checkout the tag directly, then main if tag checkout fails
-    if git -C "$root" fetch --depth=1 origin "$latest" 2>&1; then
-      if git -C "$root" checkout -B main FETCH_HEAD 2>&1 || git -C "$root" checkout -B main "origin/$latest" 2>&1 || git -C "$root" checkout "$latest" 2>&1; then
+    if git -C "$root" fetch --depth=1 origin "$latest" 2>&1 || git -C "$root" fetch origin "$latest" --prune --tags 2>&1 | tail -5; then
+      # Ensure clean state again before checkout
+      git -C "$root" reset --hard HEAD >/dev/null 2>&1 || true
+      git -C "$root" clean -fd >/dev/null 2>&1 || true
+      if git -C "$root" checkout -B main FETCH_HEAD 2>&1 || git -C "$root" checkout -B main "origin/main" 2>&1 || git -C "$root" checkout "$latest" 2>&1 || git -C "$root" checkout -B main "origin/$latest" 2>&1; then
         echo "[auto-update] Git update to ${latest} succeeded, relaunching ${relaunch}..."
         rm -rf "$wd"
         exec env ZMK_RELAUNCHED_AFTER_UPDATE=1 bash "$root/${relaunch}"
@@ -191,8 +197,12 @@ zmk_check_and_update(){
     fi
     # Last resort: fetch main
     zmk_ensure_safe_git "$root"
-    if git -C "$root" fetch --depth=1 origin main 2>&1; then
-      if git -C "$root" checkout -B main FETCH_HEAD 2>&1; then
+    git -C "$root" reset --hard HEAD >/dev/null 2>&1 || true
+    git -C "$root" clean -fd >/dev/null 2>&1 || true
+    if git -C "$root" fetch --depth=1 origin main 2>&1 || git -C "$root" fetch origin main --prune --tags 2>&1 | tail -5; then
+      git -C "$root" reset --hard HEAD >/dev/null 2>&1 || true
+      git -C "$root" clean -fd >/dev/null 2>&1 || true
+      if git -C "$root" checkout -B main FETCH_HEAD 2>&1 || git -C "$root" checkout -B main origin/main 2>&1; then
         echo "[auto-update] Git update to main succeeded, relaunching ${relaunch}..."
         rm -rf "$wd"
         exec env ZMK_RELAUNCHED_AFTER_UPDATE=1 bash "$root/${relaunch}"
