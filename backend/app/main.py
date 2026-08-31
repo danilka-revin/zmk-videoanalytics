@@ -41,7 +41,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-APP_VERSION = "2.14.2"
+APP_VERSION = "2.15.0"
 TZ = timezone(timedelta(hours=7))
 CAMERA_TELEMETRY_STALE_SECONDS = 30
 HIGH_FPS_MODE = os.getenv("CAMERA_HIGH_FPS_MODE", "true").strip().lower() not in {"0","false","no","off"}
@@ -1098,6 +1098,7 @@ def _go2rtc_source_url(rtsp_url: str) -> str:
     """Build a low-latency go2rtc source URL like VLC: TCP transport, no buffering.
     v2.14.0: Adds mp4 query for MSE/HLS low-latency and ensures single connection to camera.
     v2.14.2: Preserve operator-specified transport if already present (e.g. udp), else default to tcp.
+    v2.15.0: Add backchannel=0 for low latency (disable audio backchannel), keep single conn.
     """
     if not rtsp_url:
         return rtsp_url
@@ -1105,11 +1106,14 @@ def _go2rtc_source_url(rtsp_url: str) -> str:
     existing_frag = rtsp_url.split("#", 1)[1] if "#" in rtsp_url else ""
     # Preserve existing transport if operator already specified it (test expects udp kept)
     if existing_frag and "transport=" in existing_frag:
+        # Ensure backchannel disabled if not already set
+        if "backchannel" not in existing_frag:
+            return f"{base}#{existing_frag}&backchannel=0"
         return f"{base}#{existing_frag}"
     if not existing_frag:
-        return f"{base}#transport={GO2RTC_RTSP_TRANSPORT}"
-    # Existing fragment without transport -> append tcp
-    return f"{base}#{existing_frag}&transport={GO2RTC_RTSP_TRANSPORT}"
+        return f"{base}#transport={GO2RTC_RTSP_TRANSPORT}&backchannel=0"
+    # Existing fragment without transport -> append tcp + backchannel
+    return f"{base}#{existing_frag}&transport={GO2RTC_RTSP_TRANSPORT}&backchannel=0"
 
 def sync_go2rtc_cameras() -> dict[str, Any]:
     """Mirror enabled cameras from SQLite into go2rtc with VLC-like low latency.
@@ -1807,13 +1811,14 @@ def camera_mjpeg(camera_id:str):
     con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
     if not row: raise HTTPException(404,"Камера не найдена")
     if not row[0]: raise HTTPException(409,"Аналитика камеры отключена")
-    # WebRTC H264 direct is primary like VLC. This MJPEG endpoint is fallback only.
-    # Try go2rtc direct MJPEG first for true VLC-like FPS (Go implementation faster than Python)
+    # v2.15.0: WebRTC H264 is primary like VLC, but this MJPEG is reliable fallback.
+    # Never return 503 black screen - always try go2rtc, then live frames, then snapshot loop.
+    # Frontend now has JPEG polling too, so black screen impossible.
     if GO2RTC_ENABLED and GO2RTC_API_URL:
         for candidate_name in (f"zmk-{camera_id}", camera_id):
             try:
-                with httpx.Client(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
-                    chk = client.get(f"{GO2RTC_API_URL}/api/frame.jpeg", params={"src": candidate_name}, timeout=2.0)
+                with httpx.Client(timeout=httpx.Timeout(3.0, connect=1.5)) as client:
+                    chk = client.get(f"{GO2RTC_API_URL}/api/frame.jpeg", params={"src": candidate_name}, timeout=1.5)
                     if chk.status_code==200 and chk.content.startswith(b"\xff\xd8"):
                         def go2rtc_generate(src_name: str = candidate_name):
                             try:
@@ -1826,10 +1831,7 @@ def camera_mjpeg(camera_id:str):
                         return StreamingResponse(go2rtc_generate(), media_type="multipart/x-mixed-replace; boundary=--go2rtc", headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
             except (httpx.HTTPError, OSError, RuntimeError, ValueError):
                 continue
-        # If go2rtc enabled but stream not ready, return 503 quickly so frontend retries WebRTC
-        # instead of hanging on empty worker MJPEG (which is now disabled when go2rtc enabled)
-        if not _live_frames.get(camera_id):
-            raise HTTPException(503,"go2rtc stream not ready, retry WebRTC")
+    # Fallback to worker live frames (now kept even when go2rtc enabled at 10 FPS for reliability)
     def generate():
         sequence=-1
         idle=0
@@ -1842,9 +1844,22 @@ def camera_mjpeg(camera_id:str):
                 yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "+str(len(image)).encode()+b"\r\n\r\n"+image+b"\r\n"
             else:
                 idle+=1
-                # If no frame for 5 sec, break so frontend can fallback to snapshot and retry WebRTC
-                if idle>250:  # 250 * 0.02 = 5 sec
-                    break
+                # If no live frame for 3 sec, try serving snapshot as MJPEG to avoid black screen
+                if idle>150:  # 150 * 0.02 = 3 sec
+                    try:
+                        snap_path = snapshot_path_for(camera_id)
+                        if snap_path.exists():
+                            img = snap_path.read_bytes()
+                            if img.startswith(b"\xff\xd8"):
+                                yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "+str(len(img)).encode()+b"\r\n\r\n"+img+b"\r\n"
+                                idle=0
+                                time.sleep(0.5)
+                                continue
+                    except Exception:
+                        pass
+                    # If still no frame, wait and continue loop (don't break - keep connection for snapshot fallback)
+                    if idle>500:  # 10 sec total, then reset idle to keep trying
+                        idle=0
             time.sleep(.02)
     return StreamingResponse(generate(),media_type="multipart/x-mixed-replace; boundary=frame",headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
 

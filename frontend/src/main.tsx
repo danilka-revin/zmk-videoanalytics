@@ -95,50 +95,97 @@ function PanelTitle({title,sub,action,onAction}:{title:string,sub:string,action?
 function Ring({value,label}:{value:number,label:string}){return <div className="ringbox"><div className="ring" style={{'--p':`${value*3.6}deg`} as React.CSSProperties}><span>{value}<small>%</small></span></div><b>{label}</b><small>Цель ≥ {label==='Precision'?90:85}%</small></div>}
 function EventsTable({events,ack,onReject,openEvidence,selectionMode=false,selectedIds=[],onToggle,highlightId}:{events:Event[],ack:(id:number)=>void,onReject?:(event:Event)=>void,openEvidence?:(event:Event)=>void,selectionMode?:boolean,selectedIds?:number[],onToggle?:(id:number)=>void,highlightId?:number}){return <div className="table"><div className="tr th"><span>Событие</span><span>Камера / зона</span><span>Уверенность</span><span>Время</span><span/></div>{events.map(e=>{const selected=selectedIds.includes(e.id);const review=e.review_status||(e.acknowledged?'accepted':'pending');return <div className={`tr ${selected?'selected-event':''} ${review==='rejected'?'rejected-event':''} ${highlightId===e.id?'search-hit':''}`} key={e.id}><span><i className={`sev ${e.severity}`}/><b>{labels[e.type]||e.type}</b><small>{e.note||e.person_id||'Объект не указан'}</small></span><span><b>{e.camera_name||e.camera_id}</b><small>{e.zone||'—'}</small></span><span><b>{Math.round(e.confidence*100)}%</b><small className="conf"><i style={{width:`${e.confidence*100}%`}}/></small></span><span><b>{new Date(e.timestamp).toLocaleTimeString('ru-RU',{hour:'2-digit',minute:'2-digit'})}</b><small>{new Date(e.timestamp).toLocaleDateString('ru-RU')}</small></span><span className="event-actions">{selectionMode&&onToggle?<button className={`event-select ${selected?'selected':''}`} onClick={()=>onToggle(e.id)}>{selected?<Check size={13}/>:<Plus size={13}/>} {selected?'Выбрано':'Выбрать'}</button>:<>{openEvidence&&e.has_frame&&<button className="evidence" title="Открыть кадр события" onClick={()=>openEvidence(e)}><Eye size={13}/> Кадр</button>}{review==='rejected'?<span className="rejected"><X size={13}/> Не принято</span>:review==='accepted'?<span className="done"><Check size={13}/> Принято</span>:<><button className="ack" onClick={()=>ack(e.id)}>Принять</button>{onReject&&<button className="reject-event" onClick={()=>onReject(e)}><X size={13}/> Не принять</button>}</>}</>}</span></div>})}</div>}
 function EventEvidenceModal({event,close}:{event:Event,close:()=>void}){const[src,setSrc]=useState('');const[error,setError]=useState('Загружаю кадр…');useEffect(()=>{let cancelled=false;let objectUrl='';const load=async()=>{try{const headers:Record<string,string>={};const key=localStorage.getItem('zmk_api_key')||'';const tgData=(window as any).Telegram?.WebApp?.initData||'';if(key)headers['X-API-Key']=key;if(tgData)headers['X-Telegram-Init-Data']=tgData;const response=await fetch(`/api/events/${event.id}/frame`,{headers,cache:'no-store'});if(!response.ok)throw new Error('Кадр события недоступен');objectUrl=URL.createObjectURL(await response.blob());if(!cancelled){setSrc(objectUrl);setError('')}}catch(e){if(!cancelled)setError(e instanceof Error?e.message:'Кадр события недоступен')}};void load();return()=>{cancelled=true;if(objectUrl)URL.revokeObjectURL(objectUrl)}},[event.id]);return <div className="modal-backdrop"><div className="camera-modal event-evidence-modal"><div className="modal-head"><div><h2>Кадр события</h2><p>{labels[event.type]||event.type} · {event.camera_name||event.camera_id}</p></div><button onClick={close} aria-label="Закрыть"><X/></button></div>{src?<img src={src} alt={`Кадр события ${labels[event.type]||event.type}`}/>:<div className="event-evidence-loading">{error}</div>}<div className="event-evidence-meta"><span><b>Уверенность</b>{Math.round(event.confidence*100)}%</span><span><b>Время</b>{new Date(event.timestamp).toLocaleString('ru-RU')}</span><span><b>Объект</b>{event.person_id||'—'}</span><span><b>Решение</b>{event.review_status==='rejected'?'Не принято':event.review_status==='accepted'?'Принято':'Ожидает проверки'}</span></div>{event.note&&<p className="event-review-note"><b>Комментарий:</b> {event.note}</p>}<div className="modal-actions"><button onClick={()=>downloadFile(`/api/events/${event.id}/frame`,`zmk-event-${event.id}.jpg`).catch(()=>{})}><Download size={15}/> Скачать JPEG</button><button className="primary" onClick={close}>Закрыть</button></div></div></div>}
+
 function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;status:string;age:number|null;telemetryStale?:boolean;lastError?:string}){
  const videoRef=useRef<HTMLVideoElement|null>(null);
  const containerRef=useRef<HTMLDivElement|null>(null);
  const beginMjpegRef=useRef<()=>void>(()=>{});
  const hlsRef=useRef<any>(null);
- const mseRef=useRef<{ws:WebSocket|null,pc?:any,buffer:SourceBuffer|null}>({ws:null,buffer:null});
+ const mseRef=useRef<{ws:WebSocket|null,buffer:SourceBuffer|null,mediaSource:MediaSource|null,queue:Uint8Array[]}>({ws:null,buffer:null,mediaSource:null,queue:[]});
+ const jpegPollRef=useRef<number>(0);
+ const snapshotPollRef=useRef<number>(0);
  const[src,setSrc]=useState('');
  const[live,setLive]=useState(false);
  const[streamFailed,setStreamFailed]=useState(false);
- const[transport,setTransport]=useState<'webrtc'|'mse'|'hls'|'mjpeg'|'go2rtc-mjpeg'|'waiting'>('waiting');
+ const[transport,setTransport]=useState<'webrtc'|'mse'|'hls'|'go2rtc-jpeg'|'mjpeg'|'go2rtc-mjpeg'|'snapshot'|'waiting'>('waiting');
  const[boxes,setBoxes]=useState<{bbox:number[],label:string,semantic:string,confidence:number}[]>([]);
  const[shape,setShape]=useState<[number,number]|null>(null);
  const[reconnectCount,setReconnectCount]=useState(0);
  const apiKey=localStorage.getItem('zmk_api_key')||'';
  useEffect(()=>{
-  let cancelled=false;let current='';let fallbackTimer=0;let mjpegStarted=false;let go2rtcMjpegStarted=false;let hlsStarted=false;let mseStarted=false;
+  let cancelled=false;let current='';let fallbackTimer=0;let mjpegStarted=false;let go2rtcMjpegStarted=false;let hlsStarted=false;let mseStarted=false;let jpegPollStarted=false;
   let pc:RTCPeerConnection|null=null;let ws:WebSocket|null=null;let webrtcTimer=0;let retryTimer=0;let visualTimer=0;let hlsTimer=0;let mseTimer=0;let webrtcAttempts=0;let totalAttempts=0;
   const controller=new AbortController();
   const replace=(next:string)=>{if(cancelled){try{URL.revokeObjectURL(next)}catch{};return}setSrc(old=>{if(old&&old!==next&&old.startsWith('blob:'))try{URL.revokeObjectURL(old)}catch{};return next});current=next};
   const snapshot=async()=>{try{const headers:Record<string,string>={};if(apiKey)headers['X-API-Key']=apiKey;const r=await fetch(`/api/cameras/${id}/snapshot?t=${Date.now()}`,{headers,signal:controller.signal});if(!r.ok)return;replace(URL.createObjectURL(await r.blob()))}catch{}};
   const marker=(data:Uint8Array,a:number,b:number,from=0)=>{for(let i=from;i<data.length-1;i++)if(data[i]===a&&data[i+1]===b)return i;return-1};
 
+  // NEW v2.15.0: JPEG polling transport - most reliable HTTP fallback, 10 FPS, never black
+  const beginJpegPoll=async(srcNames?:string[])=>{
+    if(cancelled||jpegPollStarted)return;
+    jpegPollStarted=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(hlsTimer);clearTimeout(mseTimer);
+    try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};if(mseRef.current.ws){try{mseRef.current.ws.close()}catch{}}if(hlsRef.current){try{hlsRef.current.destroy()}catch{};hlsRef.current=null}
+    if(videoRef.current)videoRef.current.srcObject=null;
+    setTransport('go2rtc-jpeg');setLive(true);
+    const names=srcNames||[`zmk-${id}`,id];
+    let idx=0;
+    const poll=async()=>{
+      if(cancelled)return;
+      const streamName=names[idx%names.length];
+      try{
+        const headers:Record<string,string>={};if(apiKey)headers['X-API-Key']=apiKey;
+        const r=await fetch(`/rtc/api/frame.jpeg?src=${encodeURIComponent(streamName)}&t=${Date.now()}`,{headers,cache:'no-store',signal:controller.signal});
+        if(r.ok){
+          const blob=await r.blob();
+          if(blob.size>100&&blob.type.includes('jpeg')||true){
+            const url=URL.createObjectURL(blob);
+            // Preload to avoid flicker
+            const img=new Image();
+            img.onload=()=>{if(!cancelled){replace(url);setStreamFailed(false);setLive(true);}else{try{URL.revokeObjectURL(url)}catch{}}};
+            img.onerror=()=>{try{URL.revokeObjectURL(url)}catch{}};
+            img.src=url;
+          }
+        }else{
+          idx++;
+        }
+      }catch{
+        idx++;
+      }
+      if(!cancelled)jpegPollRef.current=window.setTimeout(poll,100) as unknown as number;
+    };
+    void poll();
+  };
+
   const beginMSE=async(srcNames?:string[])=>{
     if(cancelled||mseStarted)return;
-    mseStarted=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(hlsTimer);clearTimeout(mseTimer);
+    mseStarted=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(hlsTimer);clearTimeout(mseTimer);if(jpegPollRef.current)clearTimeout(jpegPollRef.current);
     try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};
     if(hlsRef.current){try{hlsRef.current.destroy()}catch{};hlsRef.current=null}
     if(videoRef.current)videoRef.current.srcObject=null;
     setTransport('mse');
     const names=srcNames||[`zmk-${id}`,id];
+    const codecsToTry=[
+      'video/mp4; codecs="avc1.640029"',
+      'video/mp4; codecs="avc1.64002A"',
+      'video/mp4; codecs="avc1.64001F"',
+      'video/mp4; codecs="avc1.4D401F"',
+      'video/mp4; codecs="avc1.42E01E"',
+      'video/mp4; codecs="avc1.42001E"',
+      'video/mp4'
+    ];
     for(const streamName of names){
       if(cancelled)break;
       try{
-        // go2rtc MSE via MP4 - low-latency H264 over WebSocket, works when WebRTC blocked by firewall
         const mseUrl=`${location.protocol==='https:'?'wss':'ws'}://${location.host}/rtc/api/ws?src=${encodeURIComponent(streamName)}`;
         const mseWs=new WebSocket(mseUrl);
         mseRef.current.ws=mseWs;
         let mediaSource:MediaSource|null=null;
         let sourceBuffer:SourceBuffer|null=null;
         let queue:Uint8Array[]=[];
+        let codecFound:string|null=null;
         mseWs.binaryType='arraybuffer';
         mseWs.onopen=()=>{
           if(cancelled)return;
-          // Request MP4 stream for MSE
           mseWs.send(JSON.stringify({type:'mse',value:'mp4'}));
         };
         mseWs.onmessage=async(event)=>{
@@ -147,29 +194,39 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
             try{
               const msg=JSON.parse(event.data);
               if(msg.type==='mse'&&msg.value){
-                // Init segment
                 if(!mediaSource){
                   mediaSource=new MediaSource();
+                  mseRef.current.mediaSource=mediaSource;
                   if(videoRef.current){
                     videoRef.current.src=URL.createObjectURL(mediaSource);
                     mediaSource.addEventListener('sourceopen',()=>{
                       if(!mediaSource||mediaSource.readyState!=='open')return;
+                      // Try codecs dynamically
+                      for(const codec of codecsToTry){
+                        if(codec==='video/mp4'||(window.MediaSource&&MediaSource.isTypeSupported(codec))){
+                          try{
+                            sourceBuffer=mediaSource!.addSourceBuffer(codec);
+                            codecFound=codec;
+                            break;
+                          }catch{continue}
+                        }
+                      }
+                      if(!sourceBuffer){
+                        try{mseWs.close()}catch{};void beginHls(names);return;
+                      }
+                      mseRef.current.buffer=sourceBuffer;
+                      sourceBuffer.addEventListener('updateend',()=>{
+                        if(queue.length&&sourceBuffer&&!sourceBuffer.updating){
+                          try{sourceBuffer.appendBuffer(queue.shift()! as unknown as BufferSource)}catch{}
+                        }
+                      });
                       try{
-                        sourceBuffer=mediaSource.addSourceBuffer("video/mp4; codecs=\"avc1.640029\"");
-                        mseRef.current.buffer=sourceBuffer;
-                        sourceBuffer.addEventListener('updateend',()=>{
-                          if(queue.length&&sourceBuffer&&!sourceBuffer.updating){
-                            try{sourceBuffer.appendBuffer(queue.shift()! as unknown as BufferSource)}catch{}
-                          }
-                        });
-                        // Append init segment
                         const init=Uint8Array.from(atob(msg.value),c=>c.charCodeAt(0));
                         if(sourceBuffer.updating)queue.push(init);
                         else try{sourceBuffer.appendBuffer(init as unknown as BufferSource)}catch{queue.push(init)}
                         setLive(true);setStreamFailed(false);setTransport('mse');
                         if(videoRef.current)void videoRef.current.play().catch(()=>{});
                       }catch{
-                        // Codec not supported, fallback to HLS
                         try{mseWs.close()}catch{};void beginHls(names);
                       }
                     });
@@ -189,10 +246,9 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
             }
           }
         };
-        mseWs.onerror=()=>{try{mseWs.close()}catch{};if(streamName===names[names.length-1])void beginHls(names);else beginMSE(names.slice(1))};
-        mseWs.onclose=()=>{if(!cancelled&&!live){if(streamName===names[names.length-1]){mseTimer=window.setTimeout(()=>{if(!cancelled)void beginHls(names)},800)} }};
-        // Timeout for MSE
-        mseTimer=window.setTimeout(()=>{if(!live){try{mseWs.close()}catch{};if(streamName===names[names.length-1])void beginHls(names)}},6000);
+        mseWs.onerror=()=>{try{mseWs.close()}catch{};if(streamName===names[names.length-1])void beginHls(names);};
+        mseWs.onclose=()=>{if(!cancelled&&!live){if(streamName===names[names.length-1]){mseTimer=window.setTimeout(()=>{if(!cancelled)void beginHls(names)},500) as unknown as number}}};
+        mseTimer=window.setTimeout(()=>{if(!live){try{mseWs.close()}catch{};if(streamName===names[names.length-1])void beginHls(names)}},4000) as unknown as number;
         return;
       }catch{
         continue;
@@ -203,7 +259,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
 
   const beginHls=async(srcNames?:string[])=>{
     if(cancelled||hlsStarted)return;
-    hlsStarted=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(mseTimer);
+    hlsStarted=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(mseTimer);if(jpegPollRef.current)clearTimeout(jpegPollRef.current);
     try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};if(mseRef.current.ws){try{mseRef.current.ws.close()}catch{}}
     if(videoRef.current)videoRef.current.srcObject=null;
     setTransport('hls');
@@ -212,17 +268,17 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
       if(cancelled)break;
       try{
         const {default:Hls}=await import('hls.js');
-        const hlsUrl=`/rtc/api/stream.m3u8?src=${encodeURIComponent(streamName)}`;
+        const hlsUrl=`/rtc/api/stream.m3u8?src=${encodeURIComponent(streamName)}&mp4`;
         if(videoRef.current){
           if(Hls.isSupported()){
             if(hlsRef.current){try{hlsRef.current.destroy()}catch{}}
-            const hls=new Hls({lowLatencyMode:true,backBufferLength:90,enableWorker:true,maxBufferLength:10,liveSyncDuration:1,liveMaxLatencyDuration:3});
+            const hls=new Hls({lowLatencyMode:true,backBufferLength:90,enableWorker:true,maxBufferLength:10,liveSyncDuration:0.5,liveMaxLatencyDuration:2});
             hlsRef.current=hls;
             hls.loadSource(hlsUrl);
             hls.attachMedia(videoRef.current);
             hls.on(Hls.Events.MANIFEST_PARSED,()=>{if(!cancelled){void videoRef.current?.play().catch(()=>{});setLive(true);setStreamFailed(false);}});
-            hls.on(Hls.Events.ERROR,(_:any,data:any)=>{if(data&&data.fatal){try{hls.destroy()}catch{};hlsRef.current=null;if(streamName===names[names.length-1])beginGo2rtcMjpeg(names);}});
-            hlsTimer=window.setTimeout(()=>{if(!live&&streamName===names[names.length-1])beginGo2rtcMjpeg(names)},5000);
+            hls.on(Hls.Events.ERROR,(_:any,data:any)=>{if(data&&data.fatal){try{hls.destroy()}catch{};hlsRef.current=null;if(streamName===names[names.length-1])void beginJpegPoll(names);}});
+            hlsTimer=window.setTimeout(()=>{if(!live&&streamName===names[names.length-1])void beginJpegPoll(names)},4000) as unknown as number;
             return;
           }else if(videoRef.current.canPlayType('application/vnd.apple.mpegurl')){
             videoRef.current.src=hlsUrl;void videoRef.current.play().catch(()=>{});setLive(true);return;
@@ -230,11 +286,11 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
         }
       }catch{}
     }
-    beginGo2rtcMjpeg(names);
+    void beginJpegPoll(names);
   };
   const beginGo2rtcMjpeg=(srcNames?:string[])=>{
     if(cancelled||go2rtcMjpegStarted)return;
-    go2rtcMjpegStarted=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(hlsTimer);clearTimeout(mseTimer);
+    go2rtcMjpegStarted=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(hlsTimer);clearTimeout(mseTimer);if(jpegPollRef.current)clearTimeout(jpegPollRef.current);
     try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};if(mseRef.current.ws){try{mseRef.current.ws.close()}catch{}}
     if(hlsRef.current){try{hlsRef.current.destroy()}catch{};hlsRef.current=null}
     if(videoRef.current)videoRef.current.srcObject=null;
@@ -246,7 +302,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
   };
   const beginMjpeg=()=>{
     if(cancelled||mjpegStarted)return;
-    mjpegStarted=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(hlsTimer);clearTimeout(mseTimer);
+    mjpegStarted=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(hlsTimer);clearTimeout(mseTimer);if(jpegPollRef.current)clearTimeout(jpegPollRef.current);
     try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};if(mseRef.current.ws){try{mseRef.current.ws.close()}catch{}}
     if(hlsRef.current){try{hlsRef.current.destroy()}catch{};hlsRef.current=null}
     if(videoRef.current)videoRef.current.srcObject=null;
@@ -271,7 +327,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
         }
       }
     }catch{
-      if(!cancelled){setLive(false);setStreamFailed(true);void snapshot();fallbackTimer=window.setInterval(snapshot,3000)}
+      if(!cancelled){setLive(false);setStreamFailed(true);void snapshot();fallbackTimer=window.setInterval(snapshot,2000) as unknown as number;setTransport('snapshot');}
     }
   };
   const startWebRTC=(srcNames?:string[])=>{
@@ -280,7 +336,6 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
     totalAttempts++;setReconnectCount(totalAttempts);
     const tryName=(idx:number)=>{
       if(cancelled||idx>=names.length){
-        // WebRTC failed, try MSE (low-latency H264 over WS, works when UDP blocked) then HLS
         void beginMSE(names);
         return;
       }
@@ -290,7 +345,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
         setTransport('webrtc');
         const wsUrl=`${location.protocol==='https:'?'wss':'ws'}://${location.host}/rtc/api/ws?src=${encodeURIComponent(streamName)}`;
         ws=new WebSocket(wsUrl);
-        pc=new RTCPeerConnection({iceServers:[{urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302','stun:stun2.l.google.com:19302','stun:stun3.l.google.com:19302']}],bundlePolicy:'max-bundle',iceTransportPolicy:'all'});
+        pc=new RTCPeerConnection({iceServers:[{urls:['stun:stun.l.google.com:19302','stun:stun1.l.google.com:19302','stun:stun.cloudflare.com:3478']}],bundlePolicy:'max-bundle'});
         pc.addTransceiver('video',{direction:'recvonly'});
         pc.ontrack=(event)=>{
           if(cancelled)return;
@@ -304,9 +359,8 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
           if(pc.connectionState==='failed'||pc.connectionState==='disconnected'){
             if(!live){
               try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};
-              // Exponential backoff retry
-              const delay=Math.min(1000*Math.pow(1.5,totalAttempts),10000);
-              clearTimeout(retryTimer);retryTimer=window.setTimeout(()=>{if(!cancelled)tryName(idx+1)},delay);
+              const delay=Math.min(800*Math.pow(1.4,totalAttempts),6000);
+              clearTimeout(retryTimer);retryTimer=window.setTimeout(()=>{if(!cancelled)tryName(idx+1)},delay) as unknown as number;
             }
           }
         };
@@ -326,17 +380,17 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
             else if(msg.type==='webrtc/candidate'&&pc&&msg.value){await pc.addIceCandidate({candidate:msg.value})}
           }catch{}
         };
-        ws.onerror=()=>{try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};const delay=Math.min(800*Math.pow(1.3,totalAttempts),8000);clearTimeout(retryTimer);retryTimer=window.setTimeout(()=>tryName(idx+1),delay)};
+        ws.onerror=()=>{try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};const delay=Math.min(600*Math.pow(1.3,totalAttempts),5000);clearTimeout(retryTimer);retryTimer=window.setTimeout(()=>tryName(idx+1),delay) as unknown as number};
         ws.onclose=()=>{
           if(cancelled)return;
           if(live)return;
-          if(idx+1<names.length){clearTimeout(retryTimer);retryTimer=window.setTimeout(()=>tryName(idx+1),400)}
-          else if(!mjpegStarted&&!go2rtcMjpegStarted&&!hlsStarted&&!mseStarted){
-            const delay=Math.min(1000*Math.pow(1.5,totalAttempts),10000);
-            clearTimeout(retryTimer);retryTimer=window.setTimeout(()=>{if(!cancelled)void beginMSE(names)},delay)
+          if(idx+1<names.length){clearTimeout(retryTimer);retryTimer=window.setTimeout(()=>tryName(idx+1),300) as unknown as number}
+          else if(!mjpegStarted&&!go2rtcMjpegStarted&&!hlsStarted&&!mseStarted&&!jpegPollStarted){
+            const delay=Math.min(800*Math.pow(1.4,totalAttempts),5000);
+            clearTimeout(retryTimer);retryTimer=window.setTimeout(()=>{if(!cancelled)void beginMSE(names)},delay) as unknown as number;
           }
         };
-        webrtcTimer=window.setTimeout(()=>{if(!live){try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};tryName(idx+1)}},8000);
+        webrtcTimer=window.setTimeout(()=>{if(!live){try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};tryName(idx+1)}},3500) as unknown as number;
       }catch{tryName(idx+1)}
     };
     tryName(0);
@@ -352,18 +406,19 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
   };
   void snapshot();
   if(['online','connecting','recovering'].includes(status))startWebRTC();
-  void fetchVisual();visualTimer=window.setInterval(fetchVisual,400);
-  // Periodic WebRTC health check - if we are in fallback but camera is online, retry WebRTC
+  else {setTransport('snapshot');snapshotPollRef.current=window.setInterval(snapshot,2000) as unknown as number;}
+  void fetchVisual();visualTimer=window.setInterval(fetchVisual,350) as unknown as number;
   const healthTimer=window.setInterval(()=>{
     if(cancelled)return;
-    if(!live&&['online','connecting','recovering'].includes(status)&&totalAttempts<20){
-      // Reset flags and retry WebRTC
-      mjpegStarted=false;go2rtcMjpegStarted=false;hlsStarted=false;mseStarted=false;
+    if(!live&&['online','connecting','recovering'].includes(status)&&totalAttempts<30){
+      mjpegStarted=false;go2rtcMjpegStarted=false;hlsStarted=false;mseStarted=false;jpegPollStarted=false;
+      if(jpegPollRef.current)clearTimeout(jpegPollRef.current);
       startWebRTC();
     }
-  },15000);
+  },12000) as unknown as number;
   return()=>{
-    cancelled=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(hlsTimer);clearTimeout(mseTimer);clearInterval(visualTimer);clearInterval(healthTimer);
+    cancelled=true;clearTimeout(webrtcTimer);clearTimeout(retryTimer);clearTimeout(hlsTimer);clearTimeout(mseTimer);if(jpegPollRef.current)clearTimeout(jpegPollRef.current);if(snapshotPollRef.current)clearInterval(snapshotPollRef.current);
+    clearInterval(visualTimer);clearInterval(healthTimer);
     controller.abort();try{ws&&ws.close()}catch{};try{pc&&pc.close()}catch{};if(mseRef.current.ws){try{mseRef.current.ws.close()}catch{}}
     if(hlsRef.current){try{hlsRef.current.destroy()}catch{};hlsRef.current=null}
     if(videoRef.current)videoRef.current.srcObject=null;
@@ -373,13 +428,12 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
  },[id,apiKey,status]);
  const ageText=age===null?null:(age<5?'только что':(age<60?`${age} сек назад`:`${Math.floor(age/60)} мин назад`));
  const renderOverlay=()=>{if(!boxes.length||!shape)return null;const [h,w]=shape;if(!h||!w)return null;return <div className="camera-overlay">{boxes.map((b,i)=>{const [x1,y1,x2,y2]=b.bbox;const left=(x1/w)*100;const top=(y1/h)*100;const width=Math.max(1,((x2-x1)/w)*100);const height=Math.max(1,((y2-y1)/h)*100);const isNoHelmet=b.semantic==='no_helmet';const isNoVest=b.semantic==='no_vest';const isPerson=b.semantic==='person';const color=isNoHelmet||isNoVest?'#ff3b30':isPerson?'#007aff':b.semantic==='helmet'?'#34c759':b.semantic==='vest'?'#af52de':'#ff9500';const label=b.semantic==='no_helmet'?'NO HELMET':b.semantic==='no_vest'?'NO VEST':b.semantic.toUpperCase();return <div key={i} className="camera-box" style={{left:`${left}%`,top:`${top}%`,width:`${width}%`,height:`${height}%`,borderColor:color}}><span style={{background:color}}>{label} {Math.round(b.confidence*100)}%</span></div>})}</div>};
- if(transport==='webrtc')return <div className="camera-feed-wrap" ref={containerRef}><video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline aria-label={`Прямой эфир камеры ${id}`}/>{renderOverlay()}<em className="frame-age">{live?'● WEBRTC H264 25-60 FPS (single conn via go2rtc)':streamFailed?`WebRTC retry ${reconnectCount}...`:'● WebRTC подключение'}<button onClick={()=>{setReconnectCount(0);beginMjpegRef.current();}} style={{marginLeft:8,fontSize:10,padding:'2px 6px'}}>retry</button></em></div>;
- if(transport==='mse')return <div className="camera-feed-wrap" ref={containerRef}><video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline aria-label={`MSE поток камеры ${id}`}/>{renderOverlay()}<em className="frame-age">{live?'● MSE H264 LOW-LATENCY (go2rtc)':'● MSE подключение'}</em></div>;
- if(transport==='hls')return <div className="camera-feed-wrap" ref={containerRef}><video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline controls={false} aria-label={`HLS поток камеры ${id}`}/>{renderOverlay()}<em className="frame-age">{live?'● HLS H264 FULL QUALITY':'● HLS подключение'}</em></div>;
- if(transport==='go2rtc-mjpeg')return <div className="camera-feed-wrap" ref={containerRef}><img className="camera-snapshot" src={src} alt={`Прямой эфир go2rtc ${id}`} onLoad={()=>{setLive(true);setStreamFailed(false);}} onError={()=>{setLive(false);setStreamFailed(true);void (async()=>{try{beginMjpegRef.current();}catch{}})();}} />{renderOverlay()}<em className="frame-age">{live?'● GO2RTC MJPEG (Go fast)':'● GO2RTC подключение'}</em></div>;
- if(!src)return <div className="feed-empty">{telemetryStale?<><WifiOff size={20}/><span>Нет телеметрии</span><small>worker давно не подтверждал поток (go2rtc → inference RTSP single conn)</small></>:status==='connecting'?<><RefreshCw className="spin" size={20}/><span>Подключение к потоку</span><small>{lastError||'go2rtc открывает RTSP (single conn) → inference → WebRTC'}</small></>:status==='offline'||status==='error'||status==='unknown'?<><WifiOff size={20}/><span>Поток не подключён</span><small>{lastError|| (status==='unknown'?'нет данных о статусе':'RTSP недоступен, проверь go2rtc logs')}</small></>:<><Camera size={20}/><span>Кадр не получен</span><small>{lastError||'Нет свежего снимка от inference worker (проверь go2rtc → inference RTSP)'}</small></>}</div>;
- return <div className="camera-feed-wrap" ref={containerRef}><img className="camera-snapshot" src={src} alt={live?'Прямой эфир камеры':'Последний кадр камеры'}/>{renderOverlay()}<em className="frame-age">{live?'● LIVE MJPEG FALLBACK':(streamFailed?`snapshot fallback retry ${reconnectCount}`:ageText||'кадр')}</em></div>;
+ const statusLabel=transport==='webrtc'?(live?'● WEBRTC H264 25-60 FPS':'● WebRTC...'):transport==='mse'?(live?'● MSE H264 LOW-LATENCY':'● MSE...'):transport==='hls'?(live?'● HLS H264':'● HLS...'):transport==='go2rtc-jpeg'?'● GO2RTC JPEG 10 FPS (reliable)':transport==='go2rtc-mjpeg'?(live?'● GO2RTC MJPEG':'● GO2RTC...'):transport==='mjpeg'?(live?'● LIVE MJPEG':'● MJPEG...'):transport==='snapshot'?'● SNAPSHOT':`retry ${reconnectCount}`;
+ if(transport==='webrtc'||transport==='mse'||transport==='hls')return <div className="camera-feed-wrap" ref={containerRef}><video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline aria-label={`Поток камеры ${id}`}/>{renderOverlay()}<em className="frame-age">{statusLabel}{!live&&<button onClick={()=>{setReconnectCount(0);beginMjpegRef.current();}} style={{marginLeft:8,fontSize:10,padding:'2px 6px'}}>retry</button>}</em></div>;
+ if(transport==='go2rtc-jpeg'||transport==='go2rtc-mjpeg'||transport==='mjpeg'||transport==='snapshot'||src)return <div className="camera-feed-wrap" ref={containerRef}><img className="camera-snapshot" src={src} alt={`Поток ${id}`} onLoad={()=>{setLive(true);setStreamFailed(false);}} onError={()=>{setLive(false);setStreamFailed(true);}} />{renderOverlay()}<em className="frame-age">{live?statusLabel:(streamFailed?`fallback ${statusLabel}`:ageText||statusLabel)}</em></div>;
+ return <div className="feed-empty">{telemetryStale?<><WifiOff size={20}/><span>Нет телеметрии</span><small>worker давно не подтверждал поток</small></>:status==='connecting'?<><RefreshCw className="spin" size={20}/><span>Подключение</span><small>{lastError||'go2rtc открывает RTSP'}</small></>:status==='offline'||status==='error'||status==='unknown'?<><WifiOff size={20}/><span>Поток не подключён</span><small>{lastError||'RTSP недоступен'}</small></>:<><Camera size={20}/><span>Кадр не получен</span><small>{lastError||'Нет снимка от worker'}</small></>}</div>;
 }
+
 function Cameras({cams,changed,searchIntent,clearSearchIntent}:{cams:Cam[],changed:()=>Promise<void>,searchIntent?:SearchItem|null,clearSearchIntent?:()=>void}){
  const[editing,setEditing]=useState<Cam|null|undefined>(undefined);const[selectionMode,setSelectionMode]=useState(false);const[selectedIds,setSelectedIds]=useState<string[]>([]);const[bulkConfirm,setBulkConfirm]=useState(false);const[form,setForm]=useState({name:'',zone:'',description:'',rtsp_url:'',fps_limit:'30',enabled:true});const[busy,setBusy]=useState(false);const[diag,setDiag]=useState<Record<string,string>>({});const[editRtsp,setEditRtsp]=useState(false);const[cardSize,setCardSize]=useState<'compact'|'normal'|'large'>(()=>{const saved=localStorage.getItem('zmk_camera_card_size');return saved==='compact'||saved==='large'?'compact'===saved?'compact':'large':'normal'});
  const focusedCameraId=searchIntent?.kind==='camera'?String(searchIntent.id):'';useEffect(()=>{if(!focusedCameraId)return;const timer=window.setTimeout(()=>document.getElementById(`camera-card-${focusedCameraId}`)?.scrollIntoView({behavior:'smooth',block:'center'}),90);return()=>clearTimeout(timer)},[focusedCameraId]);

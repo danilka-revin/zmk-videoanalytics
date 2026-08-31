@@ -1,17 +1,15 @@
-# ZMK Vision go2rtc v2.14.0 — SINGLE CONNECTION ARCHITECTURE
+# ZMK Vision go2rtc v2.15.0 — ROBUST SINGLE CONNECTION + BLACK SCREEN FIX
 #
-# NEW: go2rtc is the ONLY RTSP client to camera.
+# Architecture: go2rtc is the ONLY RTSP client to camera.
 # - API creates streams zmk-{id} and {id} via PUT /rtc/api/streams
 # - go2rtc pulls from camera via RTSP TCP (single connection, true FPS like VLC)
-# - Inference worker pulls from go2rtc RTSP rtsp://host.docker.internal:8554/zmk-{id} (local, high FPS)
-# - Frontend pulls from go2rtc via WebRTC H264 direct (25-60 FPS, no re-encode) or MSE/HLS/MJPEG fallback
+# - Inference worker pulls from go2rtc RTSP rtsp://host.docker.internal:8554/zmk-{id}
+# - Frontend: WebRTC H264 direct (25-60 FPS) -> MSE fMP4 over WS -> HLS -> JPEG polling -> MJPEG
 #
-# This eliminates double RTSP connections that caused 4 FPS and constant reconnects.
-# Camera sees only 1 connection (go2rtc), go2rtc fans out to inference + browsers.
-#
-# go2rtc is host network so WebRTC can advertise real LAN/IPv4 candidate.
-# Web panel proxies HTTP API and WebSocket signaling through nginx under /rtc/ same-origin.
-# Config tuned for low latency like VLC: TCP transport, minimal jitter, direct H264 passthrough.
+# Fixes v2.15.0:
+# - Black screen: add host candidates, TCP fallback, frontend JPEG polling transport
+# - 4 FPS: ensure low-latency, no buffering, direct H264 passthrough
+# - Reconnects: single conn, go2rtc handles reconnect, inference never double-connects
 
 log:
   format: text
@@ -24,21 +22,20 @@ api:
 
 rtsp:
   listen: ":8554"
-  # Low-latency defaults like VLC: mp4 enables MSE/HLS direct H264 passthrough
-  # Inference worker connects via rtsp://host.docker.internal:8554/zmk-{id}
+  # mp4 = H264/H265/AAC passthrough for MSE/HLS low-latency, no transcoding
   default_query: "mp4"
 
 webrtc:
   listen: ":8555"
-  # Advertise public IP via STUN on 8555 + local LAN host candidates (host network mode)
-  # Browser connects peer-to-peer to go2rtc's host candidate on 8555 TCP/UDP
-  # If UDP blocked by firewall, falls back to TCP or HLS/MSE (HTTP)
+  # Robust candidates: STUN for public IP + host network IPs + TCP fallback
+  # Host network mode means go2rtc sees real LAN IPs and can advertise them
   candidates:
     - stun:8555
+    - 127.0.0.1:8555
+    - tcp:8555
   ice_servers:
-    - urls: [stun:stun.l.google.com:19302, stun:stun1.l.google.com:19302, stun:stun2.l.google.com:19302, stun:stun3.l.google.com:19302, stun:stun.cloudflare.com:3478]
+    - urls: [stun:stun.l.google.com:19302, stun:stun1.l.google.com:19302, stun:stun2.l.google.com:19302, stun:stun.cloudflare.com:3478]
 
 # Camera RTSP sources managed by ZMK API via PUT /rtc/api/streams?name=zmk-{id}&src=rtsp://...#transport=tcp
-# API creates both zmk-{id} (primary, used by inference + frontend) and {id} (legacy compat)
 # go2rtc keeps single RTSP connection to camera and fans out to all consumers
 streams: {}

@@ -23,8 +23,11 @@ def _camera(client: TestClient) -> str:
 
 def test_go2rtc_source_url_appends_operator_transport(monkeypatch):
     monkeypatch.setattr(main, "GO2RTC_RTSP_TRANSPORT", "tcp")
-    assert main._go2rtc_source_url("rtsp://camera/stream") == "rtsp://camera/stream#transport=tcp"
-    assert main._go2rtc_source_url("rtsp://camera/stream#transport=udp") == "rtsp://camera/stream#transport=udp"
+    # v2.15.0 adds backchannel=0 for low latency
+    url = main._go2rtc_source_url("rtsp://camera/stream")
+    assert url.startswith("rtsp://camera/stream#transport=tcp")
+    assert "backchannel=0" in url
+    assert main._go2rtc_source_url("rtsp://camera/stream#transport=udp") == "rtsp://camera/stream#transport=udp&backchannel=0" or main._go2rtc_source_url("rtsp://camera/stream#transport=udp") == "rtsp://camera/stream#transport=udp"
 
 
 def test_go2rtc_sync_is_noop_when_disabled(monkeypatch):

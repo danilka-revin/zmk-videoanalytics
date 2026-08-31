@@ -43,7 +43,10 @@ GO2RTC_PREVIEW_ENABLED = os.getenv("GO2RTC_ENABLED", "true").strip().lower() not
 GO2RTC_FORCE_MJPEG_FALLBACK = os.getenv("CAMERA_LIVE_FORCE_MJPEG", "false").strip().lower() in {"1", "true", "yes", "on"}
 GO2RTC_RTSP_URL = os.getenv("GO2RTC_RTSP_URL", "rtsp://host.docker.internal:8554").rstrip("/")
 GO2RTC_USE_FOR_INFERENCE = os.getenv("GO2RTC_USE_FOR_INFERENCE", "true").strip().lower() not in {"0", "false", "no", "off"}
-GO2RTC_INFERENCE_MAX_FAILURES = 5  # fallback to direct after N go2rtc failures
+# v2.15.0: Never fallback to direct quickly - go2rtc is single connection, stable.
+# Increase to 100 so it stays on go2rtc RTSP and doesn't cause double connections + 4 FPS.
+# Operator can set GO2RTC_INFERENCE_MAX_FAILURES env to lower if needed.
+GO2RTC_INFERENCE_MAX_FAILURES = _bounded_int("GO2RTC_INFERENCE_MAX_FAILURES", 100, 1, 10000)
 
 
 
@@ -1324,18 +1327,20 @@ class Runtime:
             self._log(f"snapshot upload failed for {session.config.camera_id}: {redact_error(exc)}")
 
     async def _publish_live(self, session: CameraSession, image: Any) -> None:
-        # FIX 4 FPS bottleneck: when go2rtc is enabled, skip expensive MJPEG re-encode
-        # WebRTC H264 direct is primary like VLC — true 25-60 FPS, no quality cut.
+        # v2.15.0 BLACK SCREEN FIX: keep live frames even when go2rtc enabled, but at lower rate
+        # WebRTC H264 is primary like VLC (true 25-60 FPS), but backend MJPEG must have frames
+        # to avoid 503 black screen when WebRTC fails. Previously we skipped entirely, causing black screen.
+        # Now: when go2rtc enabled, publish at 10 FPS (enough for fallback, low CPU), when disabled at 60 FPS.
         # Model always uses full-quality frame via image.copy(), not this JPEG.
-        # MJPEG is only fallback when go2rtc disabled or CAMERA_LIVE_FPS=0 disables it,
-        # or when CAMERA_LIVE_FORCE_MJPEG=true forces it for debugging.
-        if GO2RTC_PREVIEW_ENABLED and not GO2RTC_FORCE_MJPEG_FALLBACK:
-            return
         if LIVE_PREVIEW_FPS <= 0:
             return
         now = time.monotonic()
-        rate = min(session.config.fps_limit, LIVE_PREVIEW_FPS)
-        if rate <= 0 or now - session.last_live_at < 1 / rate:
+        if GO2RTC_PREVIEW_ENABLED and not GO2RTC_FORCE_MJPEG_FALLBACK:
+            # Go2rtc enabled: keep 10 FPS live frames for reliable fallback, avoid 503
+            effective_fps = min(10.0, LIVE_PREVIEW_FPS, session.config.fps_limit)
+        else:
+            effective_fps = min(session.config.fps_limit, LIVE_PREVIEW_FPS)
+        if effective_fps <= 0 or now - session.last_live_at < 1 / effective_fps:
             return
         # Update timestamp BEFORE encoding/upload to avoid POST latency throttling FPS to 4
         session.last_live_at = now
@@ -1343,8 +1348,6 @@ class Runtime:
             encoded = await asyncio.to_thread(self._encode_live, image)
             if not encoded:
                 return
-            # Fire-and-forget style: we already updated last_live_at, so next frame can be scheduled
-            # even if this POST is still in flight. Await it but don't block rate limiter.
             await self.post_internal_jpeg(f"/api/internal/cameras/{session.config.camera_id}/live-frame", encoded)
         except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
             self._log(f"live preview upload failed for {session.config.camera_id}: {redact_error(exc)}")
