@@ -181,9 +181,10 @@ services:
       CAMERA_CONTROL_POLL_SECONDS: ${CAMERA_CONTROL_POLL_SECONDS:-2}
       CAMERA_TELEMETRY_SECONDS: ${CAMERA_TELEMETRY_SECONDS:-5}
       CAMERA_SNAPSHOT_SECONDS: ${CAMERA_SNAPSHOT_SECONDS:-3}
-      # Legacy MJPEG fallback rate. Default 0: WebRTC via go2rtc is the normal
-      # preview path; keep snapshots/MJPEG fallback only when go2rtc is disabled.
-      CAMERA_LIVE_FPS: ${CAMERA_LIVE_FPS:-0}
+      # MJPEG fallback rate for true live preview like VLC. WebRTC via go2rtc
+      # is primary, but MJPEG at 25 FPS ensures real-time video even if go2rtc
+      # signalling fails. Set 0 to fully disable MJPEG and save CPU.
+      CAMERA_LIVE_FPS: ${CAMERA_LIVE_FPS:-25}
       # AI is sampled separately so model speed does not throttle the preview.
       CAMERA_INFERENCE_FPS: ${CAMERA_INFERENCE_FPS:-8}
       CAMERA_HIGH_FPS_MODE: ${CAMERA_HIGH_FPS_MODE:-true}

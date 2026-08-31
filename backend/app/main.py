@@ -1088,24 +1088,36 @@ def rows(query,args=()):
     con=db(); result=[dict(r) for r in con.execute(query,args).fetchall()]; con.close(); return result
 
 def _go2rtc_source_url(rtsp_url: str) -> str:
-    """Append the operator-selected RTSP transport fragment for go2rtc."""
+    """Build a low-latency go2rtc source URL like VLC: TCP transport, no buffering."""
     if not rtsp_url:
         return rtsp_url
-    if "#" in rtsp_url:
-        return rtsp_url if "transport=" in rtsp_url else f"{rtsp_url}#transport={GO2RTC_RTSP_TRANSPORT}"
-    return f"{rtsp_url}#transport={GO2RTC_RTSP_TRANSPORT}"
+    base = rtsp_url.split("#")[0]
+    existing_frag = rtsp_url.split("#", 1)[1] if "#" in rtsp_url else ""
+    if "transport=" in existing_frag:
+        fragment = existing_frag
+    elif existing_frag:
+        fragment = f"{existing_frag}&transport={GO2RTC_RTSP_TRANSPORT}"
+    else:
+        fragment = f"transport={GO2RTC_RTSP_TRANSPORT}"
+    return f"{base}#{fragment}"
 
 def sync_go2rtc_cameras() -> dict[str, Any]:
-    """Mirror enabled cameras from SQLite into go2rtc.
+    """Mirror enabled cameras from SQLite into go2rtc with VLC-like low latency.
 
     go2rtc is deliberately optional: a slow/absent media relay must never break
-    camera CRUD. Only streams owned by this application (zmk-<camera_id>) are
-    added/removed, so an operator can keep unrelated go2rtc streams untouched.
+    camera CRUD. Streams owned by this app (zmk-<id> and plain <id> for compat)
+    are added/removed, so an operator can keep unrelated go2rtc streams untouched.
+    Creating both names fixes slideshow fallback when frontend/backend names mismatch.
     """
     if not GO2RTC_ENABLED or not GO2RTC_API_URL:
         return {"ok": False, "reason": "go2rtc disabled"}
     desired = rows("SELECT id,rtsp_url FROM cameras WHERE enabled=1 AND rtsp_url<>''")
-    desired_map = {f"zmk-{row['id']}": row["rtsp_url"] for row in desired}
+    desired_map: dict[str, str] = {}
+    for row in desired:
+        cid = str(row["id"])
+        url = str(row["rtsp_url"])
+        desired_map[f"zmk-{cid}"] = url
+        desired_map[cid] = url
     try:
         with httpx.Client(timeout=httpx.Timeout(GO2RTC_SYNC_TIMEOUT_SECONDS, connect=1.0)) as client:
             existing_response = client.get(f"{GO2RTC_API_URL}/api/streams")
@@ -1127,7 +1139,8 @@ def sync_go2rtc_cameras() -> dict[str, Any]:
                     return {"ok": False, "reason": f"{name}: HTTP {response.status_code}"}
 
             for name in existing - set(desired_map):
-                if name.startswith("zmk-"):
+                # Clean up both prefixed and legacy plain names owned by this app
+                if name.startswith("zmk-") or name.startswith("cam_"):
                     client.delete(f"{GO2RTC_API_URL}/api/streams", params=[("name", name)])
     except (httpx.HTTPError, OSError, RuntimeError, ValueError, TypeError) as exc:
         # Keep the application camera workflow fully usable if go2rtc is not
