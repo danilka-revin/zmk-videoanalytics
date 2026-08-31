@@ -1860,15 +1860,20 @@ def camera_mjpeg(camera_id:str):
                 if idle>150:  # 150 * 0.02 = 3 sec
                     try:
                         snap_path = snapshot_path_for(camera_id)
-                        if snap_path.exists():
+                    except (HTTPException, OSError):
+                        # Invalid camera id can never reach here (the camera row
+                        # was already validated above); keep the loop alive.
+                        snap_path = None
+                    if snap_path is not None and snap_path.exists():
+                        try:
                             img = snap_path.read_bytes()
-                            if img.startswith(b"\xff\xd8"):
-                                yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "+str(len(img)).encode()+b"\r\n\r\n"+img+b"\r\n"
-                                idle=0
-                                time.sleep(0.5)
-                                continue
-                    except Exception:
-                        pass
+                        except OSError:
+                            img = b""
+                        if img.startswith(b"\xff\xd8"):
+                            yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "+str(len(img)).encode()+b"\r\n\r\n"+img+b"\r\n"
+                            idle=0
+                            time.sleep(0.5)
+                            continue
                     # If still no frame, wait and continue loop (don't break - keep connection for snapshot fallback)
                     if idle>500:  # 10 sec total, then reset idle to keep trying
                         idle=0
