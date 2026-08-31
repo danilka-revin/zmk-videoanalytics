@@ -4,6 +4,8 @@
 
 Камеры и AI-модели теперь независимы. `inference-worker` сначала запускает RTSP-превью, телеметрию и reconnect-машину, а Ultralytics/PyTorch загружаются лениво и в фоне только при наличии активной модели. Ошибка CUDA, отсутствующая модель или повреждённый артефакт больше не должны останавливать просмотр камеры.
 
+Live-превью переведено на **go2rtc + WebRTC**: API синхронизирует камеры в go2rtc (`zmk-<camera_id>`), панель получает H.264/HEVC напрямую по WebRTC через `/rtc/api/ws`. Это убирает bottleneck MJPEG и повторную перерисовку каждого кадра в браузере: частота камеры больше не упирается в 4 FPS MJPEG-конвейера. Если go2rtc выключен или недоступен, панель автоматически переключается на прежний MJPEG/snapshot fallback.
+
 ## Камеры
 
 - новая машина состояний: `connecting → online / recovering / offline`;
@@ -17,8 +19,9 @@
 - безопасная публикация превью без AI-модели;
 - реальный FPS по окну телеметрии, без стартовых всплесков;
 - worker heartbeat в API и понятные диагностические данные;
-- реальный MJPEG preview endpoint в панели: кадры отображаются с `CAMERA_LIVE_FPS` (до `fps_limit` камеры), а не редким snapshot polling;
-- low-latency FFmpeg/MJPEG pipeline: `nobuffer`, `avioflags=direct`, RTP max delay 100 мс, immediate packet flush и Nginx без proxy buffering;
+- WebRTC preview через go2rtc: API поддерживает `PUT /rtc/api/streams?name=zmk-*&src=rtsp...`, браузер использует `/rtc/api/ws` и media-порт `8555` (TCP/UDP), MJPEG остаётся fallback;
+- локальные модели с русскими/кириллическими классами («Человек», «Без каски», «Жилет» и т.п.) теперь нормализуются в `person / no_helmet / helmet / vest / no_vest` — ранее не-ASCII имена классов вырезались в пустую строку и детекции не рисовались;
+- low-latency FFmpeg pipeline: `nobuffer`, `avioflags=direct`, RTP max delay 100 мс и Nginx без proxy buffering;
 - карточки камеры одинакового размера с настройкой `Компакт / Обычные / Крупные`, native fullscreen по клику и честный FPS `факт / лимит` (ползунок до 20 FPS);
 - training-worker всегда запускается с базовым стеком; GPU включается автоматически при NVIDIA Container Toolkit, иначе доступен CPU fallback;
 - хранение безопасной последней причины ошибки без RTSP-логина и пароля;

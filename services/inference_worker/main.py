@@ -29,6 +29,10 @@ DEVICE_SETTING = os.getenv("INFERENCE_DEVICE", "auto").strip() or "auto"
 CAMERA_DECODER = os.getenv("CAMERA_DECODER", "ffmpeg").strip().lower()
 if CAMERA_DECODER not in {"ffmpeg", "opencv"}:
     CAMERA_DECODER = "ffmpeg"
+# When go2rtc is enabled, the browser receives a WebRTC stream directly from
+# go2rtc (H.264/H.265 over UDP/TCP). The worker therefore does not need to
+# re-encode every frame into a legacy MJPEG live frame just for the panel.
+GO2RTC_PREVIEW_ENABLED = os.getenv("GO2RTC_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -72,6 +76,9 @@ def _worker_token() -> str:
 # the file on every internal call so a token provisioned after startup works.
 WORKER_TOKEN = _worker_token()
 CONF = _bounded_float("INFERENCE_CONF", 0.5, 0.01, 1.0)
+# Test mode deliberately starts lower than production so an uploaded model can
+# prove that it sees people before its validation metrics are known.
+TEST_CONF = _bounded_float("MODEL_TEST_CONF", 0.10, 0.01, 0.95)
 RTSP_TRANSPORT = os.getenv("RTSP_TRANSPORT", "auto").strip().lower()
 if RTSP_TRANSPORT not in {"auto", "tcp", "udp"}:
     RTSP_TRANSPORT = "auto"
@@ -125,11 +132,33 @@ _YOLO_CLASS: Any | None = None
 # "No-Helmet", ...).  Normalising them here makes a genuine person+helmet
 # model usable without forcing its author to name classes exactly like our
 # event API.  COCO `person` alone is never enough to raise a violation.
-_PERSON_LABELS = {"person", "human", "worker", "people"}
-_HELMET_LABELS = {"helmet", "hardhat", "hard_hat", "hat", "safety_helmet"}
+_PERSON_LABELS = {
+    "person", "human", "worker", "people",
+    # Locally trained custom models often keep Cyrillic/Russian class names.
+    "человек", "люди", "работник", "рабочий", "мужик", "человек_в_каске", "человек_в_жилете",
+}
+_HELMET_LABELS = {
+    "helmet", "hardhat", "hard_hat", "hat", "safety_helmet",
+    "каска", "каску", "каске", "каски", "шлем", "шлема", "шлеме", "шлём",
+}
 _NO_HELMET_LABELS = {
     "no_helmet", "nohelmet", "no_hat", "nohat", "no_hardhat", "nohardhat",
     "without_helmet", "withouthelmet", "person_without_helmet", "person_no_helmet",
+    "без_каски", "без_каску", "без_каске", "нет_каски", "нет_каску",
+    "человек_без_каски", "рабочий_без_каски", "работник_без_каски",
+    "без_шлема", "без_шлема_человек", "человек_без_шлема",
+    "bare_head", "barehead", "head", "head_without_helmet", "bare_head_detection",
+}
+_VEST_LABELS = {
+    "vest", "safety_vest", "hi_vis_vest", "hi_vis", "reflective_vest",
+    "workwear", "coveralls", "robe",
+    "жилет", "жилета", "жилеты", "жилетку", "сигнальный_жилет", "спецодежда", "спец_одежда",
+}
+_NO_VEST_LABELS = {
+    "no_vest", "novest", "without_vest", "withoutvest", "no_workwear", "noworkwear",
+    "no_coveralls", "nocoveralls", "без_жилета", "без_жилетки", "нет_жилета",
+    "человек_без_жилета", "рабочий_без_жилета", "работник_без_жилета",
+    "person_without_vest", "person_no_vest", "without_workwear",
 }
 
 
@@ -142,6 +171,9 @@ class ModelBox:
     semantic: str
     confidence: float
     index: int
+    # The pipeline can combine separate person, helmet and workwear models.
+    # Keep provenance so the event gateway validates the correct active slot.
+    model_name: str = ""
 
 
 @dataclass(frozen=True)
@@ -151,16 +183,36 @@ class InferenceVisual:
     shape: tuple[int, int]
     boxes: list[ModelBox]
     helmet_violations: list[tuple[ModelBox, ModelBox | None, bool]]
+    vest_violations: list[tuple[ModelBox, ModelBox | None, bool]] = field(default_factory=list)
 
 
 def normalise_model_label(value: object) -> str:
-    raw = re.sub(r"[^a-z0-9]+", "_", str(value or "").casefold()).strip("_")
-    if raw in _PERSON_LABELS:
-        return "person"
-    if raw in _HELMET_LABELS:
-        return "helmet"
+    # Keep Unicode letters too: custom YOLO models trained by ZMK operators are
+    # frequently exported with Russian class names ("Человек", "без каски", ...).
+    raw = re.sub(r"[^\w]+", "_", str(value or "").casefold()).strip("_")
     if raw in _NO_HELMET_LABELS:
         return "no_helmet"
+    if raw in _NO_VEST_LABELS:
+        return "no_vest"
+    if raw in _HELMET_LABELS:
+        return "helmet"
+    if raw in _VEST_LABELS:
+        return "vest"
+    if raw in _PERSON_LABELS:
+        return "person"
+    # Custom datasets frequently use compounds that are not in the exact alias
+    # set ("Person without Hardhat", "без каски человек", "NO-HELMET", ...).
+    # Match the meaningful stems before falling back to the raw label.
+    if any(token in raw for token in ("without_helmet", "withouthelmet", "no_helmet", "nohelmet", "no_hardhat", "nohardhat", "без_каск", "нет_каск", "без_шлем", "bare_head", "barehead", "no_hat")):
+        return "no_helmet"
+    if any(token in raw for token in ("without_vest", "withoutvest", "no_vest", "novest", "без_жилет", "нет_жилет", "no_workwear", "noworkwear")):
+        return "no_vest"
+    if any(token in raw for token in ("helmet", "hardhat", "hard_hat", "каск", "шлем", "helm")):
+        return "helmet"
+    if any(token in raw for token in ("жилет", "vest", "workwear", "спецодежд", "coverall")):
+        return "vest"
+    if any(token in raw for token in ("person", "human", "worker", "people", "человек", "люди", "работник", "рабочий", "мужик")):
+        return "person"
     return raw
 
 
@@ -233,6 +285,24 @@ def ppe_no_helmet_violations(boxes: list[ModelBox], declared: set[str]) -> list[
     return [(person, person, True) for person in people if person.index not in protected]
 
 
+def ppe_no_vest_violations(boxes: list[ModelBox], declared: set[str]) -> list[tuple[ModelBox, ModelBox | None, bool]]:
+    """Same conservative cross-model relation as helmet detection for workwear."""
+    people = [box for box in boxes if box.semantic == "person"]
+    missing = [box for box in boxes if box.semantic == "no_vest"]
+    if missing:
+        result=[]
+        for evidence in missing:
+            person = _person_for_box(evidence, people) if people else None
+            if people and person is None:
+                continue
+            result.append((evidence, person, False))
+        return result
+    # Unlike helmets, a vest can be hidden behind tools, an arm or a partial
+    # frame. Do not turn a missed vest box into a production alarm. A separate
+    # workwear model must expose an explicit `no_vest` class to raise this event.
+    return []
+
+
 def _label_at(names: object, class_id: int) -> str:
     if isinstance(names, dict):
         return str(names.get(class_id, names.get(str(class_id), class_id)))
@@ -250,6 +320,7 @@ def draw_detection_overlay(
     image: Any,
     boxes: list[ModelBox],
     helmet_violations: list[tuple[ModelBox, ModelBox | None, bool]],
+    vest_violations: list[tuple[ModelBox, ModelBox | None, bool]] | None = None,
 ) -> Any | None:
     """Draw real detector boxes onto a live frame for the browser preview.
 
@@ -260,18 +331,20 @@ def draw_detection_overlay(
     font cannot render Cyrillic reliably in a minimal container.
     """
 
-    recognised = {"person", "helmet", "no_helmet", "vest", *EVENT_CLASSES}
-    if not any(box.semantic in recognised for box in boxes):
+    # A custom local model may use classes outside ZMK's safety-event schema.
+    # They must still be visible on the camera preview; only event generation
+    # below remains limited to recognised safety semantics.
+    if not boxes:
         return None
     try:
         canvas = image.copy()
         height, width = canvas.shape[:2]
         thickness = max(1, round(min(height, width) / 500))
         scale = max(.35, min(.7, min(height, width) / 1000))
-        violating_people = {person.index for _, person, _ in helmet_violations if person is not None}
+        vest_violations = vest_violations or []
+        helmet_people = {person.index for _, person, _ in helmet_violations if person is not None}
+        vest_people = {person.index for _, person, _ in vest_violations if person is not None}
         for box in boxes:
-            if box.semantic not in recognised:
-                continue
             x1, y1, x2, y2 = box.bbox
             left = max(0, min(width - 1, round(x1)))
             top = max(0, min(height - 1, round(y1)))
@@ -280,17 +353,24 @@ def draw_detection_overlay(
             if right <= left or bottom <= top:
                 continue
             if box.semantic == "person":
-                violation = box.index in violating_people
-                colour = (50, 55, 235) if violation else (235, 170, 30)  # BGR: red / blue
-                title = "NO HELMET" if violation else "PERSON"
+                no_helmet = box.index in helmet_people
+                no_vest = box.index in vest_people
+                colour = (50, 55, 235) if no_helmet or no_vest else (235, 170, 30)  # BGR: red / blue
+                title = "NO HELMET & VEST" if no_helmet and no_vest else "NO HELMET" if no_helmet else "NO VEST" if no_vest else "PERSON"
             elif box.semantic == "helmet":
                 colour, title = (55, 205, 75), "HELMET"
             elif box.semantic == "no_helmet":
                 colour, title = (50, 55, 235), "NO HELMET"
             elif box.semantic == "vest":
                 colour, title = (200, 80, 170), "VEST"
+            elif box.semantic == "no_vest":
+                colour, title = (50, 55, 235), "NO VEST"
             else:
-                colour, title = (0, 165, 255), box.semantic.upper()
+                # OpenCV Hershey fonts cannot safely render arbitrary Unicode,
+                # but a clean ASCII fallback still proves that the custom model
+                # is producing real boxes on the live camera.
+                title=re.sub(r"[^A-Za-z0-9_. -]+","?",str(box.label or box.semantic)).strip()[:32] or f"CLASS {box.index}"
+                colour = (0, 165, 255)
             cv2.rectangle(canvas, (left, top), (right, bottom), colour, thickness)
             cv2.putText(
                 canvas,
@@ -422,6 +502,17 @@ class CameraSession:
         return TRANSPORT_ORDER[self.transport_index % len(TRANSPORT_ORDER)]
 
 
+@dataclass
+class SlotModelRuntime:
+    role: str
+    info: dict[str, Any]
+    model: Any | None = None
+    device: str = DEVICE_SETTING
+    task: asyncio.Task[tuple[str, Any, str]] | None = None
+    error: str = ""
+    retry_at: float = 0.0
+
+
 class Runtime:
     """Owns camera sessions, API protocol and optional model inference."""
 
@@ -438,11 +529,16 @@ class Runtime:
         self._inference_lock = asyncio.Lock()
         self.model: Any | None = None
         self.model_name = ""
+        # Explicit camera tests draw boxes but never deliver detections/events.
+        self.model_test_mode = False
+        self.model_test_conf = TEST_CONF
         self.device = DEVICE_SETTING
         self._model_task: asyncio.Task[tuple[str, Any, str]] | None = None
         self._model_loading_name = ""
+        self._model_error = ""
         self._model_retry_at = 0.0
         self._no_model_announced = False
+        self.slot_models: dict[str, SlotModelRuntime] = {}
 
     async def _request(
         self,
@@ -469,7 +565,9 @@ class Runtime:
         return await self._request("GET", path, internal=internal)
 
     async def post(self, path: str, data: dict[str, Any]) -> Any:
-        return await self._request("POST", path, data)
+        # Detection ingestion is worker-only even though it lives outside the
+        # /api/internal namespace; browser password sessions must not block it.
+        return await self._request("POST", path, data, internal=path.startswith("/api/inference/"))
 
     async def post_internal(self, path: str, data: dict[str, Any]) -> Any:
         return await self._request("POST", path, data, internal=True)
@@ -650,16 +748,30 @@ class Runtime:
             session.telemetry_window_started = now
             session.frames_in_window = 0
 
+    def _model_runtime(self) -> tuple[str, str, str]:
+        """Return (name, state, safe_error) for API/UI model lifecycle status."""
+        if self._model_error:
+            return self._model_loading_name or self.model_name, "error", self._model_error
+        if self.model is not None and self.model_name:
+            return self.model_name, "ready", ""
+        if self._model_task is not None and not self._model_task.done():
+            return self._model_loading_name, "loading", ""
+        return "", "none", ""
+
     async def _heartbeat(self) -> None:
         now = time.monotonic()
         if now - self._last_heartbeat_at < HEARTBEAT_INTERVAL_SECONDS:
             return
         status = "running" if self.sessions else "idle"
-        detail = f"cameras={len(self.sessions)} model={self.model_name or 'none'}"
+        model_name, model_status, model_error = self._model_runtime()
+        slot_detail=",".join(f"{state.role}:{state.info.get('name')}:{'ready' if state.model is not None else 'loading' if state.task is not None else 'error' if state.error else 'waiting'}" for state in self.slot_models.values()) or "none"
+        detail = f"cameras={len(self.sessions)} model={model_name or 'none'} slots={slot_detail} state={model_status} test={str(self.model_test_mode).lower()} test_conf={self.model_test_conf:.2f}"
+        if model_error:
+            detail += f" error={model_error}"
         try:
             await self.post_internal(
                 "/api/internal/inference/heartbeat",
-                {"status": status, "detail": detail, "camera_count": len(self.sessions)},
+                {"status": status, "detail": detail[:300], "camera_count": len(self.sessions), "model_name": model_name, "model_status": model_status, "model_error": model_error[:300]},
             )
             self._last_heartbeat_at = now
         except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
@@ -702,6 +814,59 @@ class Runtime:
             else:
                 session.config = config
 
+    def _ready_models(self) -> list[tuple[str, Any, str]]:
+        ready=[]
+        if self.model is not None and self.model_name:
+            ready.append((self.model_name,self.model,self.device))
+        seen={self.model_name} if self.model_name else set()
+        for slot in self.slot_models.values():
+            name=str(slot.info.get("name") or "")
+            if slot.model is not None and name and name not in seen:
+                ready.append((name,slot.model,slot.device)); seen.add(name)
+        return ready
+
+    def _clear_inference_visuals(self) -> None:
+        for session in self.sessions.values():
+            if session.inference_task is not None and not session.inference_task.done():
+                session.inference_task.cancel()
+            session.inference_task = None
+            session.latest_visual = None
+            session.next_inference_at = 0
+
+    async def _refresh_slots(self, infos: list[dict[str, Any]]) -> None:
+        desired={str(info.get("role")):dict(info) for info in infos if str(info.get("role")) and str(info.get("name"))}
+        changed=False
+        for role in set(self.slot_models)-set(desired):
+            state=self.slot_models.pop(role)
+            if state.task is not None and not state.task.done():
+                state.task.cancel()
+            changed=True
+        now=time.monotonic()
+        for role,info in desired.items():
+            state=self.slot_models.get(role)
+            if state is None or state.info.get("name")!=info.get("name"):
+                if state is not None and state.task is not None and not state.task.done():
+                    state.task.cancel()
+                state=SlotModelRuntime(role=role,info=info)
+                self.slot_models[role]=state
+                changed=True
+            if state.task is not None and state.task.done():
+                task=state.task; state.task=None
+                try:
+                    loaded_name,model,device=task.result()
+                    if loaded_name==str(state.info.get("name")):
+                        state.model=model; state.device=device; state.error=""
+                        self._log(f"pipeline model loaded: {role}={loaded_name} (device={device})",force=True)
+                except Exception as exc:  # noqa: BLE001 - model backends vary.
+                    state.model=None; state.retry_at=now+15; state.error=redact_error(exc)
+                    self._log(f"pipeline model unavailable: {role}={state.info.get('name')} error={state.error}",force=True)
+            if state.model is None and state.task is None and now>=state.retry_at:
+                state.error=""
+                state.task=asyncio.create_task(self._load_model_async(dict(state.info)),name=f"slot-model-load-{role}-{state.info.get('name')}")
+                self._log(f"loading pipeline model: {role}={state.info.get('name')}",force=True)
+        if changed:
+            self._clear_inference_visuals()
+
     async def _load_model_async(self, info: dict[str, Any]) -> tuple[str, Any, str]:
         return await asyncio.to_thread(load_model_sync, info)
 
@@ -713,36 +878,49 @@ class Runtime:
             self._model_task = None
             self.model = None
             self.model_name = ""
-            for session in self.sessions.values():
-                if session.inference_task is not None and not session.inference_task.done():
-                    session.inference_task.cancel()
-                session.inference_task = None
-                session.latest_visual = None
-                session.next_inference_at = 0
+            self.model_test_mode = False
+            self.model_test_conf = TEST_CONF
+            self._model_loading_name = ""
+            self._model_error = ""
             if not self._no_model_announced:
                 self._log("no active model; camera preview and telemetry remain enabled", force=True)
                 self._no_model_announced = True
             return
 
         wanted_name = str(info["name"])
+        requested_test_mode = bool(info.get("test_mode"))
+        try:
+            requested_test_conf=max(.01,min(.95,float(info.get("test_conf") if info.get("test_conf") is not None else TEST_CONF)))
+        except (TypeError,ValueError):
+            requested_test_conf=TEST_CONF
         self._no_model_announced = False
         if self.model_name == wanted_name and self.model is not None:
+            self.model_test_mode = requested_test_mode
+            self.model_test_conf = requested_test_conf
+            self._model_loading_name = wanted_name
+            self._model_error = ""
             return
 
         if self._model_task is not None:
             if not self._model_task.done():
+                self.model_test_mode = requested_test_mode
+                self.model_test_conf = requested_test_conf
                 return
             task = self._model_task
             self._model_task = None
             try:
                 loaded_name, model, device = task.result()
-            except (OSError, RuntimeError, ValueError, ImportError) as exc:
+            except Exception as exc:  # noqa: BLE001 - model backends raise heterogeneous load errors.
                 self._model_retry_at = now + 15
-                self._log(f"model unavailable; camera capture continues: {redact_error(exc)}", force=True)
+                self._model_loading_name = wanted_name
+                self._model_error = redact_error(exc)
+                self._log(f"model unavailable; camera capture continues: {self._model_error}", force=True)
                 return
             if loaded_name == wanted_name:
                 self.model = model
                 self.model_name = loaded_name
+                self._model_loading_name = loaded_name
+                self._model_error = ""
                 self.device = device
                 self._log(f"active model loaded: {loaded_name} (device={device})", force=True)
                 return
@@ -758,6 +936,9 @@ class Runtime:
             session.latest_visual = None
             session.next_inference_at = 0
         self._model_loading_name = wanted_name
+        self.model_test_mode = requested_test_mode
+        self.model_test_conf = requested_test_conf
+        self._model_error = ""
         self._model_task = asyncio.create_task(self._load_model_async(dict(info)), name=f"model-load-{wanted_name}")
         self._log(f"loading active model {wanted_name} in background", force=True)
 
@@ -770,11 +951,20 @@ class Runtime:
         cameras = await self.get("/api/internal/cameras", internal=True)
         self._sync_cameras(cameras)
         try:
-            info = await self.get("/api/internal/active-model", internal=True)
+            pipeline = await self.get("/api/internal/active-models", internal=True)
+            info=pipeline.get("primary") if isinstance(pipeline,dict) else None
+            slots=pipeline.get("slots",[]) if isinstance(pipeline,dict) and isinstance(pipeline.get("slots"),list) else []
         except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
-            self._log(f"active-model query failed; camera capture continues: {redact_error(exc)}")
-            info = None
+            self._log(f"pipeline query failed; trying legacy active model: {redact_error(exc)}")
+            try:
+                info=await self.get("/api/internal/active-model", internal=True)
+            except (httpx.HTTPError, OSError, RuntimeError, ValueError):
+                info=None
+            slots=[]
         await self._refresh_model(info)
+        await self._refresh_slots(slots)
+        if not self._ready_models() and not any(state.task is not None for state in self.slot_models.values()):
+            self._clear_inference_visuals()
 
         if not self.sessions and time.monotonic() - self._last_no_camera_log >= 30:
             self._log("no enabled RTSP cameras returned by API; set RTSP_CAM_01 or add a camera", force=True)
@@ -1033,7 +1223,7 @@ class Runtime:
             self._log(f"snapshot upload failed for {session.config.camera_id}: {redact_error(exc)}")
 
     async def _publish_live(self, session: CameraSession, image: Any) -> None:
-        if LIVE_PREVIEW_FPS <= 0:
+        if GO2RTC_PREVIEW_ENABLED or LIVE_PREVIEW_FPS <= 0:
             return
         now = time.monotonic()
         rate = min(session.config.fps_limit, LIVE_PREVIEW_FPS)
@@ -1065,98 +1255,97 @@ class Runtime:
             self._log(f"event evidence upload failed for {session.config.camera_id}: {redact_error(exc)}")
 
     async def _infer(self, session: CameraSession, image: Any) -> InferenceVisual | None:
-        if self.model is None or not self.model_name:
-            return
-        try:
-            # GPU/Ultralytics inference is intentionally serialised; RTSP
-            # capture itself stays concurrent and does not wait for a stalled
-            # camera opening or read.
-            async with self._inference_lock:
-                result = (
-                    await asyncio.to_thread(
-                        self.model.predict,
-                        image,
-                        conf=CONF,
-                        device=self.device,
-                        verbose=False,
-                    )
-                )[0]
-        except Exception as exc:  # noqa: BLE001 - ML failures must not stop RTSP.
-            self._log(f"inference failed; camera capture continues: {redact_error(exc)}")
-            return
-
+        ready=self._ready_models()
+        if not ready:
+            return None
         stamp = datetime.now(timezone.utc).isoformat()
-        try:
-            names = getattr(result, "names", None) or getattr(self.model, "names", {})
-            declared = model_semantics(names)
-            shape=(int(image.shape[0]),int(image.shape[1]))
-            raw: list[ModelBox] = []
-            values = zip(
-                result.boxes.xyxy.cpu().tolist(),
-                result.boxes.cls.cpu().tolist(),
-                result.boxes.conf.cpu().tolist(),
-            )
-            for index, (xyxy, cls, score) in enumerate(values):
-                if len(xyxy) != 4:
-                    continue
-                x1, y1, x2, y2 = (float(value) for value in xyxy)
-                if x2 <= x1 or y2 <= y1:
-                    continue
-                label = _label_at(names, int(cls))
-                raw.append(ModelBox((x1, y1, x2, y2), label, normalise_model_label(label), float(score), index))
-        except (AttributeError, IndexError, TypeError, ValueError) as exc:
-            self._log(f"invalid model output ignored: {redact_error(exc)}")
-            return
+        shape=(int(image.shape[0]),int(image.shape[1]))
+        raw: list[ModelBox] = []
+        declared: set[str] = set()
+        next_index=0
+        primary_succeeded=False
+        # Models are deliberately scheduled independently but predictions are
+        # serialised on one GPU/CPU context. This avoids VRAM races while still
+        # combining person, helmet and workwear detections from separate files.
+        async with self._inference_lock:
+            for model_name,model,device in ready:
+                try:
+                    confidence=self.model_test_conf if self.model_test_mode else CONF
+                    result=(await asyncio.to_thread(model.predict,image,conf=confidence,device=device,verbose=False))[0]
+                    names=getattr(result,"names",None) or getattr(model,"names",{})
+                    declared.update(model_semantics(names))
+                    values=zip(result.boxes.xyxy.cpu().tolist(),result.boxes.cls.cpu().tolist(),result.boxes.conf.cpu().tolist())
+                    for local_index,(xyxy,cls,score) in enumerate(values):
+                        if len(xyxy)!=4:
+                            continue
+                        x1,y1,x2,y2=(float(value) for value in xyxy)
+                        if x2<=x1 or y2<=y1:
+                            continue
+                        label=_label_at(names,int(cls))
+                        raw.append(ModelBox((x1,y1,x2,y2),label,normalise_model_label(label),float(score),next_index+local_index,model_name))
+                    next_index+=max(1,len(raw)-next_index)
+                    if model_name==self.model_name:
+                        primary_succeeded=True
+                        self._model_error=""
+                    for state in self.slot_models.values():
+                        if state.info.get("name")==model_name:
+                            state.error=""
+                except Exception as exc:  # noqa: BLE001 - one model must not stop the others.
+                    safe=redact_error(exc)
+                    if model_name==self.model_name:
+                        self._model_loading_name=model_name; self._model_error=safe
+                    for state in self.slot_models.values():
+                        if state.info.get("name")==model_name:
+                            state.error=safe
+                    self._log(f"inference failed for {model_name}; other pipeline models continue: {safe}")
+        if not raw and not primary_succeeded and self._model_error:
+            return None
 
         detections: list[dict[str, Any]] = []
         frame_token = int(time.time() * 1000)
 
         def append_event(event_type: str, evidence: ModelBox, person: ModelBox | None = None, *, inferred: bool = False) -> None:
             anchor = person or evidence
-            x1, y1, x2, y2 = anchor.bbox
-            # For an inferred absence the only measurable confidence is the
-            # confidence of the detected worker. Explicit no-helmet labels use
-            # the model's own no-helmet confidence instead.
-            confidence = evidence.confidence
-            person_id = _person_id(session.config.camera_id, anchor) if person else f"{session.config.camera_id}-{event_type}-{int(((x1 + x2) / 2) // 100)}-{int(((y1 + y2) / 2) // 100)}"
-            detections.append(
-                {
-                    "camera_id": session.config.camera_id,
-                    "model_name": self.model_name,
-                    "timestamp": stamp,
-                    "event_type": event_type,
-                    "confidence": confidence,
-                    "person_id": person_id,
-                    "detection_id": f"{session.config.camera_id}:{frame_token}:{evidence.index}:{'derived' if inferred else event_type}",
-                    "bbox": [x1, y1, x2, y2],
-                }
-            )
+            x1,y1,x2,y2=anchor.bbox
+            source_model=evidence.model_name or anchor.model_name or self.model_name
+            confidence=evidence.confidence
+            person_id=_person_id(session.config.camera_id,anchor) if person else f"{session.config.camera_id}-{event_type}-{int(((x1+x2)/2)//100)}-{source_model}"
+            detections.append({
+                "camera_id":session.config.camera_id,
+                "model_name":source_model,
+                "timestamp":stamp,
+                "event_type":event_type,
+                "confidence":confidence,
+                "person_id":person_id,
+                "detection_id":f"{session.config.camera_id}:{frame_token}:{source_model}:{evidence.index}:{'derived' if inferred else event_type}",
+                "bbox":[x1,y1,x2,y2],
+            })
 
-        # Preserve the existing direct event-class contract for models trained
-        # with ZMK's native labels. `no_helmet` is handled below so a PPE model
-        # can attach the violation to the corresponding person.
         for box in raw:
-            if box.semantic in EVENT_CLASSES and box.semantic != "no_helmet":
-                append_event(box.semantic, box)
-        helmet_violations = ppe_no_helmet_violations(raw, declared)
-        for evidence, person, inferred in helmet_violations:
-            append_event("no_helmet", evidence, person, inferred=inferred)
+            if box.semantic in EVENT_CLASSES and box.semantic not in {"no_helmet","no_vest"}:
+                append_event(box.semantic,box)
+        helmet_violations=ppe_no_helmet_violations(raw,declared)
+        vest_violations=ppe_no_vest_violations(raw,declared)
+        for evidence,person,inferred in helmet_violations:
+            append_event("no_helmet",evidence,person,inferred=inferred)
+        for evidence,person,inferred in vest_violations:
+            append_event("no_vest",evidence,person,inferred=inferred)
 
-        # The browser and the evidence archive receive this annotated JPEG,
-        # created from exactly the same YOLO result used for event creation.
         try:
-            annotated=await asyncio.to_thread(draw_detection_overlay,image,raw,helmet_violations)
+            annotated=await asyncio.to_thread(draw_detection_overlay,image,raw,helmet_violations,vest_violations)
         except (OSError,RuntimeError,TypeError,ValueError) as exc:
             self._log(f"overlay render failed; raw preview continues: {redact_error(exc)}")
             annotated=None
 
-        if detections:
+        # A requested camera test is deliberately global: no specialised slot
+        # may emit production alerts while the operator evaluates a test model.
+        if detections and not self.model_test_mode:
             try:
-                receipt=await self.post("/api/inference/detections", {"detections": detections})
+                receipt=await self.post("/api/inference/detections",{"detections":detections})
                 await self._publish_event_evidence(session,receipt,annotated if annotated is not None else image)
-            except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
+            except (httpx.HTTPError,OSError,RuntimeError,ValueError) as exc:
                 self._log(f"detections rejected: {redact_error(exc)}")
-        return InferenceVisual(shape,raw,helmet_violations)
+        return InferenceVisual(shape,raw,helmet_violations,vest_violations)
 
     def _collect_inference_result(self, session: CameraSession) -> None:
         task=session.inference_task
@@ -1229,14 +1418,14 @@ class Runtime:
         visual=session.latest_visual
         try:
             if visual is not None and visual.shape==tuple(image.shape[:2]):
-                preview=draw_detection_overlay(image,visual.boxes,visual.helmet_violations) or image
+                preview=draw_detection_overlay(image,visual.boxes,visual.helmet_violations,visual.vest_violations) or image
         except (AttributeError,TypeError,ValueError):
             preview=image
         await self._publish_live(session, preview)
         await self._publish_snapshot(session, preview)
 
         now=time.monotonic()
-        if self.model is not None and self.model_name and session.inference_task is None and now>=session.next_inference_at:
+        if self._ready_models() and session.inference_task is None and now>=session.next_inference_at:
             try:
                 inference_image=image.copy()
             except AttributeError:

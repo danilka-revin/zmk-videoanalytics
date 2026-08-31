@@ -27,12 +27,31 @@ def test_linux_installers_pass_shell_parser_and_dry_check():
     start = (ROOT/'start.sh').read_text()
     assert 'installers/wizard.sh' in start and 'run_config' in start and '--setup' in start
     assert '.zmk-profiles' in start
+    # The one-command launcher retries a known BuildKit snapshot-cache failure
+    # without pruning persistent project volumes.
+    for script in (start, (ROOT/'installers/install-linux.sh').read_text()):
+        assert 'builder prune -af' in script
+        assert 'COMPOSE_PARALLEL_LIMIT=1' in script
+        assert 'buildx prune -af' in script
+        assert 'ZMK VISION' in script
+        assert '███████' in script
+        assert 'VIDEO ANALYTICS CONTROL PLATFORM' in script
+        assert 'SERVICE STATUS' in script
+        assert 'API HEALTH CHECK' in script
 
 
 def test_bootstrap_launcher_and_rtsp_wizard_escape_credentials(tmp_path):
     bootstrap = (ROOT/'installers/bootstrap-linux.sh').read_text()
     for required in ['git clone', 'ZMK_REF', 'ZMK_INSTALL_DIR', 'zmk-vision', '/dev/tty', 'NONINTERACTIVE=1', 'ENABLE_INFERENCE=true']:
         assert required in bootstrap
+    assert 'TELEGRAM_ADMIN_USERNAMES' in (ROOT/'installers/wizard.sh').read_text()
+    # Explicit shallow fetches populate FETCH_HEAD, but do not guarantee a
+    # remote-tracking origin/<slash-containing-branch> ref. The repeat launcher
+    # must therefore check out the fetched commit directly.
+    assert 'checkout -B "$ZMK_REF" FETCH_HEAD' in bootstrap
+    # bootstrap has already checked out the requested Git ref; the release
+    # updater must not replace a feature branch immediately afterwards.
+    assert 'ZMK_NO_AUTO_UPDATE=1' in bootstrap
 
     # An RTSP password may include & or |. The wizard must preserve it rather
     # than interpreting it as a sed replacement expression.
@@ -47,6 +66,45 @@ def test_bootstrap_launcher_and_rtsp_wizard_escape_credentials(tmp_path):
         check=True,
     )
     assert result.stdout.strip() == f'RTSP_CAM_01={value}'
+
+
+def test_shallow_fetch_of_feature_branch_checks_out_fetch_head(tmp_path):
+    """Git only sets FETCH_HEAD for an explicit shallow branch fetch.
+
+    This reproduces the one-command updater's branch-switch path without a
+    network dependency.  `origin/arena/...` is intentionally absent, while
+    `checkout -B <branch> FETCH_HEAD` succeeds.
+    """
+    def git(*args, cwd):
+        return subprocess.run(['git', *args], cwd=cwd, text=True, capture_output=True, check=True)
+
+    remote = tmp_path / 'remote.git'
+    source = tmp_path / 'source'
+    clone = tmp_path / 'clone'
+    git('init', '--bare', str(remote), cwd=tmp_path)
+    git('init', '-b', 'main', str(source), cwd=tmp_path)
+    git('config', 'user.email', 'test@example.invalid', cwd=source)
+    git('config', 'user.name', 'Test', cwd=source)
+    (source / 'version.txt').write_text('main\n')
+    git('add', '.', cwd=source); git('commit', '-m', 'main', cwd=source)
+    git('remote', 'add', 'origin', str(remote), cwd=source)
+    git('push', '-u', 'origin', 'main', cwd=source)
+    git('checkout', '-b', 'arena/test-launcher', cwd=source)
+    (source / 'version.txt').write_text('feature\n')
+    git('commit', '-am', 'feature', cwd=source)
+    expected = git('rev-parse', 'HEAD', cwd=source).stdout.strip()
+    git('push', 'origin', 'arena/test-launcher', cwd=source)
+
+    git('clone', '--depth=1', '--branch', 'main', f'file://{remote}', str(clone), cwd=tmp_path)
+    git('fetch', '--depth=1', 'origin', 'arena/test-launcher', cwd=clone)
+    missing_tracking = subprocess.run(
+        ['git', 'show-ref', '--verify', '--quiet', 'refs/remotes/origin/arena/test-launcher'],
+        cwd=clone,
+        check=False,
+    )
+    assert missing_tracking.returncode != 0
+    git('checkout', '-B', 'arena/test-launcher', 'FETCH_HEAD', cwd=clone)
+    assert git('rev-parse', 'HEAD', cwd=clone).stdout.strip() == expected
 
 
 def test_windows_wrapper_and_powershell_structure():
@@ -73,6 +131,13 @@ def test_compose_and_environment_are_consistent():
     assert compose['services']['web']['build'] == './frontend'
     assert 'healthcheck' in compose['services']['api']
     assert compose['services']['api']['environment']['VIDEOANALYTICS_DB'] == '/app/data/videoanalytics.db'
+    assert compose['services']['api']['environment']['MODEL_UPLOAD_MAX_BYTES'] == '${MODEL_UPLOAD_MAX_BYTES:-2000000000}'
+    assert compose['services']['api']['environment']['MODEL_TEST_CONF'] == '${MODEL_TEST_CONF:-0.10}'
+    assert compose['services']['api']['environment']['ZMK_PASSWORD_AUTH'] == '${ZMK_PASSWORD_AUTH:-true}'
+    assert compose['services']['api']['environment']['ZMK_INITIAL_PASSWORD'] == '${ZMK_INITIAL_PASSWORD:-1234}'
+    assert compose['services']['api']['environment']['TELEGRAM_ADMIN_USERNAMES'] == '${TELEGRAM_ADMIN_USERNAMES:-}'
+    assert compose['services']['api']['environment']['SMTP_USE_SSL'] == '${SMTP_USE_SSL:-false}'
+    assert compose['services']['api']['environment']['ZMK_BOT_API_TOKEN_FILE'] == '/bot-tokens/.api-token'
     assert compose['services']['api']['ports'] == ['127.0.0.1:8000:8000']
     # Both messenger workers stay available and idle safely until the Admin → Боты
     # control plane enables a provider; this makes UI toggles real without Docker CLI use.
@@ -82,21 +147,35 @@ def test_compose_and_environment_are_consistent():
     assert compose['services']['max-bot']['restart'] == 'unless-stopped'
     assert compose['services']['max-bot']['build'] == './services/max_bot'
     assert compose['services']['api']['environment']['MAX_BOT_TOKEN'] == '${MAX_BOT_TOKEN:-}'
+    # Admin-entered bot tokens stay in a dedicated API-writable volume, never
+    # a broad read-only mount of the database/RTSP data into bot workers.
+    assert compose['services']['api']['environment']['ZMK_BOT_TOKEN_DIR'] == '/bot-tokens'
+    assert 'bot-token-data:/bot-tokens' in compose['services']['api']['volumes']
+    for service in ('telegram-bot', 'max-bot'):
+        assert compose['services'][service]['environment']['ZMK_BOT_TOKEN_DIR'] == '/bot-secrets'
+        assert compose['services'][service]['environment']['ZMK_BOT_API_TOKEN_FILE'] == '/bot-secrets/.api-token'
+        assert 'bot-token-data:/bot-secrets:ro' in compose['services'][service]['volumes']
+    assert compose['services']['telegram-bot']['environment']['TELEGRAM_ADMIN_USERNAMES'] == '${TELEGRAM_ADMIN_USERNAMES:-}'
+    assert 'bot-token-data' in compose['volumes']
     assert 'profiles' not in compose['services']['training-worker']
     assert compose['services']['training-worker']['build'] == './services/training_worker'
+    assert compose['services']['training-worker']['environment']['ZMK_BOT_API_TOKEN_FILE'] == '/bot-secrets/.api-token'
+    assert 'bot-token-data:/bot-secrets:ro' in compose['services']['training-worker']['volumes']
     assert compose['services']['api']['environment']['TRAINING_WORKER_URL'] == '${TRAINING_WORKER_URL:-http://training-worker:8010}'
     assert compose['services']['inference-worker']['profiles'] == ['inference']
     assert compose['services']['inference-worker']['build'] == './services/inference_worker'
+    assert compose['services']['inference-worker']['environment']['MODEL_TEST_CONF'] == '${MODEL_TEST_CONF:-0.10}'
     assert 'RUN nginx -t' in (ROOT/'frontend/Dockerfile').read_text()
     nginx = (ROOT/'frontend/nginx.conf').read_text()
     assert 'set $api_upstream http://api:8000' in nginx and 'proxy_pass $api_upstream' in nginx
     assert "img-src 'self' data: blob:" in nginx
     assert '/mjpeg$' in nginx and 'proxy_buffering off' in nginx
     assert 'location ^~ /telegram' in nginx and 'https://web.telegram.org' in nginx
+    assert 'location = /api/models/upload' in nginx and 'client_max_body_size 2g' in nginx and 'proxy_request_buffering off' in nginx
     lines = [x for x in (ROOT/'.env.example').read_text().splitlines() if x and not x.startswith('#')]
     keys = [x.split('=',1)[0] for x in lines]
     assert len(keys) == len(set(keys))
-    assert {'MESSENGER_PROVIDER','ZMK_API_KEY','TELEGRAM_BOT_TOKEN','MAX_BOT_TOKEN','MAX_ADMIN_IDS','POSTGRES_PASSWORD','MINIO_ROOT_PASSWORD'} <= set(keys)
+    assert {'MESSENGER_PROVIDER','ZMK_API_KEY','ZMK_PASSWORD_AUTH','ZMK_INITIAL_PASSWORD','SMTP_HOST','SMTP_USE_SSL','TELEGRAM_BOT_TOKEN','TELEGRAM_ADMIN_USERNAMES','MAX_BOT_TOKEN','MAX_ADMIN_IDS','MODEL_UPLOAD_MAX_BYTES','POSTGRES_PASSWORD','MINIO_ROOT_PASSWORD'} <= set(keys)
 
 
 def test_release_contains_installation_assets():
@@ -104,3 +183,18 @@ def test_release_contains_installation_assets():
     for path in ['installers/install-windows.ps1','installers/install-windows.bat','installers/install-linux.sh']:
         assert (ROOT/path).exists()
         assert path in workflow
+
+
+def test_max_wizard_allows_safe_waiting_mode_without_token(tmp_path):
+    (tmp_path / '.env.example').write_text((ROOT / '.env.example').read_text())
+    result = subprocess.run(
+        ['bash', '-c', 'source "$1"; NONINTERACTIVE=1 MESSENGER_PROVIDER=max MAX_BOT_TOKEN="" MAX_ADMIN_IDS="" ENABLE_INFERENCE=false run_config', '_', str(ROOT / 'installers/wizard.sh')],
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    config = (tmp_path / '.env').read_text()
+    assert 'MESSENGER_PROVIDER=max' in config and 'MAX_BOT_TOKEN=' in config
+    assert 'безопасном режиме ожидания' in result.stdout

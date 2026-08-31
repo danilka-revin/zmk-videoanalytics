@@ -16,7 +16,7 @@ class _Handler(BaseHTTPRequestHandler):
     payload = b"pretended-model-bytes"
 
     def do_GET(self):
-        if self.path.endswith("yolo11n.pt"):
+        if self.path.endswith(("yolo11n.pt", "custom.onnx", "custom.engine")):
             self.send_response(200)
             self.send_header("Content-Length", str(len(self.payload)))
             self.end_headers()
@@ -87,6 +87,19 @@ def test_download_and_register_preset(model_dir, preset_url, monkeypatch):
         # idempotent: second attempt reports already
         r2 = c.post("/api/models/presets/yolo11n/download")
         assert r2.json()["already"] is True
+
+
+def test_custom_onnx_preset_keeps_onnx_extension(model_dir, preset_url, monkeypatch):
+    monkeypatch.setattr(main, "MODEL_PRESETS", [{
+        "id": "custom-onnx", "name": "custom-onnx", "format": "ONNX",
+        "url": f"{preset_url}/custom.onnx", "size_bytes": 1000, "classes": 2,
+        "category": "custom", "description": "local test preset",
+    }])
+    with TestClient(main.app) as c:
+        result = c.post("/api/models/presets/custom-onnx/download")
+        assert result.status_code == 200, result.text
+        assert (model_dir / "custom-onnx.onnx").is_file()
+        assert result.json()["artifact_uri"].endswith("custom-onnx.onnx")
 
 
 def test_ppe_preset_requires_explicit_trial_activation(model_dir, preset_url, monkeypatch):
@@ -162,8 +175,15 @@ def test_delete_model_blocked_when_active(model_dir, preset_url, monkeypatch):
         con.commit(); con.close()
         assert c.post("/api/models/yolo11n/activate").status_code == 200
         r = c.delete("/api/models/yolo11n")
-        assert r.status_code == 409  # active model cannot be deleted
+        assert r.status_code == 409  # active model cannot be deleted accidentally
         assert "активн" in r.json()["detail"].lower()
+        # The panel can explicitly stop analytics and remove the active model
+        # in one confirmed action.
+        removed = c.delete("/api/models/yolo11n?deactivate=true")
+        assert removed.status_code == 200, removed.text
+        assert removed.json()["deactivated_active"] is True
+        assert removed.json()["active_model"] is None
+        assert not (model_dir / "yolo11n.pt").exists()
 
 
 def test_delete_model_removes_registry_and_artifact(model_dir, preset_url, monkeypatch):

@@ -14,5 +14,8 @@ data/
 htmlcov/
 *.log
 .zmk-profiles
+.zmk-ref
 .live-data/
 .worker-token
+
+.bot-api-token

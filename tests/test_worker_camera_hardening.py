@@ -62,6 +62,8 @@ def worker_mod(monkeypatch):
     monkeypatch.setenv("RTSP_STIMEOUT", "5000000")
     monkeypatch.setenv("CAMERA_DECODER", "opencv")
     monkeypatch.setenv("CAMERA_LIVE_FPS", "0")
+    # Runtime tests exercise the legacy MJPEG live-frame path directly.
+    monkeypatch.setenv("GO2RTC_ENABLED", "false")
     _FakeCap.default_opened = True
     _FakeCap.results = []
 
@@ -127,6 +129,35 @@ def test_no_active_model_does_not_import_ml_dependencies(worker_mod):
     assert "torch" not in worker_mod.__dict__
 
 
+def test_heartbeat_reports_real_model_load_state(worker_mod):
+    runtime = worker_mod.Runtime()
+    runtime._model_loading_name = "custom-forklift"
+    runtime._model_error = "Unsupported model graph"
+    calls = _record_internal(runtime)
+
+    asyncio.run(runtime._heartbeat())
+
+    assert calls
+    payload = calls[-1][1]
+    assert payload["model_name"] == "custom-forklift"
+    assert payload["model_status"] == "error"
+    assert payload["model_error"] == "Unsupported model graph"
+
+
+def test_prediction_error_is_reported_as_model_runtime_error(worker_mod):
+    class BrokenModel:
+        def predict(self, *_args, **_kwargs):
+            raise RuntimeError("Unsupported ONNX graph")
+
+    runtime = worker_mod.Runtime()
+    runtime.model = BrokenModel()
+    runtime.model_name = "custom-onnx"
+    session = worker_mod.CameraSession(config=worker_mod.CameraConfig.from_api(_camera()))
+
+    assert asyncio.run(runtime._infer(session, _FakeImage())) is None
+    assert runtime._model_runtime() == ("custom-onnx", "error", "Unsupported ONNX graph")
+
+
 def test_ppe_labels_link_no_helmet_to_the_detected_person(worker_mod):
     person = worker_mod.ModelBox((0, 0, 100, 200), "Human", "person", .96, 0)
     bare_head = worker_mod.ModelBox((35, 12, 65, 55), "No-Helmet", "no_helmet", .92, 1)
@@ -143,6 +174,23 @@ def test_ppe_labels_link_no_helmet_to_the_detected_person(worker_mod):
     inferred = worker_mod.ppe_no_helmet_violations([person], {"person", "helmet"})
     assert inferred == [(person, person, True)]
     assert worker_mod.ppe_no_helmet_violations([person], {"person"}) == []  # COCO person-only is not PPE
+
+
+def test_custom_cyrillic_and_russian_class_names_are_normalised(worker_mod):
+    """A locally trained model often uses Russian class names; they must not be
+    stripped to an empty string by the ASCII-only label normaliser."""
+    assert worker_mod.normalise_model_label("Человек") == "person"
+    assert worker_mod.normalise_model_label("Рабочий") == "person"
+    assert worker_mod.normalise_model_label("Люди") == "person"
+    assert worker_mod.normalise_model_label("Без каски") == "no_helmet"
+    assert worker_mod.normalise_model_label("Человек без каски") == "no_helmet"
+    assert worker_mod.normalise_model_label("Каска") == "helmet"
+    assert worker_mod.normalise_model_label("без жилета") == "no_vest"
+    assert worker_mod.normalise_model_label("Жилет") == "vest"
+    assert worker_mod.normalise_model_label("Person without Hardhat") == "no_helmet"
+    assert worker_mod.normalise_model_label("Человек без жилета") == "no_vest"
+    semantics = worker_mod.model_semantics({"0": "Человек", "1": "Без каски", "2": "Каска"})
+    assert {"person", "no_helmet", "helmet"} <= semantics
 
 
 def test_ppe_inference_posts_no_helmet_event_for_the_matching_person(worker_mod):
@@ -180,6 +228,36 @@ def test_ppe_inference_posts_no_helmet_event_for_the_matching_person(worker_mod)
     assert detection["event_type"] == "no_helmet"
     assert detection["bbox"] == [0.0, 0.0, 100.0, 200.0]
     assert detection["person_id"].startswith("cam_01-person-")
+
+
+def test_camera_test_mode_draws_boxes_without_sending_production_events(worker_mod):
+    class Tensor:
+        def __init__(self, value): self.value = value
+        def cpu(self): return self
+        def tolist(self): return self.value
+
+    result = types.SimpleNamespace(boxes=types.SimpleNamespace(
+        xyxy=Tensor([[1, 1, 18, 19]]), cls=Tensor([0]), conf=Tensor([.96]),
+    ))
+
+    class TestModel:
+        def __init__(self): self.names = {0: "no_vest"}
+        def predict(self, *_args, **_kwargs): return [result]
+
+    runtime = worker_mod.Runtime()
+    runtime.model = TestModel()
+    runtime.model_name = "unvalidated-local"
+    runtime.model_test_mode = True
+    posted = []
+
+    async def post(path, data): posted.append((path, data))
+    runtime.post = post
+    session = worker_mod.CameraSession(config=worker_mod.CameraConfig.from_api(_camera()))
+
+    visual = asyncio.run(runtime._infer(session, _FakeImage()))
+
+    assert visual is not None and visual.boxes
+    assert posted == []
 
 
 def test_accepted_event_gets_an_annotated_evidence_frame(worker_mod):
@@ -264,6 +342,19 @@ def test_ppe_boxes_are_drawn_into_the_published_camera_preview(worker_mod):
     assert len(rectangles) >= 2
     assert any(text.startswith("PERSON") for text in labels)
     assert any(text.startswith("HELMET") for text in labels)
+
+
+def test_custom_model_classes_are_drawn_on_live_preview(worker_mod):
+    rectangles, labels = [], []
+    worker_mod.cv2.rectangle = lambda image, *args: rectangles.append(args) or image
+    worker_mod.cv2.putText = lambda image, text, *args: labels.append(text) or image
+    custom = worker_mod.ModelBox((1, 1, 18, 19), "Forklift", "forklift", .91, 0)
+
+    result = worker_mod.draw_detection_overlay(_FakeImage(), [custom], [])
+
+    assert result is not None
+    assert rectangles
+    assert any(text.startswith("Forklift") for text in labels)
 
 
 def test_live_preview_does_not_wait_for_slow_ai_inference(worker_mod):
@@ -517,3 +608,94 @@ def test_compose_forwards_all_camera_runtime_settings():
         "CAMERA_HEARTBEAT_SECONDS",
     ):
         assert variable in env
+
+
+def test_separate_person_and_helmet_models_are_combined(worker_mod):
+    class Tensor:
+        def __init__(self, value): self.value = value
+        def cpu(self): return self
+        def tolist(self): return self.value
+
+    person_result = types.SimpleNamespace(boxes=types.SimpleNamespace(
+        xyxy=Tensor([[0, 0, 100, 200]]), cls=Tensor([0]), conf=Tensor([.97]),
+    ))
+    helmet_result = types.SimpleNamespace(boxes=types.SimpleNamespace(
+        xyxy=Tensor([]), cls=Tensor([]), conf=Tensor([]),
+    ))
+
+    class PersonModel:
+        def __init__(self): self.names = {0: "person"}
+        def predict(self, *_args, **_kwargs): return [person_result]
+
+    class HelmetModel:
+        def __init__(self): self.names = {0: "helmet"}
+        def predict(self, *_args, **_kwargs): return [helmet_result]
+
+    runtime = worker_mod.Runtime()
+    runtime.model = PersonModel()
+    runtime.model_name = "people-model"
+    runtime.slot_models["helmet"] = worker_mod.SlotModelRuntime(
+        role="helmet", info={"name": "helmet-model"}, model=HelmetModel(), device="cpu",
+    )
+    posted = []
+
+    async def post(path, data):
+        posted.append((path, data))
+        return {"accepted": []}
+
+    runtime.post = post
+    session = worker_mod.CameraSession(config=worker_mod.CameraConfig.from_api(_camera()))
+    visual = asyncio.run(runtime._infer(session, _FakeImage()))
+
+    assert visual is not None and {box.model_name for box in visual.boxes} == {"people-model"}
+    assert visual.helmet_violations
+    assert posted and posted[0][1]["detections"][0]["model_name"] == "people-model"
+    assert posted[0][1]["detections"][0]["event_type"] == "no_helmet"
+
+
+def test_pipeline_slot_loads_independently_of_primary(worker_mod):
+    runtime = worker_mod.Runtime()
+    loaded = object()
+
+    async def fake_load(info):
+        return str(info["name"]), loaded, "cpu"
+
+    runtime._load_model_async = fake_load
+
+    async def scenario():
+        await runtime._refresh_slots([{"role": "helmet", "name": "helmet-model", "artifact_uri": "file:///models/helmet.onnx"}])
+        await asyncio.sleep(0)
+        await runtime._refresh_slots([{"role": "helmet", "name": "helmet-model", "artifact_uri": "file:///models/helmet.onnx"}])
+
+    asyncio.run(scenario())
+    assert runtime.slot_models["helmet"].model is loaded
+    assert runtime._ready_models() == [("helmet-model", loaded, "cpu")]
+
+
+def test_camera_test_uses_lower_test_confidence(worker_mod):
+    class Tensor:
+        def __init__(self, value): self.value = value
+        def cpu(self): return self
+        def tolist(self): return self.value
+
+    result = types.SimpleNamespace(boxes=types.SimpleNamespace(
+        xyxy=Tensor([[1, 1, 18, 19]]), cls=Tensor([0]), conf=Tensor([.2]),
+    ))
+    seen = []
+
+    class PersonModel:
+        def __init__(self): self.names = {0: "person"}
+        def predict(self, *_args, **kwargs):
+            seen.append(kwargs["conf"])
+            return [result]
+
+    runtime = worker_mod.Runtime()
+    runtime.model = PersonModel()
+    runtime.model_name = "person-test-model"
+    runtime.model_test_mode = True
+    runtime.model_test_conf = .10
+    session = worker_mod.CameraSession(config=worker_mod.CameraConfig.from_api(_camera()))
+    visual = asyncio.run(runtime._infer(session, _FakeImage()))
+
+    assert visual is not None and visual.boxes
+    assert seen == [.10]

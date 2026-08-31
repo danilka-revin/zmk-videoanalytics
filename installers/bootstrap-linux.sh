@@ -16,9 +16,39 @@
 set -Eeuo pipefail
 
 ZMK_REPO="${ZMK_REPO:-danilka-revin/zmk-videoanalytics}"
-ZMK_REF="${ZMK_REF:-main}"
 ZMK_INSTALL_DIR="${ZMK_INSTALL_DIR:-$HOME/zmk-vision}"
 ZMK_GIT_URL="https://github.com/${ZMK_REPO}.git"
+ZMK_BIN_DIR="${HOME}/.local/bin"
+
+# Resolve the update ref:
+#   1) an explicit launcher/env override wins;
+#   2) a legacy launcher that pins ZMK_REF=main but currently sits on a work
+#      branch is migrated to that branch once (so the previous one-command
+#      launcher does not silently revert to the release channel);
+#   3) otherwise the pinned ref recorded in .zmk-ref (set by a previous run);
+#   4) otherwise the public release channel (main).
+# The launcher stores ZMK_REF=auto so a one-command `zmk-vision` keeps tracking
+# the current work branch until it disappears after the PR is merged, and then
+# automatically falls back to main.
+CURRENT_BRANCH=""
+if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
+  CURRENT_BRANCH="$(git -C "$ZMK_INSTALL_DIR" branch --show-current 2>/dev/null | tr -d '[:space:]' || true)"
+fi
+LEGACY_LAUNCHER="$ZMK_BIN_DIR/zmk-vision"
+if [[ "$ZMK_REF" == "main" && -x "$LEGACY_LAUNCHER" && "$CURRENT_BRANCH" != "main" && -n "$CURRENT_BRANCH" ]]; then
+  if grep -qE 'exec env ZMK_REF=main ' "$LEGACY_LAUNCHER" 2>/dev/null; then
+    info "Migrating legacy launcher to the current work branch: ${CURRENT_BRANCH}"
+    ZMK_REF="$CURRENT_BRANCH"
+  fi
+fi
+ZMK_REF="${ZMK_REF:-}"
+if [[ "$ZMK_REF" == "auto" || -z "$ZMK_REF" ]]; then
+  if [[ -f "$ZMK_INSTALL_DIR/.zmk-ref" ]]; then
+    ZMK_REF="$(tr -d '[:space:]' < "$ZMK_INSTALL_DIR/.zmk-ref")"
+  else
+    ZMK_REF="main"
+  fi
+fi
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }
 info(){ echo "[zmk-bootstrap] $*"; }
@@ -50,9 +80,24 @@ if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
   [[ "$current_origin" == "$ZMK_GIT_URL" ]] || fail "The target has another git origin: ${current_origin}"
   changes=$(git -C "$ZMK_INSTALL_DIR" status --porcelain --untracked-files=no)
   [[ -z "$changes" ]] || fail "Tracked local changes found. They were not overwritten; commit or stash them first."
+
+  # A pinned feature branch that no longer exists on the remote has normally
+  # been merged and deleted. Fall back to the public release channel so the
+  # one-command launcher keeps working without manual maintenance.
+  if [[ "$ZMK_REF" != "main" ]]; then
+    if ! git ls-remote --heads "$ZMK_GIT_URL" "$ZMK_REF" >/dev/null 2>&1; then
+      info "Pinned ref ${ZMK_REF} is gone (probably merged); switching to main."
+      ZMK_REF="main"
+    fi
+  fi
+
   info "Downloading ${ZMK_REF} from GitHub..."
+  # An explicit `git fetch origin <branch>` records the commit in FETCH_HEAD
+  # but does not necessarily create origin/<branch> in shallow checkouts.
+  # Checking out FETCH_HEAD works for main as well as slash-containing feature
+  # branches (e.g. arena/...) and keeps the one-command launcher repeatable.
   git -C "$ZMK_INSTALL_DIR" fetch --depth=1 origin "$ZMK_REF"
-  git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" "origin/$ZMK_REF"
+  git -C "$ZMK_INSTALL_DIR" checkout -B "$ZMK_REF" FETCH_HEAD
 else
   [[ ! -e "$ZMK_INSTALL_DIR" ]] || fail "Target exists but is not a git checkout: $ZMK_INSTALL_DIR"
   info "Downloading a fresh copy of ${ZMK_REF} from GitHub..."
@@ -62,11 +107,15 @@ fi
 cd "$ZMK_INSTALL_DIR"
 chmod +x start.sh install.sh installers/*.sh 2>/dev/null || true
 
+# Remember the branch the launcher should keep tracking.
+printf '%s\n' "$ZMK_REF" > "$ZMK_INSTALL_DIR/.zmk-ref"
+
 # Install a short repeatable command. It updates the same Git ref and starts
 # the stack, so the operator no longer has to remember a long curl command.
+# ZMK_REF=auto lets .zmk-ref drive updates and fall back to main after merge.
 ZMK_BIN_DIR="${HOME}/.local/bin"
 mkdir -p "$ZMK_BIN_DIR"
-printf '#!/usr/bin/env bash\nexec env ZMK_REF=%q ZMK_INSTALL_DIR=%q bash %q "$@"\n' "$ZMK_REF" "$ZMK_INSTALL_DIR" "$ZMK_INSTALL_DIR/installers/bootstrap-linux.sh" > "$ZMK_BIN_DIR/zmk-vision"
+printf '#!/usr/bin/env bash\nexec env ZMK_REF=auto ZMK_INSTALL_DIR=%q bash %q "$@"\n' "$ZMK_INSTALL_DIR" "$ZMK_INSTALL_DIR/installers/bootstrap-linux.sh" > "$ZMK_BIN_DIR/zmk-vision"
 chmod +x "$ZMK_BIN_DIR/zmk-vision"
 
 # A clean install uses the same host ports as older ZMK stacks. Stop only
@@ -102,7 +151,10 @@ if [[ "$needs_setup" == true ]]; then
   fi
   [[ "$ZMK_RTSP_URL" =~ ^rtsps?://[^[:space:]]+$ ]] || fail "A non-empty rtsp:// or rtsps:// URL is required"
   info "Installing Docker if necessary, configuring the camera and starting ZMK Vision..."
+  # bootstrap already fetched the requested Git ref. Do not let the release
+  # updater immediately replace a feature branch with the latest main release.
   exec env \
+    ZMK_NO_AUTO_UPDATE=1 \
     NONINTERACTIVE=1 \
     MESSENGER_PROVIDER=none \
     ENABLE_INFERENCE=true \
@@ -114,4 +166,6 @@ if [[ "$needs_setup" == true ]]; then
 fi
 
 info "Configuration already exists. Updating source and starting ZMK Vision..."
-exec bash start.sh
+# The Git ref above is authoritative for this launcher run (including custom
+# arena/feature refs), so skip the release-only updater in start.sh.
+exec env ZMK_NO_AUTO_UPDATE=1 bash start.sh

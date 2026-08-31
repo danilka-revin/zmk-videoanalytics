@@ -29,8 +29,15 @@ run_privileged(){
 }
 
 # --- auto-update (optional) ---
-if [[ "${1:-}" != "--no-update" && -f installers/auto-update.sh ]]; then
-  bash installers/auto-update.sh start.sh || echo "[start] auto-update check skipped."
+# Release updater is intentionally skipped on feature branches. Otherwise a
+# one-command launch re-checkouts main and silently removes the current
+# go2rtc/WebRTC build. main is the only channel auto-update may rewrite.
+if [[ "${1:-}" != "--no-update" && -z "${ZMK_NO_AUTO_UPDATE:-}" && -f installers/auto-update.sh ]]; then
+  if [[ -d .git ]] && git branch --show-current 2>/dev/null | grep -qvE '^(main|master)$'; then
+    echo "[start] Feature branch active; release auto-update is skipped to preserve this build."
+  else
+    bash installers/auto-update.sh start.sh || echo "[start] auto-update check skipped."
+  fi
 fi
 
 # required project files
@@ -72,31 +79,101 @@ PROFILE=()
 if [[ -f .zmk-profiles ]]; then mapfile -t PROFILE < .zmk-profiles; fi
 
 DC=(docker compose)
+DOCKER=(docker)
 if ! docker info >/dev/null 2>&1; then
   run_privileged systemctl start docker 2>/dev/null || true
   if ! docker info >/dev/null 2>&1; then
-    if [[ "${EUID}" -eq 0 ]]; then DC=(docker compose); else DC=(sudo docker compose); fi
+    if [[ "${EUID}" -eq 0 ]]; then DC=(docker compose); else DC=(sudo docker compose); DOCKER=(sudo docker); fi
   fi
 fi
 "${DC[@]}" version >/dev/null 2>&1 || fail "Docker Compose plugin is unavailable."
 
 if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -qi nvidia; then
   export COMPOSE_FILE="docker-compose.yml:docker-compose.gpu.yml"
+  COMPUTE_MODE="GPU / NVIDIA"
   echo "NVIDIA Container Runtime найден: GPU включён"
 else
+  COMPUTE_MODE="CPU FALLBACK"
   echo "NVIDIA runtime не найден: workers используют CPU fallback"
 fi
 
 wait_http(){ local url="$1" s="${2:-120}" i; for ((i=0;i<s/2;i++)); do curl -fsS --max-time 3 "$url" >/dev/null 2>&1 && return 0; sleep 2; done; return 1; }
 
-echo "[start] Запускаю сервисы ZMK Vision..."
+repair_build_cache(){
+  # BuildKit's occasional "parent snapshot ... does not exist" is cache
+  # corruption, not a project/data error. Remove only disposable build cache;
+  # never touch named volumes, data, models or bot tokens.
+  echo "[start] Docker BuildKit не собрал образы. Очищаю только кэш сборки и повторяю один раз..."
+  "${DOCKER[@]}" builder prune -af >/dev/null 2>&1 || true
+  "${DOCKER[@]}" buildx prune -af >/dev/null 2>&1 || true
+  run_privileged systemctl restart docker 2>/dev/null || true
+}
+
+start_stack(){
+  if "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
+    return 0
+  fi
+  repair_build_cache
+  # Serial service builds avoid a second concurrent snapshot/export race.
+  COMPOSE_PARALLEL_LIMIT=1 "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans
+}
+
+print_zmk_logo(){
+  printf '%s\n' \
+    ' ███████╗███╗   ███╗██╗  ██╗    ██╗   ██╗██╗███████╗██╗ ██████╗ ███╗   ██╗' \
+    ' ╚══███╔╝████╗ ████║██║ ██╔╝    ██║   ██║██║██╔════╝██║██╔═══██╗████╗  ██║' \
+    '   ███╔╝ ██╔████╔██║█████╔╝     ██║   ██║██║███████╗██║██║   ██║██╔██╗ ██║' \
+    '  ███╔╝  ██║╚██╔╝██║██╔═██╗     ╚██╗ ██╔╝██║╚════██║██║██║   ██║██║╚██╗██║' \
+    ' ███████╗██║ ╚═╝ ██║██║  ██╗     ╚████╔╝ ██║███████║██║╚██████╔╝██║ ╚████║' \
+    ' ╚══════╝╚═╝     ╚═╝╚═╝  ╚═╝      ╚═══╝  ╚═╝╚══════╝╚═╝ ╚═════╝ ╚═╝  ╚═══╝'
+}
+
+print_launch_summary(){
+  local version ref revision profile compose_display launch_command
+  version=$(tr -d '[:space:]' < VERSION 2>/dev/null || printf 'DEV')
+  if command -v git >/dev/null 2>&1 && [[ -d .git ]]; then
+    ref=$(git branch --show-current 2>/dev/null || printf 'DETACHED')
+    revision=$(git rev-parse --short HEAD 2>/dev/null || printf 'UNKNOWN')
+  else
+    ref="RELEASE ARCHIVE"; revision="N/A"
+  fi
+  profile="${PROFILE[*]:-DEFAULT SERVICES}"
+  compose_display=$(printf '%q ' "${DC[@]}" "${PROFILE[@]}")
+  launch_command="${HOME}/.local/bin/zmk-vision"
+  [[ -x "$launch_command" ]] || launch_command="./start.sh (launcher is created by bootstrap)"
+  printf '\n%s\n' '================================================================'
+  print_zmk_logo
+  printf '%s\n' '                           ZMK VISION'
+  printf '%s\n' '                 VIDEO ANALYTICS CONTROL PLATFORM'
+  printf '%s\n' '================================================================'
+  printf ' STATUS              : RUNNING\n'
+  printf ' VERSION             : %s\n' "$version"
+  printf ' SOURCE BRANCH       : %s (%s)\n' "$ref" "$revision"
+  printf ' PROJECT DIRECTORY   : %s\n' "$ROOT"
+  printf ' COMPUTE MODE        : %s\n' "$COMPUTE_MODE"
+  printf ' COMPOSE PROFILES    : %s\n' "$profile"
+  printf '%s\n' '----------------------------------------------------------------'
+  printf ' WEB PANEL           : http://localhost:5173\n'
+  printf ' TELEGRAM MINI APP   : http://localhost:5173/telegram\n'
+  printf ' API DOCUMENTATION   : http://localhost:8000/docs\n'
+  printf ' API HEALTH CHECK    : http://localhost:8000/api/health\n'
+  printf ' WEBRTC UPSTREAM     : GO2RTC_ENABLED=%s GO2RTC_UPSTREAM=%s\n' "${GO2RTC_ENABLED:-true}" "${GO2RTC_UPSTREAM:-http://host.docker.internal:1984}"
+  printf '%s\n' '----------------------------------------------------------------'
+  printf ' UPDATE / START      : %s\n' "$launch_command"
+  printf ' PROJECT START       : ./start.sh\n'
+  printf ' LIVE LOGS           : %slogs -f\n' "$compose_display"
+  printf ' AI WORKER LOGS      : %slogs -f inference-worker\n' "$compose_display"
+  printf ' STOP SERVICES       : %sdown\n' "$compose_display"
+  printf '%s\n' '----------------------------------------------------------------'
+  printf '%s\n' ' SERVICE STATUS'
+  "${DC[@]}" "${PROFILE[@]}" ps 2>/dev/null || true
+  printf '%s\n\n' '================================================================'
+}
+
+echo "[start] Обновляю образы и запускаю сервисы ZMK Vision..."
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml или .env не прошли валидацию"
-"${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans || "${DC[@]}" "${PROFILE[@]}" logs --tail=100
+start_stack || { "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose startup failed after BuildKit cache recovery"; }
 if ! wait_http http://localhost:8000/api/health 120; then "${DC[@]}" logs --tail=100 api; fail "API health check failed"; fi
 if ! wait_http http://localhost:5173 120; then "${DC[@]}" logs --tail=100 web; fail "Web health check failed"; fi
 
-echo ""
-echo "ZMK Vision запущено."
-echo "Панель:  http://localhost:5173"
-echo "API:     http://localhost:8000/docs"
-echo "Повторный запуск: ./start.sh"
+print_launch_summary

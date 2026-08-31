@@ -1,8 +1,10 @@
 # Telegram Bot + Mini App
 
 1. Создайте бота через `@BotFather`, получите token.
-2. Узнайте Telegram ID через `@userinfobot`.
-3. В `.env` задайте `TELEGRAM_BOT_TOKEN`, `TELEGRAM_ADMIN_IDS` и публичный HTTPS `TELEGRAM_WEBAPP_URL`.
-4. Запустите обычный стек: `./start.sh`, затем включите Telegram в **Админ → Боты**.
+2. Убедитесь, что у вашего Telegram-аккаунта задан username, например `@chilavik`.
+3. Запустите обычный стек: `./start.sh`.
+4. В **Админ → Боты** вставьте token, добавьте `@chilavik` в «Администраторы Telegram», укажите публичный HTTPS `Mini App URL` и включите Telegram.
 
-Роли — whitelist: admin, operator, viewer. Бот работает long polling, внешние inbound-порты не нужны. Mini App требует HTTPS URL, доступный Telegram.
+Поле токена write-only: API не возвращает значение, а API-контейнер хранит его в закрытом Docker volume `bot-token-data`, смонтированном в служебные bot-контейнеры только для чтения. Изменение токена перезапускает polling без Docker restart. `TELEGRAM_*_USERNAMES` и числовые `TELEGRAM_*_IDS` в `.env` остаются совместимыми запасными вариантами для headless-развёртываний. Для push-тревог укажите числовой chat ID: Telegram не гарантирует личную доставку только по username.
+
+Роли — whitelist: admin, operator, viewer. Команда `/cameras` выводит кнопки камер, а `/camera <camera_id>` присылает последний реальный JPEG-кадр от inference-worker. Это снимок, а не поддельный или бесконечный видеопоток. Mini App даёт мобильный контур: инфографику и графики по событиям за 24 ч / 7 / 30 дней, очередь решений с массовым принятием/отклонением для operator/admin, камеры с реальным кадром, возрастом снимка, TCP-диагностикой и перезапуском для admin, модели с безопасным тестом/активацией и отчёты/сводку смены. Экспорт событий формирует ZIP с русской CSV-таблицей, HTML-отчётом и доступными кадрами нарушений. Бот работает long polling, внешние inbound-порты не нужны. Mini App требует HTTPS URL, доступный Telegram.

@@ -1,0 +1,175 @@
+"""Local model artifact uploads are streamed, registered and safely cleaned up."""
+from __future__ import annotations
+
+import hashlib
+
+import pytest
+from app import main
+from fastapi.testclient import TestClient
+
+
+@pytest.fixture
+def model_dir(tmp_path, monkeypatch):
+    directory = tmp_path / "shared-models"
+    monkeypatch.setattr(main, "MODEL_DIR", directory)
+    return directory
+
+
+def upload_params(**overrides: object) -> dict[str, object]:
+    values: dict[str, object] = {
+        "name": "local-ppe-v1",
+        "format": "ONNX",
+        "precision": "93.4",
+        "recall": "88.2",
+        "filename": "factory-ppe.onnx",
+    }
+    values.update(overrides)
+    return values
+
+
+def test_uploads_local_model_to_shared_volume_registers_checksum_and_deletes_it(model_dir):
+    artifact = b"pretend-onnx-artifact\x00" * 64
+    with TestClient(main.app) as client:
+        result = client.post(
+            "/api/models/upload",
+            params=upload_params(filename="../../factory-ppe.onnx"),
+            content=artifact,
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert result.status_code == 201, result.text
+        body = result.json()
+        target = model_dir / "local-ppe-v1.onnx"
+        assert body["uploaded"] is True
+        assert body["artifact_uri"] == f"file://{target}"
+        assert body["checksum"] == hashlib.sha256(artifact).hexdigest()
+        assert body["source"] == "upload:factory-ppe.onnx"
+        assert target.read_bytes() == artifact
+
+        listed = client.get("/api/models").json()
+        uploaded = next(item for item in listed if item["name"] == "local-ppe-v1")
+        assert uploaded["artifact_uri"] == f"file://{target}"
+        assert uploaded["checksum"] == hashlib.sha256(artifact).hexdigest()
+
+        deleted = client.delete("/api/models/local-ppe-v1")
+        assert deleted.status_code == 200, deleted.text
+        assert deleted.json()["removed_artifact_file"] is True
+        assert not target.exists()
+
+
+def test_camera_test_can_run_uploaded_model_below_quality_gate(model_dir):
+    with TestClient(main.app) as client:
+        uploaded = client.post(
+            "/api/models/upload",
+            params=upload_params(name="camera-test", precision="40", recall="35"), content=b"onnx-data",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        assert client.post("/api/models/camera-test/activate").status_code == 409
+        tested = client.post("/api/models/camera-test/activate-test")
+        assert tested.status_code == 200, tested.text
+        assert tested.json()["test_mode"] is True
+        model = next(item for item in client.get("/api/models").json() if item["name"] == "camera-test")
+        assert model["active"] is True and model["test_mode"] is True
+        # Validate the selected test mode through the public health endpoint.
+        health = client.get("/api/models/active/health")
+        assert health.status_code == 200 and health.json()["test_mode"] is True
+        stopped = client.post("/api/models/camera-test/deactivate-test")
+        assert stopped.status_code == 200 and stopped.json()["stopped"] is True
+        model = next(item for item in client.get("/api/models").json() if item["name"] == "camera-test")
+        assert model["active"] is False and model["test_mode"] is False
+        assert (model_dir / "camera-test.onnx").is_file()
+
+
+def test_training_does_not_promote_camera_test_model_to_training_baseline(model_dir):
+    with TestClient(main.app) as client:
+        uploaded = client.post(
+            "/api/models/upload",
+            params=upload_params(name="test-only-base", precision="40", recall="35"), content=b"onnx-data",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        assert client.post("/api/models/test-only-base/activate-test").status_code == 200
+        started = client.post("/api/training/jobs", json={
+            "camera_id": "cam_01", "image_count": 20, "epochs": 1, "target_name": "safe-training-base",
+        })
+        assert started.status_code == 202, started.text
+        job = client.get(f"/api/training/jobs/{started.json()['id']}").json()
+        assert job["base_model"] == ""
+
+
+def test_activation_rejects_uploaded_model_when_shared_artifact_disappeared(model_dir):
+    with TestClient(main.app) as client:
+        uploaded = client.post(
+            "/api/models/upload", params=upload_params(name="lost-artifact"), content=b"onnx-data",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        (model_dir / "lost-artifact.onnx").unlink()
+        activated = client.post("/api/models/lost-artifact/activate")
+
+    assert activated.status_code == 409
+    assert "отсутствует" in activated.json()["detail"]
+
+
+def test_rejects_extension_mismatch_without_creating_model_file(model_dir):
+    with TestClient(main.app) as client:
+        result = client.post(
+            "/api/models/upload",
+            params=upload_params(filename="weights.pt", format="ONNX"),
+            content=b"not-an-onnx",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+
+    assert result.status_code == 422
+    assert ".onnx" in result.text
+    assert not model_dir.exists()
+
+
+def test_respects_streaming_size_limit_and_keeps_existing_artifact_safe(model_dir, monkeypatch):
+    model_dir.mkdir(parents=True)
+    existing = model_dir / "local-ppe-v1.onnx"
+    existing.write_bytes(b"existing-artifact")
+    monkeypatch.setattr(main, "MODEL_UPLOAD_MAX_BYTES", 5)
+
+    def chunked_body():
+        # No Content-Length: this exercises the endpoint's in-stream limit,
+        # not just the middleware's early Content-Length guard.
+        yield b"123"
+        yield b"456"
+
+    with TestClient(main.app) as client:
+        too_large = client.post(
+            "/api/models/upload",
+            params=upload_params(name="too-large"),
+            content=chunked_body(),
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        collision = client.post(
+            "/api/models/upload",
+            params=upload_params(),
+            content=b"1234",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+
+    assert too_large.status_code == 413
+    assert collision.status_code == 409
+    assert existing.read_bytes() == b"existing-artifact"
+    assert not list(model_dir.glob("*.upload"))
+
+
+def test_unvalidated_upload_can_start_a_safe_camera_test(model_dir):
+    with TestClient(main.app) as client:
+        uploaded = client.post(
+            "/api/models/upload",
+            params={"name": "person-box-test", "format": "ONNX", "filename": "person-box-test.onnx"},
+            content=b"onnx-data",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        assert uploaded.status_code == 201, uploaded.text
+        model = next(item for item in client.get("/api/models").json() if item["name"] == "person-box-test")
+        assert model["precision"] is None and model["recall"] is None
+        assert client.post("/api/models/person-box-test/activate").status_code == 409
+        tested = client.post("/api/models/person-box-test/activate-test")
+        assert tested.status_code == 200 and tested.json()["test_mode"] is True
+        internal = client.get("/api/internal/active-model", headers={"X-Worker-Token": main.WORKER_TOKEN})
+        assert internal.status_code == 200 and internal.json()["test_conf"] == .10
