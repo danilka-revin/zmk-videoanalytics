@@ -29,9 +29,10 @@ DEVICE_SETTING = os.getenv("INFERENCE_DEVICE", "auto").strip() or "auto"
 CAMERA_DECODER = os.getenv("CAMERA_DECODER", "ffmpeg").strip().lower()
 if CAMERA_DECODER not in {"ffmpeg", "opencv"}:
     CAMERA_DECODER = "ffmpeg"
-# When go2rtc is enabled, the browser receives a WebRTC stream directly from
-# go2rtc (H.264/H.265 over UDP/TCP). The worker therefore does not need to
-# re-encode every frame into a legacy MJPEG live frame just for the panel.
+# go2rtc provides the preferred WebRTC path (H.264/H.265 direct to browser).
+# The worker still publishes a high-FPS MJPEG fallback so the panel remains
+# truly live like VLC even if go2rtc is temporarily unreachable.
+# Set CAMERA_LIVE_FPS=0 to fully disable the MJPEG fallback and reduce CPU.
 GO2RTC_PREVIEW_ENABLED = os.getenv("GO2RTC_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 
 
@@ -1229,7 +1230,10 @@ class Runtime:
             self._log(f"snapshot upload failed for {session.config.camera_id}: {redact_error(exc)}")
 
     async def _publish_live(self, session: CameraSession, image: Any) -> None:
-        if GO2RTC_PREVIEW_ENABLED or LIVE_PREVIEW_FPS <= 0:
+        # VLC-like live preview: always publish MJPEG when LIVE_FPS>0, even
+        # if go2rtc is enabled. This gives a real high-FPS fallback and prevents
+        # the 3-second snapshot slideshow when WebRTC signalling fails.
+        if LIVE_PREVIEW_FPS <= 0:
             return
         now = time.monotonic()
         rate = min(session.config.fps_limit, LIVE_PREVIEW_FPS)
