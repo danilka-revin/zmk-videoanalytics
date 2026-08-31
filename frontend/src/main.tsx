@@ -155,17 +155,17 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
                     mediaSource.addEventListener('sourceopen',()=>{
                       if(!mediaSource||mediaSource.readyState!=='open')return;
                       try{
-                        sourceBuffer=mediaSource.addSourceBuffer('video/mp4; codecs="avc1.640029"');
+                        sourceBuffer=mediaSource.addSourceBuffer("video/mp4; codecs=\"avc1.640029\"");
                         mseRef.current.buffer=sourceBuffer;
                         sourceBuffer.addEventListener('updateend',()=>{
                           if(queue.length&&sourceBuffer&&!sourceBuffer.updating){
-                            try{sourceBuffer.appendBuffer(queue.shift()!)}catch{}
+                            try{sourceBuffer.appendBuffer(queue.shift()! as unknown as BufferSource)}catch{}
                           }
                         });
                         // Append init segment
                         const init=Uint8Array.from(atob(msg.value),c=>c.charCodeAt(0));
                         if(sourceBuffer.updating)queue.push(init);
-                        else try{sourceBuffer.appendBuffer(init)}catch{queue.push(init)}
+                        else try{sourceBuffer.appendBuffer(init as unknown as BufferSource)}catch{queue.push(init)}
                         setLive(true);setStreamFailed(false);setTransport('mse');
                         if(videoRef.current)void videoRef.current.play().catch(()=>{});
                       }catch{
@@ -177,7 +177,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
                 }else if(sourceBuffer){
                   const seg=Uint8Array.from(atob(msg.value),c=>c.charCodeAt(0));
                   if(sourceBuffer.updating)queue.push(seg);
-                  else try{sourceBuffer.appendBuffer(seg)}catch{queue.push(seg)}
+                  else try{sourceBuffer.appendBuffer(seg as unknown as BufferSource)}catch{queue.push(seg)}
                 }
               }
             }catch{}
@@ -185,7 +185,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
             const seg=new Uint8Array(event.data);
             if(sourceBuffer){
               if(sourceBuffer.updating)queue.push(seg);
-              else try{sourceBuffer.appendBuffer(seg)}catch{queue.push(seg)}
+              else try{sourceBuffer.appendBuffer(seg as unknown as BufferSource)}catch{queue.push(seg)}
             }
           }
         };
@@ -377,7 +377,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
  if(transport==='mse')return <div className="camera-feed-wrap" ref={containerRef}><video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline aria-label={`MSE поток камеры ${id}`}/>{renderOverlay()}<em className="frame-age">{live?'● MSE H264 LOW-LATENCY (go2rtc)':'● MSE подключение'}</em></div>;
  if(transport==='hls')return <div className="camera-feed-wrap" ref={containerRef}><video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline controls={false} aria-label={`HLS поток камеры ${id}`}/>{renderOverlay()}<em className="frame-age">{live?'● HLS H264 FULL QUALITY':'● HLS подключение'}</em></div>;
  if(transport==='go2rtc-mjpeg')return <div className="camera-feed-wrap" ref={containerRef}><img className="camera-snapshot" src={src} alt={`Прямой эфир go2rtc ${id}`} onLoad={()=>{setLive(true);setStreamFailed(false);}} onError={()=>{setLive(false);setStreamFailed(true);void (async()=>{try{beginMjpegRef.current();}catch{}})();}} />{renderOverlay()}<em className="frame-age">{live?'● GO2RTC MJPEG (Go fast)':'● GO2RTC подключение'}</em></div>;
- if(!src)return <div className="feed-empty">{telemetryStale?<><WifiOff size={20}/><span>Нет телеметрии</span><small>worker давно не подтверждал поток (go2rtc->inference RTSP single conn)</small></>:status==='connecting'?<><RefreshCw className="spin" size={20}/><span>Подключение к потоку</span><small>{lastError||'go2rtc открывает RTSP (single conn) → inference → WebRTC'}</small></>:status==='offline'||status==='error'||status==='unknown'?<><WifiOff size={20}/><span>Поток не подключён</span><small>{lastError|| (status==='unknown'?'нет данных о статусе':'RTSP недоступен, проверь go2rtc logs')}</small></>:<><Camera size={20}/><span>Кадр не получен</span><small>{lastError||'Нет свежего снимка от inference worker (проверь go2rtc->inference RTSP)'}</small></>}</div>;
+ if(!src)return <div className="feed-empty">{telemetryStale?<><WifiOff size={20}/><span>Нет телеметрии</span><small>worker давно не подтверждал поток (go2rtc → inference RTSP single conn)</small></>:status==='connecting'?<><RefreshCw className="spin" size={20}/><span>Подключение к потоку</span><small>{lastError||'go2rtc открывает RTSP (single conn) → inference → WebRTC'}</small></>:status==='offline'||status==='error'||status==='unknown'?<><WifiOff size={20}/><span>Поток не подключён</span><small>{lastError|| (status==='unknown'?'нет данных о статусе':'RTSP недоступен, проверь go2rtc logs')}</small></>:<><Camera size={20}/><span>Кадр не получен</span><small>{lastError||'Нет свежего снимка от inference worker (проверь go2rtc → inference RTSP)'}</small></>}</div>;
  return <div className="camera-feed-wrap" ref={containerRef}><img className="camera-snapshot" src={src} alt={live?'Прямой эфир камеры':'Последний кадр камеры'}/>{renderOverlay()}<em className="frame-age">{live?'● LIVE MJPEG FALLBACK':(streamFailed?`snapshot fallback retry ${reconnectCount}`:ageText||'кадр')}</em></div>;
 }
 function Cameras({cams,changed,searchIntent,clearSearchIntent}:{cams:Cam[],changed:()=>Promise<void>,searchIntent?:SearchItem|null,clearSearchIntent?:()=>void}){
