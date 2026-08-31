@@ -1,10 +1,10 @@
-# ZMK Vision go2rtc baseline — VLC-like real-time streaming.
+# ZMK Vision go2rtc baseline — VLC-like real-time streaming (true 25-60 FPS).
 #
 # go2rtc is exposed on the host network so WebRTC can advertise a real LAN/IPv4
 # candidate to the browser. The Web panel proxies HTTP API and WebSocket
 # signaling through nginx under /rtc/ to keep the browser same-origin.
 # This config is tuned for low latency like VLC: TCP transport, minimal
-# jitter, direct H264/H265 passthrough without transcoding.
+# jitter, direct H264/H265 passthrough without transcoding (no MJPEG re-encode).
 log:
   format: text
   level: info
@@ -16,19 +16,14 @@ api:
 
 rtsp:
   listen: ":8554"
-  # Low-latency defaults: use TCP, small delays, like VLC's live555
-  default_query: ""
+  default_query: "mp4"
 
 webrtc:
   listen: ":8555"
-  # VLC-like: advertise host candidates, allow UDP+TCP, use public STUN
   candidates:
     - stun:8555
-  filters:
-    loopback: true
-    networks: [udp4, tcp4]
   ice_servers:
-    - urls: [stun:stun.google.com:3478, stun:stun.l.google.com:19302, stun:stun1.l.google.com:19302]
+    - urls: [stun:stun.l.google.com:19302, stun:stun1.l.google.com:19302, stun:stun2.l.google.com:19302]
 
 # Camera RTSP sources are managed by the ZMK API through
 # PUT /rtc/api/streams?name=zmk-<camera_id>&src=rtsp://...#transport=tcp
