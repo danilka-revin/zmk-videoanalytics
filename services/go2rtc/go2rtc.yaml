@@ -1,10 +1,18 @@
-# ZMK Vision go2rtc baseline — VLC-like real-time streaming (true 25-60 FPS).
+# ZMK Vision go2rtc v2.14.0 — SINGLE CONNECTION ARCHITECTURE
 #
-# go2rtc is exposed on the host network so WebRTC can advertise a real LAN/IPv4
-# candidate to the browser. The Web panel proxies HTTP API and WebSocket
-# signaling through nginx under /rtc/ to keep the browser same-origin.
-# This config is tuned for low latency like VLC: TCP transport, minimal
-# jitter, direct H264/H265 passthrough without transcoding (no MJPEG re-encode).
+# NEW: go2rtc is the ONLY RTSP client to camera.
+# - API creates streams zmk-{id} and {id} via PUT /rtc/api/streams
+# - go2rtc pulls from camera via RTSP TCP (single connection, true FPS like VLC)
+# - Inference worker pulls from go2rtc RTSP rtsp://host.docker.internal:8554/zmk-{id} (local, high FPS)
+# - Frontend pulls from go2rtc via WebRTC H264 direct (25-60 FPS, no re-encode) or MSE/HLS/MJPEG fallback
+#
+# This eliminates double RTSP connections that caused 4 FPS and constant reconnects.
+# Camera sees only 1 connection (go2rtc), go2rtc fans out to inference + browsers.
+#
+# go2rtc is host network so WebRTC can advertise real LAN/IPv4 candidate.
+# Web panel proxies HTTP API and WebSocket signaling through nginx under /rtc/ same-origin.
+# Config tuned for low latency like VLC: TCP transport, minimal jitter, direct H264 passthrough.
+
 log:
   format: text
   level: info
@@ -16,17 +24,21 @@ api:
 
 rtsp:
   listen: ":8554"
+  # Low-latency defaults like VLC: mp4 enables MSE/HLS direct H264 passthrough
+  # Inference worker connects via rtsp://host.docker.internal:8554/zmk-{id}
   default_query: "mp4"
 
 webrtc:
   listen: ":8555"
+  # Advertise public IP via STUN on 8555 + local LAN host candidates (host network mode)
+  # Browser connects peer-to-peer to go2rtc's host candidate on 8555 TCP/UDP
+  # If UDP blocked by firewall, falls back to TCP or HLS/MSE (HTTP)
   candidates:
     - stun:8555
   ice_servers:
-    - urls: [stun:stun.l.google.com:19302, stun:stun1.l.google.com:19302, stun:stun2.l.google.com:19302]
+    - urls: [stun:stun.l.google.com:19302, stun:stun1.l.google.com:19302, stun:stun2.l.google.com:19302, stun:stun3.l.google.com:19302, stun:stun.cloudflare.com:3478]
 
-# Camera RTSP sources are managed by the ZMK API through
-# PUT /rtc/api/streams?name=zmk-<camera_id>&src=rtsp://...#transport=tcp
-# API also creates legacy plain <camera_id> alias so frontend requesting
-# either name always finds a stream and shows real-time video, not slideshow.
+# Camera RTSP sources managed by ZMK API via PUT /rtc/api/streams?name=zmk-{id}&src=rtsp://...#transport=tcp
+# API creates both zmk-{id} (primary, used by inference + frontend) and {id} (legacy compat)
+# go2rtc keeps single RTSP connection to camera and fans out to all consumers
 streams: {}

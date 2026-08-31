@@ -39,6 +39,7 @@ services:
       # go2rtc exposes its HTTP API on the host network; host.docker.internal
       # is resolved through the reserved host-gateway added below.
       GO2RTC_API_URL: ${GO2RTC_API_URL:-http://host.docker.internal:1984/rtc}
+      GO2RTC_RTSP_URL: ${GO2RTC_RTSP_URL:-rtsp://host.docker.internal:8554}
       GO2RTC_ENABLED: ${GO2RTC_ENABLED:-true}
       GO2RTC_RTSP_TRANSPORT: ${GO2RTC_RTSP_TRANSPORT:-tcp}
       # Training worker is part of the default stack and remains available in
@@ -150,15 +151,19 @@ services:
     build: ./services/inference_worker
     profiles:
     - inference
+    extra_hosts:
+    - host.docker.internal:host-gateway
     environment:
       ZMK_API_URL: http://api:8000
       ZMK_API_KEY: ${ZMK_API_KEY:-}
       ZMK_WORKER_TOKEN: ${ZMK_WORKER_TOKEN:-}
       # Keep this in sync with API so a custom shared-token path works too.
       ZMK_WORKER_TOKEN_FILE: ${ZMK_WORKER_TOKEN_FILE:-/models/.worker-token}
-      # WebRTC preview is served by go2rtc; when enabled the worker skips the
-      # expensive MJPEG frame re-encode/upload and keeps snapshots + telemetry.
+      # go2rtc is the ONLY RTSP client to camera; inference pulls from go2rtc RTSP
+      # This gives true 25-60 FPS like VLC and single connection to camera.
       GO2RTC_ENABLED: ${GO2RTC_ENABLED:-true}
+      GO2RTC_API_URL: ${GO2RTC_API_URL:-http://host.docker.internal:1984/rtc}
+      GO2RTC_RTSP_URL: ${GO2RTC_RTSP_URL:-rtsp://host.docker.internal:8554}
       INFERENCE_DEVICE: ${INFERENCE_DEVICE:-auto}
       INFERENCE_CONF: ${INFERENCE_CONF:-0.5}
       MODEL_TEST_CONF: ${MODEL_TEST_CONF:-0.10}

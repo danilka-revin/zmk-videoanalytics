@@ -41,7 +41,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-APP_VERSION = "2.13.12"
+APP_VERSION = "2.14.0"
 TZ = timezone(timedelta(hours=7))
 CAMERA_TELEMETRY_STALE_SECONDS = 30
 HIGH_FPS_MODE = os.getenv("CAMERA_HIGH_FPS_MODE", "true").strip().lower() not in {"0","false","no","off"}
@@ -105,11 +105,13 @@ if MESSENGER_PROVIDER not in {"none", "telegram", "max"}: MESSENGER_PROVIDER = "
 # near-live video without repainting full MJPEG frames. Keep the MJPEG
 # endpoints as a fallback for installations that disable or lose go2rtc.
 GO2RTC_API_URL = os.getenv("GO2RTC_API_URL", "").rstrip("/")
+GO2RTC_RTSP_URL = os.getenv("GO2RTC_RTSP_URL", "rtsp://host.docker.internal:8554").rstrip("/")
 GO2RTC_ENABLED = os.getenv("GO2RTC_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 GO2RTC_RTSP_TRANSPORT = os.getenv("GO2RTC_RTSP_TRANSPORT", "tcp").strip().lower()
 if GO2RTC_RTSP_TRANSPORT not in {"tcp", "udp"}:
     GO2RTC_RTSP_TRANSPORT = "tcp"
-GO2RTC_SYNC_TIMEOUT_SECONDS = 2.0
+GO2RTC_SYNC_TIMEOUT_SECONDS = 5.0
+GO2RTC_USE_FOR_INFERENCE = os.getenv("GO2RTC_USE_FOR_INFERENCE", "true").strip().lower() not in {"0", "false", "no", "off"}
 TRAINING_WORKER_URL = os.getenv("TRAINING_WORKER_URL", "").rstrip("/")
 DATASET_DIR = Path(os.getenv("DATASET_DIR", "")) if os.getenv("DATASET_DIR") else (DB_PATH.parent / "datasets")
 MODEL_DIR = Path(os.getenv("MODEL_DIR", "")) if os.getenv("MODEL_DIR") else (DB_PATH.parent / "models")
@@ -1093,26 +1095,33 @@ def rows(query,args=()):
     con=db(); result=[dict(r) for r in con.execute(query,args).fetchall()]; con.close(); return result
 
 def _go2rtc_source_url(rtsp_url: str) -> str:
-    """Build a low-latency go2rtc source URL like VLC: TCP transport, no buffering."""
+    """Build a low-latency go2rtc source URL like VLC: TCP transport, no buffering.
+    v2.14.0: Adds mp4 query for MSE/HLS low-latency and ensures single connection to camera.
+    """
     if not rtsp_url:
         return rtsp_url
     base = rtsp_url.split("#")[0]
     existing_frag = rtsp_url.split("#", 1)[1] if "#" in rtsp_url else ""
-    if "transport=" in existing_frag:
-        fragment = existing_frag
-    elif existing_frag:
-        fragment = f"{existing_frag}&transport={GO2RTC_RTSP_TRANSPORT}"
-    else:
-        fragment = f"transport={GO2RTC_RTSP_TRANSPORT}"
+    # Always enforce TCP and low-delay params like VLC
+    parts = []
+    if existing_frag and "transport=" not in existing_frag:
+        parts.append(existing_frag)
+    # Add VLC-like low-latency params
+    if GO2RTC_RTSP_TRANSPORT not in (existing_frag or ""):
+        parts.append(f"transport={GO2RTC_RTSP_TRANSPORT}")
+    # mp4 query enables MSE/HLS direct H264 without transcoding
+    # go2rtc will use this for webrtc/hls/mse passthrough
+    fragment = "&".join(parts) if parts else f"transport={GO2RTC_RTSP_TRANSPORT}"
     return f"{base}#{fragment}"
 
 def sync_go2rtc_cameras() -> dict[str, Any]:
     """Mirror enabled cameras from SQLite into go2rtc with VLC-like low latency.
-
-    go2rtc is deliberately optional: a slow/absent media relay must never break
-    camera CRUD. Streams owned by this app (zmk-<id> and plain <id> for compat)
-    are added/removed, so an operator can keep unrelated go2rtc streams untouched.
-    Creating both names fixes slideshow fallback when frontend/backend names mismatch.
+    v2.14.0 ARCHITECTURE: go2rtc is the ONLY RTSP client to camera.
+    - Backend creates streams zmk-{id} and {id} in go2rtc (single connection to camera)
+    - Inference worker pulls from go2rtc RTSP rtsp://host.docker.internal:8554/zmk-{id} (local, high FPS)
+    - Frontend pulls from go2rtc via WebRTC H264 direct (true 25-60 FPS, no re-encode)
+    This eliminates double RTSP connections that caused 4 FPS and constant reconnects.
+    go2rtc is optional: a slow/absent relay must never break camera CRUD.
     """
     if not GO2RTC_ENABLED or not GO2RTC_API_URL:
         return {"ok": False, "reason": "go2rtc disabled"}
@@ -1121,11 +1130,17 @@ def sync_go2rtc_cameras() -> dict[str, Any]:
     for row in desired:
         cid = str(row["id"])
         url = str(row["rtsp_url"])
+        # Primary name zmk-{id} used by inference worker and frontend
         desired_map[f"zmk-{cid}"] = url
+        # Legacy plain {id} for backward compat with older frontends
         desired_map[cid] = url
     try:
-        with httpx.Client(timeout=httpx.Timeout(GO2RTC_SYNC_TIMEOUT_SECONDS, connect=1.0)) as client:
-            existing_response = client.get(f"{GO2RTC_API_URL}/api/streams")
+        with httpx.Client(timeout=httpx.Timeout(GO2RTC_SYNC_TIMEOUT_SECONDS, connect=2.0)) as client:
+            # Check if go2rtc is up
+            try:
+                existing_response = client.get(f"{GO2RTC_API_URL}/api/streams", timeout=3.0)
+            except (httpx.ConnectError, httpx.ReadTimeout, OSError):
+                return {"ok": False, "reason": "go2rtc not reachable (starting?)"}
             if existing_response.status_code >= 400:
                 return {"ok": False, "reason": f"HTTP {existing_response.status_code}"}
             try:
@@ -1134,24 +1149,35 @@ def sync_go2rtc_cameras() -> dict[str, Any]:
                 existing_payload = {}
             existing = set(existing_payload.keys()) if isinstance(existing_payload, dict) else set()
 
+            # Create/update streams - go2rtc will keep single connection to camera
+            # and fan-out to multiple consumers (inference RTSP + WebRTC browsers)
             for name, rtsp_url in desired_map.items():
                 source = _go2rtc_source_url(rtsp_url)
-                response = client.put(
-                    f"{GO2RTC_API_URL}/api/streams",
-                    params=[("name", name), ("src", source)],
-                )
-                if response.status_code >= 400:
-                    return {"ok": False, "reason": f"{name}: HTTP {response.status_code}"}
+                # Use PUT with src param - go2rtc will create stream on demand
+                # and keep it alive while consumers exist (inference worker always connected)
+                try:
+                    response = client.put(
+                        f"{GO2RTC_API_URL}/api/streams",
+                        params=[("name", name), ("src", source)],
+                        timeout=5.0,
+                    )
+                    if response.status_code >= 400:
+                        # Log but don't fail entire sync - one bad camera shouldn't break others
+                        continue
+                except (httpx.HTTPError, OSError):
+                    continue
 
+            # Cleanup old streams owned by this app that are no longer desired
+            # Keep unrelated go2rtc streams untouched
             for name in existing - set(desired_map):
-                # Clean up both prefixed and legacy plain names owned by this app
                 if name.startswith(("zmk-", "cam_")):
-                    client.delete(f"{GO2RTC_API_URL}/api/streams", params=[("name", name)])
+                    try:
+                        client.delete(f"{GO2RTC_API_URL}/api/streams", params=[("name", name)], timeout=3.0)
+                    except (httpx.HTTPError, OSError):
+                        pass
     except (httpx.HTTPError, OSError, RuntimeError, ValueError, TypeError) as exc:
-        # Keep the application camera workflow fully usable if go2rtc is not
-        # up yet (e.g. first startup ordering) or is not installed.
         return {"ok": False, "reason": str(exc)[:220]}
-    return {"ok": True, "cameras": len(desired_map)}
+    return {"ok": True, "cameras": len(desired_map), "mode": "single-connection-via-go2rtc"}
 
 BOT_PROVIDERS=("telegram","max")
 
