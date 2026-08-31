@@ -1106,11 +1106,26 @@ class Runtime:
             return
         self._stop_ffmpeg(session)
         await self._report(session, "connecting", error="", force=session.status != "connecting")
+        # v2.16.2: Try go2rtc RTSP first even in ffmpeg mode to keep single connection to camera
+        rtsp_url_to_use = session.config.rtsp_url
+        is_go2rtc = False
+        if (
+            GO2RTC_PREVIEW_ENABLED
+            and GO2RTC_USE_FOR_INFERENCE
+            and GO2RTC_RTSP_URL
+            and session.go2rtc_failures < GO2RTC_INFERENCE_MAX_FAILURES
+        ):
+            go2rtc_url = _go2rtc_rtsp_url_for(session.config.camera_id)
+            if go2rtc_url:
+                rtsp_url_to_use = go2rtc_url
+                is_go2rtc = True
+        # Store for logging
+        session.using_go2rtc = is_go2rtc
         env = os.environ.copy()
         env.update(
             {
-                "ZMK_RTSP_URL": session.config.rtsp_url,
-                "ZMK_RTSP_TRANSPORT": session.transport,
+                "ZMK_RTSP_URL": rtsp_url_to_use,
+                "ZMK_RTSP_TRANSPORT": "tcp" if is_go2rtc else session.transport,
                 "ZMK_RTSP_MAX_DELAY_US": str(RTSP_MAX_DELAY_US),
             }
         )
@@ -1145,7 +1160,7 @@ class Runtime:
         session.received_first_frame = False
         session.failures = 0
         session.decoder_error = ""
-        self._log(f"camera {session.config.camera_id} FFmpeg decoder started via {session.transport.upper()}", force=True)
+        self._log(f"camera {session.config.camera_id} FFmpeg decoder started via {('GO2RTC '+('TCP' if session.using_go2rtc else session.transport.upper())) if session.using_go2rtc else session.transport.upper()} ({'single conn' if session.using_go2rtc else 'direct'})", force=True)
 
     @staticmethod
     def _decode_jpeg(payload: bytes):
@@ -1159,6 +1174,7 @@ class Runtime:
         if process is None or process.stdout is None:
             return None, "FFmpeg decoder не запущен"
 
+        # v2.16.2: If we were using go2rtc and ffmpeg fails quickly, count as go2rtc failure for fast fallback
         wait_seconds = READ_TIMEOUT_MS / 1000 + 1
         if not session.received_first_frame:
             wait_seconds = max(wait_seconds, KEYFRAME_GRACE_SECONDS)

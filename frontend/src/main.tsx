@@ -504,7 +504,11 @@ function CameraPreview({id,status,age,telemetryStale,lastError}:{id:string;statu
  const label=transport==='mse'?(live?'● MSE H264 25-60 FPS':'● MSE connecting…'):transport==='hls'?(live?'● HLS H264':'● HLS…'):transport==='snapshot'?'● SNAPSHOT':`retry ${retry}`;
 
  if(transport==='mse'||transport==='hls'){
-  return <div className="camera-feed-wrap"><video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline preload="auto" aria-label={`Поток камеры ${id}`} />{renderOverlay()}<em className="frame-age">{label}</em></div>;
+  return <div className="camera-feed-wrap">
+    {snapshotSrc&&!live&&<img className="camera-snapshot" src={snapshotSrc} alt={`Поток ${id}`} style={{position:'absolute',inset:0,width:'100%',height:'100%',objectFit:'cover'}} />}
+    <video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline preload="auto" aria-label={`Поток камеры ${id}`} style={{position:'relative',zIndex:1,background: live?'transparent':'transparent', opacity: live?1:0.01}} />
+    {renderOverlay()}<em className="frame-age" style={{zIndex:2}}>{label}{snapshotSrc&&!live?' · SNAPSHOT fallback':''}</em>
+  </div>;
  }
  if(transport==='snapshot'&&snapshotSrc){
   return <div className="camera-feed-wrap"><img className="camera-snapshot" src={snapshotSrc} alt={`Поток ${id}`} />{renderOverlay()}<em className="frame-age">{live?label:(ageText||label)}</em></div>;
