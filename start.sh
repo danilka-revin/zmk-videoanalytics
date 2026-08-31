@@ -106,7 +106,10 @@ repair_build_cache(){
   echo "[start] Docker BuildKit не собрал образы. Очищаю только кэш сборки и повторяю один раз..."
   "${DOCKER[@]}" builder prune -af >/dev/null 2>&1 || true
   "${DOCKER[@]}" buildx prune -af >/dev/null 2>&1 || true
+  # Also clear Buildx cache that can hold corrupted parent snapshots
+  "${DOCKER[@]}" system prune -f --filter "until=24h" >/dev/null 2>&1 || true
   run_privileged systemctl restart docker 2>/dev/null || true
+  sleep 2
 }
 
 start_stack(){
@@ -115,7 +118,25 @@ start_stack(){
   fi
   repair_build_cache
   # Serial service builds avoid a second concurrent snapshot/export race.
-  COMPOSE_PARALLEL_LIMIT=1 "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans
+  echo "[start] Повторная сборка с лимитом параллелизма..."
+  if COMPOSE_PARALLEL_LIMIT=1 "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
+    return 0
+  fi
+  echo "[start] BuildKit всё ещё падает, пробую без BuildKit и без Bake..."
+  # Fallback 1: disable Bake (the warning about buildx not installed)
+  if COMPOSE_BAKE=false COMPOSE_DOCKER_CLI_BUILD=0 "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
+    return 0
+  fi
+  echo "[start] Пробую сборку без кэша для inference-worker..."
+  # Fallback 2: no-cache for the failing worker images
+  if DOCKER_BUILDKIT=0 COMPOSE_BAKE=false "${DC[@]}" "${PROFILE[@]}" build --no-cache inference-worker training-worker 2>&1 | tail -20; then
+    if DOCKER_BUILDKIT=0 COMPOSE_BAKE=false "${DC[@]}" "${PROFILE[@]}" up -d --remove-orphans; then
+      return 0
+    fi
+  fi
+  echo "[start] Последняя попытка: полная очистка builder и no-cache..."
+  "${DOCKER[@]}" builder prune --all -f >/dev/null 2>&1 || true
+  DOCKER_BUILDKIT=0 COMPOSE_BAKE=false COMPOSE_PARALLEL_LIMIT=1 "${DC[@]}" "${PROFILE[@]}" up -d --build --no-cache --remove-orphans
 }
 
 print_zmk_logo(){
