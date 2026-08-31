@@ -29,6 +29,10 @@ DEVICE_SETTING = os.getenv("INFERENCE_DEVICE", "auto").strip() or "auto"
 CAMERA_DECODER = os.getenv("CAMERA_DECODER", "ffmpeg").strip().lower()
 if CAMERA_DECODER not in {"ffmpeg", "opencv"}:
     CAMERA_DECODER = "ffmpeg"
+# When go2rtc is enabled, the browser receives a WebRTC stream directly from
+# go2rtc (H.264/H.265 over UDP/TCP). The worker therefore does not need to
+# re-encode every frame into a legacy MJPEG live frame just for the panel.
+GO2RTC_PREVIEW_ENABLED = os.getenv("GO2RTC_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -128,14 +132,34 @@ _YOLO_CLASS: Any | None = None
 # "No-Helmet", ...).  Normalising them here makes a genuine person+helmet
 # model usable without forcing its author to name classes exactly like our
 # event API.  COCO `person` alone is never enough to raise a violation.
-_PERSON_LABELS = {"person", "human", "worker", "people"}
-_HELMET_LABELS = {"helmet", "hardhat", "hard_hat", "hat", "safety_helmet"}
+_PERSON_LABELS = {
+    "person", "human", "worker", "people",
+    # Locally trained custom models often keep Cyrillic/Russian class names.
+    "человек", "люди", "работник", "рабочий", "мужик", "человек_в_каске", "человек_в_жилете",
+}
+_HELMET_LABELS = {
+    "helmet", "hardhat", "hard_hat", "hat", "safety_helmet",
+    "каска", "каску", "каске", "каски", "шлем", "шлема", "шлеме", "шлём",
+}
 _NO_HELMET_LABELS = {
     "no_helmet", "nohelmet", "no_hat", "nohat", "no_hardhat", "nohardhat",
     "without_helmet", "withouthelmet", "person_without_helmet", "person_no_helmet",
+    "без_каски", "без_каску", "без_каске", "нет_каски", "нет_каску",
+    "человек_без_каски", "рабочий_без_каски", "работник_без_каски",
+    "без_шлема", "без_шлема_человек", "человек_без_шлема",
+    "bare_head", "barehead", "head", "head_without_helmet", "bare_head_detection",
 }
-_VEST_LABELS = {"vest", "safety_vest", "hi_vis_vest", "hi_vis", "reflective_vest", "workwear", "coveralls", "robe"}
-_NO_VEST_LABELS = {"no_vest", "novest", "without_vest", "withoutvest", "no_workwear", "noworkwear", "no_coveralls", "nocoveralls"}
+_VEST_LABELS = {
+    "vest", "safety_vest", "hi_vis_vest", "hi_vis", "reflective_vest",
+    "workwear", "coveralls", "robe",
+    "жилет", "жилета", "жилеты", "жилетку", "сигнальный_жилет", "спецодежда", "спец_одежда",
+}
+_NO_VEST_LABELS = {
+    "no_vest", "novest", "without_vest", "withoutvest", "no_workwear", "noworkwear",
+    "no_coveralls", "nocoveralls", "без_жилета", "без_жилетки", "нет_жилета",
+    "человек_без_жилета", "рабочий_без_жилета", "работник_без_жилета",
+    "person_without_vest", "person_no_vest", "without_workwear",
+}
 
 
 @dataclass(frozen=True)
@@ -163,17 +187,32 @@ class InferenceVisual:
 
 
 def normalise_model_label(value: object) -> str:
-    raw = re.sub(r"[^a-z0-9]+", "_", str(value or "").casefold()).strip("_")
-    if raw in _PERSON_LABELS:
-        return "person"
-    if raw in _HELMET_LABELS:
-        return "helmet"
+    # Keep Unicode letters too: custom YOLO models trained by ZMK operators are
+    # frequently exported with Russian class names ("Человек", "без каски", ...).
+    raw = re.sub(r"[^\w]+", "_", str(value or "").casefold()).strip("_")
     if raw in _NO_HELMET_LABELS:
         return "no_helmet"
-    if raw in _VEST_LABELS:
-        return "vest"
     if raw in _NO_VEST_LABELS:
         return "no_vest"
+    if raw in _HELMET_LABELS:
+        return "helmet"
+    if raw in _VEST_LABELS:
+        return "vest"
+    if raw in _PERSON_LABELS:
+        return "person"
+    # Custom datasets frequently use compounds that are not in the exact alias
+    # set ("Person without Hardhat", "без каски человек", "NO-HELMET", ...).
+    # Match the meaningful stems before falling back to the raw label.
+    if any(token in raw for token in ("without_helmet", "withouthelmet", "no_helmet", "nohelmet", "no_hardhat", "nohardhat", "без_каск", "нет_каск", "без_шлем", "bare_head", "barehead", "no_hat")):
+        return "no_helmet"
+    if any(token in raw for token in ("without_vest", "withoutvest", "no_vest", "novest", "без_жилет", "нет_жилет", "no_workwear", "noworkwear")):
+        return "no_vest"
+    if any(token in raw for token in ("helmet", "hardhat", "hard_hat", "каск", "шлем", "helm")):
+        return "helmet"
+    if any(token in raw for token in ("жилет", "vest", "workwear", "спецодежд", "coverall")):
+        return "vest"
+    if any(token in raw for token in ("person", "human", "worker", "people", "человек", "люди", "работник", "рабочий", "мужик")):
+        return "person"
     return raw
 
 
@@ -1184,7 +1223,7 @@ class Runtime:
             self._log(f"snapshot upload failed for {session.config.camera_id}: {redact_error(exc)}")
 
     async def _publish_live(self, session: CameraSession, image: Any) -> None:
-        if LIVE_PREVIEW_FPS <= 0:
+        if GO2RTC_PREVIEW_ENABLED or LIVE_PREVIEW_FPS <= 0:
             return
         now = time.monotonic()
         rate = min(session.config.fps_limit, LIVE_PREVIEW_FPS)

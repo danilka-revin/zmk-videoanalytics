@@ -95,6 +95,16 @@ _live_frames_lock = threading.Lock()
 _live_frame_sequence = 0
 MESSENGER_PROVIDER = os.getenv("MESSENGER_PROVIDER", "none").lower()
 if MESSENGER_PROVIDER not in {"none", "telegram", "max"}: MESSENGER_PROVIDER = "none"
+# go2rtc is the preferred WebRTC transport for the browser camera preview. The
+# API mirrors the camera RTSP list into go2rtc so the panel can play raw,
+# near-live video without repainting full MJPEG frames. Keep the MJPEG
+# endpoints as a fallback for installations that disable or lose go2rtc.
+GO2RTC_API_URL = os.getenv("GO2RTC_API_URL", "").rstrip("/")
+GO2RTC_ENABLED = os.getenv("GO2RTC_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+GO2RTC_RTSP_TRANSPORT = os.getenv("GO2RTC_RTSP_TRANSPORT", "tcp").strip().lower()
+if GO2RTC_RTSP_TRANSPORT not in {"tcp", "udp"}:
+    GO2RTC_RTSP_TRANSPORT = "tcp"
+GO2RTC_SYNC_TIMEOUT_SECONDS = 2.0
 TRAINING_WORKER_URL = os.getenv("TRAINING_WORKER_URL", "").rstrip("/")
 DATASET_DIR = Path(os.getenv("DATASET_DIR", "")) if os.getenv("DATASET_DIR") else (DB_PATH.parent / "datasets")
 MODEL_DIR = Path(os.getenv("MODEL_DIR", "")) if os.getenv("MODEL_DIR") else (DB_PATH.parent / "models")
@@ -550,10 +560,25 @@ class AuthRecoveryVerifyIn(AuthRecoveryRequestIn):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # Push the configured camera list into go2rtc as soon as the API starts.
+    # go2rtc may still be starting; sync is idempotent and is repeated on every
+    # camera CRUD operation and on a low-frequency background reconcile.
+    sync_go2rtc_cameras()
+    sync_task: asyncio.Task[None] | None = None
+    if GO2RTC_ENABLED and GO2RTC_API_URL:
+        async def _go2rtc_sync_loop() -> None:
+            while True:
+                await asyncio.sleep(15)
+                await asyncio.to_thread(sync_go2rtc_cameras)
+        sync_task = asyncio.create_task(_go2rtc_sync_loop(), name="go2rtc-camera-sync")
     try: yield
     finally:
+        if sync_task is not None and not sync_task.done():
+            sync_task.cancel()
         for task in [*list(_training_tasks.values()),*list(_dataset_capture_tasks.values())]: task.cancel()
         pending=[*list(_training_tasks.values()),*list(_dataset_capture_tasks.values())]
+        if sync_task is not None:
+            pending.append(sync_task)
         if pending: await asyncio.gather(*pending,return_exceptions=True)
 
 app=FastAPI(title="ZMK Vision API",version=APP_VERSION,description="On-premise API контура видеоаналитики",lifespan=lifespan)
@@ -1062,6 +1087,54 @@ class TrainingIn(BaseModel):
 def rows(query,args=()):
     con=db(); result=[dict(r) for r in con.execute(query,args).fetchall()]; con.close(); return result
 
+def _go2rtc_source_url(rtsp_url: str) -> str:
+    """Append the operator-selected RTSP transport fragment for go2rtc."""
+    if not rtsp_url:
+        return rtsp_url
+    if "#" in rtsp_url:
+        return rtsp_url if "transport=" in rtsp_url else f"{rtsp_url}#transport={GO2RTC_RTSP_TRANSPORT}"
+    return f"{rtsp_url}#transport={GO2RTC_RTSP_TRANSPORT}"
+
+def sync_go2rtc_cameras() -> dict[str, Any]:
+    """Mirror enabled cameras from SQLite into go2rtc.
+
+    go2rtc is deliberately optional: a slow/absent media relay must never break
+    camera CRUD. Only streams owned by this application (zmk-<camera_id>) are
+    added/removed, so an operator can keep unrelated go2rtc streams untouched.
+    """
+    if not GO2RTC_ENABLED or not GO2RTC_API_URL:
+        return {"ok": False, "reason": "go2rtc disabled"}
+    desired = rows("SELECT id,rtsp_url FROM cameras WHERE enabled=1 AND rtsp_url<>''")
+    desired_map = {f"zmk-{row['id']}": row["rtsp_url"] for row in desired}
+    try:
+        with httpx.Client(timeout=httpx.Timeout(GO2RTC_SYNC_TIMEOUT_SECONDS, connect=1.0)) as client:
+            existing_response = client.get(f"{GO2RTC_API_URL}/api/streams")
+            if existing_response.status_code >= 400:
+                return {"ok": False, "reason": f"HTTP {existing_response.status_code}"}
+            try:
+                existing_payload = existing_response.json()
+            except (ValueError, TypeError):
+                existing_payload = {}
+            existing = set(existing_payload.keys()) if isinstance(existing_payload, dict) else set()
+
+            for name, rtsp_url in desired_map.items():
+                source = _go2rtc_source_url(rtsp_url)
+                response = client.put(
+                    f"{GO2RTC_API_URL}/api/streams",
+                    params=[("name", name), ("src", source)],
+                )
+                if response.status_code >= 400:
+                    return {"ok": False, "reason": f"{name}: HTTP {response.status_code}"}
+
+            for name in existing - set(desired_map):
+                if name.startswith("zmk-"):
+                    client.delete(f"{GO2RTC_API_URL}/api/streams", params=[("name", name)])
+    except (httpx.HTTPError, OSError, RuntimeError, ValueError, TypeError) as exc:
+        # Keep the application camera workflow fully usable if go2rtc is not
+        # up yet (e.g. first startup ordering) or is not installed.
+        return {"ok": False, "reason": str(exc)[:220]}
+    return {"ok": True, "cameras": len(desired_map)}
+
 BOT_PROVIDERS=("telegram","max")
 
 def _parse_bot_ids(value: str | None) -> list[int]:
@@ -1532,6 +1605,7 @@ def camera_detail(camera_id:str):
 def add_camera(payload:CameraIn):
     cid=f"cam_{uuid.uuid4().hex[:12]}"; timestamp=now_iso(); con=db(); status="connecting" if payload.enabled and payload.rtsp_url else "unknown"
     con.execute("INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,restart_requested_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(cid,payload.name,payload.zone,payload.description,payload.rtsp_url,payload.fps_limit,status,0,0,int(payload.enabled),timestamp,timestamp,timestamp if status=="connecting" else "")); con.commit(); con.close()
+    sync_go2rtc_cameras()
     return {"id":cid,"name":payload.name,"zone":payload.zone,"description":payload.description,"fps_limit":payload.fps_limit,"enabled":payload.enabled,"configured":bool(payload.rtsp_url),"status":status}
 
 @app.put("/api/cameras/{camera_id}")
@@ -1554,6 +1628,7 @@ def update_camera(camera_id:str,payload:CameraUpdate):
     con.commit(); con.close()
     if stream_changed:
         snapshot_path_for(camera_id).unlink(missing_ok=True); clear_live_frame(camera_id)
+    sync_go2rtc_cameras()
     return {"id":camera_id,"updated":True,"configured":bool(new_rtsp),"rtsp_updated":rtsp_updated,"stream_reset":stream_changed}
 
 @app.delete("/api/cameras/{camera_id}")
@@ -1569,6 +1644,7 @@ def delete_camera(camera_id:str,delete_events:bool=False):
     con.execute("DELETE FROM cameras WHERE id=?",(camera_id,)); con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(now_iso(),"WARNING","camera_manager",f"Camera deleted: {camera[0]}",camera_id)); con.commit(); con.close()
     snapshot=snapshot_path_for(camera_id); snapshot.unlink(missing_ok=True); clear_live_frame(camera_id)
     if delete_events: remove_event_frames(event_ids)
+    sync_go2rtc_cameras()
     return {"id":camera_id,"deleted":True,"deleted_events":event_count if delete_events else 0}
 
 @app.patch("/api/cameras/{camera_id}/toggle")
@@ -1580,6 +1656,7 @@ def toggle_camera(camera_id:str):
     # from its next polling cycle.
     timestamp=now_iso(); con.execute("UPDATE cameras SET enabled=?,status=?,fps=0,latency_ms=0,last_error='',updated_at=?,telemetry_at='',restart_requested_at=? WHERE id=?",(enabled,"connecting" if enabled else "unknown",timestamp,timestamp,camera_id)); con.commit(); con.close()
     snapshot_path_for(camera_id).unlink(missing_ok=True); clear_live_frame(camera_id)
+    sync_go2rtc_cameras()
     return {"id":camera_id,"enabled":bool(enabled),"stream_reset":True}
 
 @app.post("/api/cameras/{camera_id}/restart")
@@ -1589,6 +1666,7 @@ def restart_camera(camera_id:str):
     if not row[0]: con.close(); raise HTTPException(409,"Сначала включите аналитику камеры")
     timestamp=now_iso(); con.execute("UPDATE cameras SET status='connecting',fps=0,latency_ms=0,last_error='',telemetry_at='',restart_requested_at=?,updated_at=? WHERE id=?",(timestamp,timestamp,camera_id)); con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(timestamp,"INFO","camera_manager","RTSP restart requested",camera_id)); con.commit(); con.close()
     snapshot_path_for(camera_id).unlink(missing_ok=True); clear_live_frame(camera_id)
+    sync_go2rtc_cameras()
     return {"id":camera_id,"restart_requested_at":timestamp,"status":"connecting"}
 
 def apply_camera_telemetry(camera_id:str,payload:CameraTelemetry):

@@ -21,6 +21,18 @@ def _camera(client: TestClient) -> str:
     return response.json()["id"]
 
 
+def test_go2rtc_source_url_appends_operator_transport(monkeypatch):
+    monkeypatch.setattr(main, "GO2RTC_RTSP_TRANSPORT", "tcp")
+    assert main._go2rtc_source_url("rtsp://camera/stream") == "rtsp://camera/stream#transport=tcp"
+    assert main._go2rtc_source_url("rtsp://camera/stream#transport=udp") == "rtsp://camera/stream#transport=udp"
+
+
+def test_go2rtc_sync_is_noop_when_disabled(monkeypatch):
+    monkeypatch.setattr(main, "GO2RTC_API_URL", "")
+    monkeypatch.setattr(main, "GO2RTC_ENABLED", False)
+    assert main.sync_go2rtc_cameras() == {"ok": False, "reason": "go2rtc disabled"}
+
+
 def test_camera_schema_migrates_existing_database(tmp_path, monkeypatch):
     legacy = tmp_path / "legacy.db"
     con = main.sqlite3.connect(legacy)

@@ -62,6 +62,8 @@ def worker_mod(monkeypatch):
     monkeypatch.setenv("RTSP_STIMEOUT", "5000000")
     monkeypatch.setenv("CAMERA_DECODER", "opencv")
     monkeypatch.setenv("CAMERA_LIVE_FPS", "0")
+    # Runtime tests exercise the legacy MJPEG live-frame path directly.
+    monkeypatch.setenv("GO2RTC_ENABLED", "false")
     _FakeCap.default_opened = True
     _FakeCap.results = []
 
@@ -172,6 +174,23 @@ def test_ppe_labels_link_no_helmet_to_the_detected_person(worker_mod):
     inferred = worker_mod.ppe_no_helmet_violations([person], {"person", "helmet"})
     assert inferred == [(person, person, True)]
     assert worker_mod.ppe_no_helmet_violations([person], {"person"}) == []  # COCO person-only is not PPE
+
+
+def test_custom_cyrillic_and_russian_class_names_are_normalised(worker_mod):
+    """A locally trained model often uses Russian class names; they must not be
+    stripped to an empty string by the ASCII-only label normaliser."""
+    assert worker_mod.normalise_model_label("Человек") == "person"
+    assert worker_mod.normalise_model_label("Рабочий") == "person"
+    assert worker_mod.normalise_model_label("Люди") == "person"
+    assert worker_mod.normalise_model_label("Без каски") == "no_helmet"
+    assert worker_mod.normalise_model_label("Человек без каски") == "no_helmet"
+    assert worker_mod.normalise_model_label("Каска") == "helmet"
+    assert worker_mod.normalise_model_label("без жилета") == "no_vest"
+    assert worker_mod.normalise_model_label("Жилет") == "vest"
+    assert worker_mod.normalise_model_label("Person without Hardhat") == "no_helmet"
+    assert worker_mod.normalise_model_label("Человек без жилета") == "no_vest"
+    semantics = worker_mod.model_semantics({"0": "Человек", "1": "Без каски", "2": "Каска"})
+    assert {"person", "no_helmet", "helmet"} <= semantics
 
 
 def test_ppe_inference_posts_no_helmet_event_for_the_matching_person(worker_mod):
