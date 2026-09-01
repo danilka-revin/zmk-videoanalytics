@@ -41,7 +41,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-APP_VERSION = "2.14.2"
+APP_VERSION = "2.16.4"
 TZ = timezone(timedelta(hours=7))
 CAMERA_TELEMETRY_STALE_SECONDS = 30
 HIGH_FPS_MODE = os.getenv("CAMERA_HIGH_FPS_MODE", "true").strip().lower() not in {"0","false","no","off"}
@@ -438,7 +438,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS auth_recovery_codes(id TEXT PRIMARY KEY, email TEXT NOT NULL, code_hash TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, used_at TEXT NOT NULL DEFAULT '');
     """)
     camera_columns={r[1] for r in con.execute("PRAGMA table_info(cameras)").fetchall()}
-    for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''","telemetry_at":"TEXT NOT NULL DEFAULT ''","last_error":"TEXT NOT NULL DEFAULT ''","restart_requested_at":"TEXT NOT NULL DEFAULT ''"}.items():
+    for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''","telemetry_at":"TEXT NOT NULL DEFAULT ''","last_error":"TEXT NOT NULL DEFAULT ''","restart_requested_at":"TEXT NOT NULL DEFAULT ''","preview_mode":"TEXT NOT NULL DEFAULT 'mse'"}.items():
         if column not in camera_columns: con.execute(f"ALTER TABLE cameras ADD COLUMN {column} {ddl}")
     con.execute("UPDATE cameras SET created_at=updated_at WHERE created_at='' OR created_at IS NULL")
     # A live MJPEG browser stream has a deliberate upper bound: keep stored
@@ -961,6 +961,10 @@ class CameraIn(BaseModel):
     rtsp_url:str=Field(default="",max_length=2048)
     fps_limit:float=Field(default=30,ge=.1,le=60)
     enabled:bool=True
+    # Browser preview transport only. It never changes the inference worker's
+    # own RTSP connection (which always runs through go2rtc). mse = H.264 over
+    # Media Source via go2rtc (default); mjpeg = reliable multipart JPEG stream.
+    preview_mode:Literal["mse","mjpeg"]="mse"
     @field_validator("rtsp_url")
     @classmethod
     def validate_rtsp(cls,value:str):
@@ -972,6 +976,9 @@ class CameraUpdate(BaseModel):
     rtsp_url:str|None=Field(default=None,max_length=2048)
     fps_limit:float=Field(default=30,ge=.1,le=60)
     enabled:bool=True
+    # Optional so older clients that never heard of the toggle keep the current
+    # stored value unchanged on update.
+    preview_mode:Literal["mse","mjpeg"]|None=None
     @field_validator("rtsp_url")
     @classmethod
     def validate_rtsp(cls,value:str|None):
@@ -1096,20 +1103,36 @@ def rows(query,args=()):
 
 def _go2rtc_source_url(rtsp_url: str) -> str:
     """Build a low-latency go2rtc source URL like VLC: TCP transport, no buffering.
+
+    go2rtc parses RTSP source options as ``#key=value`` fragments separated by
+    ``#`` (see go2rtc internal/streams/helpers.go ParseQuery). Joining them with
+    ``&`` makes go2rtc read the whole ``tcp&backchannel=0`` string as the
+    ``transport`` value and try to dial it as a WebSocket URL, failing with
+    ``unsupported protocol scheme \"\"`` so the camera never comes online.
+
     v2.14.0: Adds mp4 query for MSE/HLS low-latency and ensures single connection to camera.
     v2.14.2: Preserve operator-specified transport if already present (e.g. udp), else default to tcp.
+    v2.15.0: Add backchannel=0 for low latency (disable audio backchannel), keep single conn.
+    v2.16.3: Join source options with ``#`` (not ``&``) — fixes go2rtc
+    ``unsupported protocol scheme ""`` and cameras stuck offline.
     """
     if not rtsp_url:
         return rtsp_url
-    base = rtsp_url.split("#")[0]
-    existing_frag = rtsp_url.split("#", 1)[1] if "#" in rtsp_url else ""
-    # Preserve existing transport if operator already specified it (test expects udp kept)
-    if existing_frag and "transport=" in existing_frag:
-        return f"{base}#{existing_frag}"
-    if not existing_frag:
-        return f"{base}#transport={GO2RTC_RTSP_TRANSPORT}"
-    # Existing fragment without transport -> append tcp
-    return f"{base}#{existing_frag}&transport={GO2RTC_RTSP_TRANSPORT}"
+    base, _, fragment = rtsp_url.partition("#")
+    # go2rtc source options are `#`-separated `key=value` tokens; preserve any
+    # operator-supplied ones (e.g. media=video) and only fill in the defaults.
+    options: dict[str, str] = {}
+    for token in fragment.split("#"):
+        if not token:
+            continue
+        key, _, value = token.partition("=")
+        if key:
+            options[key] = value
+    # Disable the ONVIF audio backchannel by default (backchannel=0) and force
+    # the configured RTSP transport, without overriding explicit operator values.
+    options.setdefault("transport", GO2RTC_RTSP_TRANSPORT)
+    options.setdefault("backchannel", "0")
+    return base + "#" + "#".join(f"{key}={value}" for key, value in options.items())
 
 def sync_go2rtc_cameras() -> dict[str, Any]:
     """Mirror enabled cameras from SQLite into go2rtc with VLC-like low latency.
@@ -1633,44 +1656,47 @@ def camera_with_snapshot(row:dict|sqlite3.Row) -> dict:
 
 @app.get("/api/cameras")
 def cameras():
-    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,last_error,restart_requested_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras ORDER BY created_at,id")
+    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,last_error,restart_requested_at,preview_mode,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras ORDER BY created_at,id")
     return [camera_with_snapshot(r) for r in data]
 
 @app.get("/api/cameras/{camera_id}")
 def camera_detail(camera_id:str):
-    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,last_error,restart_requested_at,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras WHERE id=?",(camera_id,))
+    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,last_error,restart_requested_at,preview_mode,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras WHERE id=?",(camera_id,))
     if not data: raise HTTPException(404,"Камера не найдена")
     return camera_with_snapshot(data[0])
 
 @app.post("/api/cameras",status_code=201)
 def add_camera(payload:CameraIn):
     cid=f"cam_{uuid.uuid4().hex[:12]}"; timestamp=now_iso(); con=db(); status="connecting" if payload.enabled and payload.rtsp_url else "unknown"
-    con.execute("INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,restart_requested_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",(cid,payload.name,payload.zone,payload.description,payload.rtsp_url,payload.fps_limit,status,0,0,int(payload.enabled),timestamp,timestamp,timestamp if status=="connecting" else "")); con.commit(); con.close()
+    con.execute("INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,restart_requested_at,preview_mode) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(cid,payload.name,payload.zone,payload.description,payload.rtsp_url,payload.fps_limit,status,0,0,int(payload.enabled),timestamp,timestamp,timestamp if status=="connecting" else "",payload.preview_mode)); con.commit(); con.close()
     sync_go2rtc_cameras()
-    return {"id":cid,"name":payload.name,"zone":payload.zone,"description":payload.description,"fps_limit":payload.fps_limit,"enabled":payload.enabled,"configured":bool(payload.rtsp_url),"status":status}
+    return {"id":cid,"name":payload.name,"zone":payload.zone,"description":payload.description,"fps_limit":payload.fps_limit,"enabled":payload.enabled,"preview_mode":payload.preview_mode,"configured":bool(payload.rtsp_url),"status":status}
 
 @app.put("/api/cameras/{camera_id}")
 def update_camera(camera_id:str,payload:CameraUpdate):
-    con=db(); current=con.execute("SELECT rtsp_url,enabled FROM cameras WHERE id=?",(camera_id,)).fetchone()
+    con=db(); current=con.execute("SELECT rtsp_url,enabled,preview_mode FROM cameras WHERE id=?",(camera_id,)).fetchone()
     if not current: con.close(); raise HTTPException(404,"Камера не найдена")
     # The RTSP URL is a secret and is never returned by the API. It is only
     # replaced when the client supplies a non-empty value; null or "" ("leave
     # as is" from the edit form) keeps the existing URL.
     new_rtsp=payload.rtsp_url if payload.rtsp_url else current[0]
+    # preview_mode is optional in the payload; keep the stored value when the
+    # client (or an older frontend) does not send it.
+    new_preview=payload.preview_mode or current[2]
     rtsp_updated=bool(payload.rtsp_url)
     stream_changed=new_rtsp != current[0] or bool(payload.enabled) != bool(current[1])
     timestamp=now_iso()
     if stream_changed:
         # A frame and telemetry from the old endpoint must not be shown as if
         # they belonged to the newly configured camera.
-        con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,status='connecting',fps=0,latency_ms=0,last_error='',updated_at=?,telemetry_at='',restart_requested_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),timestamp,timestamp,camera_id))
+        con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,preview_mode=?,status='connecting',fps=0,latency_ms=0,last_error='',updated_at=?,telemetry_at='',restart_requested_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),new_preview,timestamp,timestamp,camera_id))
     else:
-        con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,updated_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),timestamp,camera_id))
+        con.execute("UPDATE cameras SET name=?,zone=?,description=?,rtsp_url=?,fps_limit=?,enabled=?,preview_mode=?,updated_at=? WHERE id=?",(payload.name,payload.zone,payload.description,new_rtsp,payload.fps_limit,int(payload.enabled),new_preview,timestamp,camera_id))
     con.commit(); con.close()
     if stream_changed:
         snapshot_path_for(camera_id).unlink(missing_ok=True); clear_live_frame(camera_id)
     sync_go2rtc_cameras()
-    return {"id":camera_id,"updated":True,"configured":bool(new_rtsp),"rtsp_updated":rtsp_updated,"stream_reset":stream_changed}
+    return {"id":camera_id,"updated":True,"configured":bool(new_rtsp),"rtsp_updated":rtsp_updated,"stream_reset":stream_changed,"preview_mode":new_preview}
 
 @app.delete("/api/cameras/{camera_id}")
 def delete_camera(camera_id:str,delete_events:bool=False):
@@ -1807,13 +1833,14 @@ def camera_mjpeg(camera_id:str):
     con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
     if not row: raise HTTPException(404,"Камера не найдена")
     if not row[0]: raise HTTPException(409,"Аналитика камеры отключена")
-    # WebRTC H264 direct is primary like VLC. This MJPEG endpoint is fallback only.
-    # Try go2rtc direct MJPEG first for true VLC-like FPS (Go implementation faster than Python)
+    # v2.15.0: WebRTC H264 is primary like VLC, but this MJPEG is reliable fallback.
+    # Never return 503 black screen - always try go2rtc, then live frames, then snapshot loop.
+    # Frontend now has JPEG polling too, so black screen impossible.
     if GO2RTC_ENABLED and GO2RTC_API_URL:
         for candidate_name in (f"zmk-{camera_id}", camera_id):
             try:
-                with httpx.Client(timeout=httpx.Timeout(5.0, connect=2.0)) as client:
-                    chk = client.get(f"{GO2RTC_API_URL}/api/frame.jpeg", params={"src": candidate_name}, timeout=2.0)
+                with httpx.Client(timeout=httpx.Timeout(3.0, connect=1.5)) as client:
+                    chk = client.get(f"{GO2RTC_API_URL}/api/frame.jpeg", params={"src": candidate_name}, timeout=1.5)
                     if chk.status_code==200 and chk.content.startswith(b"\xff\xd8"):
                         def go2rtc_generate(src_name: str = candidate_name):
                             try:
@@ -1826,10 +1853,7 @@ def camera_mjpeg(camera_id:str):
                         return StreamingResponse(go2rtc_generate(), media_type="multipart/x-mixed-replace; boundary=--go2rtc", headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
             except (httpx.HTTPError, OSError, RuntimeError, ValueError):
                 continue
-        # If go2rtc enabled but stream not ready, return 503 quickly so frontend retries WebRTC
-        # instead of hanging on empty worker MJPEG (which is now disabled when go2rtc enabled)
-        if not _live_frames.get(camera_id):
-            raise HTTPException(503,"go2rtc stream not ready, retry WebRTC")
+    # Fallback to worker live frames (now kept even when go2rtc enabled at 10 FPS for reliability)
     def generate():
         sequence=-1
         idle=0
@@ -1842,9 +1866,27 @@ def camera_mjpeg(camera_id:str):
                 yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "+str(len(image)).encode()+b"\r\n\r\n"+image+b"\r\n"
             else:
                 idle+=1
-                # If no frame for 5 sec, break so frontend can fallback to snapshot and retry WebRTC
-                if idle>250:  # 250 * 0.02 = 5 sec
-                    break
+                # If no live frame for 3 sec, try serving snapshot as MJPEG to avoid black screen
+                if idle>150:  # 150 * 0.02 = 3 sec
+                    try:
+                        snap_path = snapshot_path_for(camera_id)
+                    except (HTTPException, OSError):
+                        # Invalid camera id can never reach here (the camera row
+                        # was already validated above); keep the loop alive.
+                        snap_path = None
+                    if snap_path is not None and snap_path.exists():
+                        try:
+                            img = snap_path.read_bytes()
+                        except OSError:
+                            img = b""
+                        if img.startswith(b"\xff\xd8"):
+                            yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "+str(len(img)).encode()+b"\r\n\r\n"+img+b"\r\n"
+                            idle=0
+                            time.sleep(0.5)
+                            continue
+                    # If still no frame, wait and continue loop (don't break - keep connection for snapshot fallback)
+                    if idle>500:  # 10 sec total, then reset idle to keep trying
+                        idle=0
             time.sleep(.02)
     return StreamingResponse(generate(),media_type="multipart/x-mixed-replace; boundary=frame",headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
 

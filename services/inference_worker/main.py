@@ -39,14 +39,6 @@ if CAMERA_DECODER not in {"ffmpeg", "opencv"}:
 # NEW ARCHITECTURE v2.14.0: go2rtc is the ONLY RTSP client to camera.
 # Inference worker pulls from go2rtc RTSP (rtsp://host.docker.internal:8554/zmk-{id})
 # instead of direct camera, giving single connection to camera and true 25-60 FPS.
-GO2RTC_PREVIEW_ENABLED = os.getenv("GO2RTC_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
-GO2RTC_FORCE_MJPEG_FALLBACK = os.getenv("CAMERA_LIVE_FORCE_MJPEG", "false").strip().lower() in {"1", "true", "yes", "on"}
-GO2RTC_RTSP_URL = os.getenv("GO2RTC_RTSP_URL", "rtsp://host.docker.internal:8554").rstrip("/")
-GO2RTC_USE_FOR_INFERENCE = os.getenv("GO2RTC_USE_FOR_INFERENCE", "true").strip().lower() not in {"0", "false", "no", "off"}
-GO2RTC_INFERENCE_MAX_FAILURES = 5  # fallback to direct after N go2rtc failures
-
-
-
 def _bounded_int(name: str, default: int, minimum: int, maximum: int) -> int:
     try:
         value = int(os.getenv(name, str(default)))
@@ -61,6 +53,14 @@ def _bounded_float(name: str, default: float, minimum: float, maximum: float) ->
     except (TypeError, ValueError):
         value = default
     return max(minimum, min(maximum, value))
+
+
+GO2RTC_PREVIEW_ENABLED = os.getenv("GO2RTC_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+GO2RTC_FORCE_MJPEG_FALLBACK = os.getenv("CAMERA_LIVE_FORCE_MJPEG", "false").strip().lower() in {"1", "true", "yes", "on"}
+GO2RTC_RTSP_URL = os.getenv("GO2RTC_RTSP_URL", "rtsp://host.docker.internal:8554").rstrip("/")
+GO2RTC_USE_FOR_INFERENCE = os.getenv("GO2RTC_USE_FOR_INFERENCE", "true").strip().lower() not in {"0", "false", "no", "off"}
+# v2.16.1: Fast fallback to direct after 5 failures to avoid infinite connecting when go2rtc can't reach camera
+GO2RTC_INFERENCE_MAX_FAILURES = _bounded_int("GO2RTC_INFERENCE_MAX_FAILURES", 5, 1, 10000)
 
 
 def _go2rtc_rtsp_url_for(camera_id: str) -> str:
@@ -622,15 +622,18 @@ class Runtime:
 
     def _open_capture(self, url: str, transport: str):
         """Open RTSP with timeouts supplied *before* FFmpeg connects.
-
-        Calling CAP_PROP_OPEN_TIMEOUT_MSEC after VideoCapture(url, ...) is too
-        late: OpenCV has already entered its 30-second default connection path.
-        The empty-capture + open(params=...) form is supported by modern OpenCV
-        and is the reason unreachable streams now fail in ~OPEN_TIMEOUT_MS.
+        v2.16.0: Add low-latency flags like VLC for true 25-60 FPS.
         """
+        # Low-latency like VLC: nobuffer, low_delay, max_delay 0, analyzeduration 0, probesize 32
         options = [
             f"rtsp_transport;{transport}",
             f"{RTSP_TIMEOUT_OPTION};{_RTSP_STIMEOUT}",
+            "fflags;nobuffer+genpts+discardcorrupt",
+            "flags;low_delay",
+            "max_delay;0",
+            "analyzeduration;0",
+            "probesize;32",
+            "reorder_queue_size;0",
         ]
         if _RTSP_BUFSIZE:
             options.append(f"buffer_size;{_RTSP_BUFSIZE}")
@@ -1103,11 +1106,26 @@ class Runtime:
             return
         self._stop_ffmpeg(session)
         await self._report(session, "connecting", error="", force=session.status != "connecting")
+        # v2.16.2: Try go2rtc RTSP first even in ffmpeg mode to keep single connection to camera
+        rtsp_url_to_use = session.config.rtsp_url
+        is_go2rtc = False
+        if (
+            GO2RTC_PREVIEW_ENABLED
+            and GO2RTC_USE_FOR_INFERENCE
+            and GO2RTC_RTSP_URL
+            and session.go2rtc_failures < GO2RTC_INFERENCE_MAX_FAILURES
+        ):
+            go2rtc_url = _go2rtc_rtsp_url_for(session.config.camera_id)
+            if go2rtc_url:
+                rtsp_url_to_use = go2rtc_url
+                is_go2rtc = True
+        # Store for logging
+        session.using_go2rtc = is_go2rtc
         env = os.environ.copy()
         env.update(
             {
-                "ZMK_RTSP_URL": session.config.rtsp_url,
-                "ZMK_RTSP_TRANSPORT": session.transport,
+                "ZMK_RTSP_URL": rtsp_url_to_use,
+                "ZMK_RTSP_TRANSPORT": "tcp" if is_go2rtc else session.transport,
                 "ZMK_RTSP_MAX_DELAY_US": str(RTSP_MAX_DELAY_US),
             }
         )
@@ -1142,7 +1160,7 @@ class Runtime:
         session.received_first_frame = False
         session.failures = 0
         session.decoder_error = ""
-        self._log(f"camera {session.config.camera_id} FFmpeg decoder started via {session.transport.upper()}", force=True)
+        self._log(f"camera {session.config.camera_id} FFmpeg decoder started via {('GO2RTC '+('TCP' if session.using_go2rtc else session.transport.upper())) if session.using_go2rtc else session.transport.upper()} ({'single conn' if session.using_go2rtc else 'direct'})", force=True)
 
     @staticmethod
     def _decode_jpeg(payload: bytes):
@@ -1156,6 +1174,7 @@ class Runtime:
         if process is None or process.stdout is None:
             return None, "FFmpeg decoder не запущен"
 
+        # v2.16.2: If we were using go2rtc and ffmpeg fails quickly, count as go2rtc failure for fast fallback
         wait_seconds = READ_TIMEOUT_MS / 1000 + 1
         if not session.received_first_frame:
             wait_seconds = max(wait_seconds, KEYFRAME_GRACE_SECONDS)
@@ -1324,30 +1343,31 @@ class Runtime:
             self._log(f"snapshot upload failed for {session.config.camera_id}: {redact_error(exc)}")
 
     async def _publish_live(self, session: CameraSession, image: Any) -> None:
-        # FIX 4 FPS bottleneck: when go2rtc is enabled, skip expensive MJPEG re-encode
-        # WebRTC H264 direct is primary like VLC — true 25-60 FPS, no quality cut.
-        # Model always uses full-quality frame via image.copy(), not this JPEG.
-        # MJPEG is only fallback when go2rtc disabled or CAMERA_LIVE_FPS=0 disables it,
-        # or when CAMERA_LIVE_FORCE_MJPEG=true forces it for debugging.
-        if GO2RTC_PREVIEW_ENABLED and not GO2RTC_FORCE_MJPEG_FALLBACK:
+        # v2.16.0 REAL STREAM ONLY: go2rtc provides true H264 25-60 FPS via MSE/HLS directly to browser.
+        # MJPEG re-encode per frame is the 4 FPS bottleneck (JPEG encode + HTTP POST blocking decode loop).
+        # User explicitly banned MJPEG for preview: "только давай не через mjpeg а то там будет 4 фпс"
+        # So we DISABLE live-frame MJPEG publish when go2rtc is enabled, saving CPU and keeping decode at 60 FPS.
+        # Snapshot still published every 3 sec for evidence fallback, and boxes via /visual JSON.
+        if GO2RTC_PREVIEW_ENABLED and not GO2RTC_FORCE_MJPEG_FALLBACK and session.using_go2rtc:
+            # Using go2rtc -> frontend gets MSE/HLS directly, no need for MJPEG re-encode
             return
         if LIVE_PREVIEW_FPS <= 0:
             return
         now = time.monotonic()
-        rate = min(session.config.fps_limit, LIVE_PREVIEW_FPS)
-        if rate <= 0 or now - session.last_live_at < 1 / rate:
+        effective_fps = min(session.config.fps_limit, LIVE_PREVIEW_FPS)
+        if effective_fps <= 0 or now - session.last_live_at < 1 / effective_fps:
             return
-        # Update timestamp BEFORE encoding/upload to avoid POST latency throttling FPS to 4
         session.last_live_at = now
         try:
             encoded = await asyncio.to_thread(self._encode_live, image)
             if not encoded:
                 return
-            # Fire-and-forget style: we already updated last_live_at, so next frame can be scheduled
-            # even if this POST is still in flight. Await it but don't block rate limiter.
-            await self.post_internal_jpeg(f"/api/internal/cameras/{session.config.camera_id}/live-frame", encoded)
-        except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
-            self._log(f"live preview upload failed for {session.config.camera_id}: {redact_error(exc)}")
+            try:
+                await self.post_internal_jpeg(f"/api/internal/cameras/{session.config.camera_id}/live-frame", encoded)
+            except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
+                self._log(f"live preview upload failed for {session.config.camera_id}: {redact_error(exc)}")
+        except (AttributeError, OSError, RuntimeError, ValueError) as exc:
+            self._log(f"live encode failed for {session.config.camera_id}: {redact_error(exc)}")
 
     async def _publish_visual(self, session: CameraSession, visual: Any | None) -> None:
         # Publish boxes for frontend overlay — lightweight, no image re-encode

@@ -46,8 +46,14 @@ def test_camera_full_crud_search_telemetry_and_diagnostics(monkeypatch):
         camera=c.get(f'/api/cameras/{camera_id}').json()
         assert camera['description']=='Ворота №2' and camera['fps_limit']==6
         assert 'rtsp_url' not in camera
-        updated=c.put(f'/api/cameras/{camera_id}',json={'name':'Склад Южный','zone':'Склад','description':'После переноса','rtsp_url':None,'fps_limit':4.5,'enabled':True})
-        assert updated.status_code==200
+        # preview_mode defaults to mse and is returned per camera.
+        assert camera['preview_mode']=='mse'
+        updated=c.put(f'/api/cameras/{camera_id}',json={'name':'Склад Южный','zone':'Склад','description':'После переноса','rtsp_url':None,'fps_limit':4.5,'enabled':True,'preview_mode':'mjpeg'})
+        assert updated.status_code==200 and updated.json()['preview_mode']=='mjpeg'
+        assert c.get(f'/api/cameras/{camera_id}').json()['preview_mode']=='mjpeg'
+        # Omitting preview_mode keeps the stored value instead of resetting it.
+        c.put(f'/api/cameras/{camera_id}',json={'name':'Склад Южный','zone':'Склад','description':'После переноса','rtsp_url':None,'fps_limit':4.5,'enabled':True})
+        assert c.get(f'/api/cameras/{camera_id}').json()['preview_mode']=='mjpeg'
         telemetry=c.post(f'/api/cameras/{camera_id}/telemetry',json={'status':'online','fps':4.2,'latency_ms':180})
         assert telemetry.status_code==200
         results=c.get('/api/search',params={'q':'Южный'}).json()['results']

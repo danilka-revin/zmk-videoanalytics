@@ -23,8 +23,17 @@ def _camera(client: TestClient) -> str:
 
 def test_go2rtc_source_url_appends_operator_transport(monkeypatch):
     monkeypatch.setattr(main, "GO2RTC_RTSP_TRANSPORT", "tcp")
-    assert main._go2rtc_source_url("rtsp://camera/stream") == "rtsp://camera/stream#transport=tcp"
-    assert main._go2rtc_source_url("rtsp://camera/stream#transport=udp") == "rtsp://camera/stream#transport=udp"
+    # go2rtc joins RTSP source options with '#' fragments, never '&'. Using '&'
+    # made go2rtc read "tcp&backchannel=0" as the transport value and dial it as
+    # a WebSocket URL -> "unsupported protocol scheme" and cameras stayed offline.
+    url = main._go2rtc_source_url("rtsp://camera/stream")
+    assert url == "rtsp://camera/stream#transport=tcp#backchannel=0"
+    # Operator-specified transport is preserved, backchannel default is added.
+    assert main._go2rtc_source_url("rtsp://camera/stream#transport=udp") == "rtsp://camera/stream#transport=udp#backchannel=0"
+    # Explicit backchannel choice is never overridden or duplicated.
+    assert main._go2rtc_source_url("rtsp://camera/stream#transport=udp#backchannel=1") == "rtsp://camera/stream#transport=udp#backchannel=1"
+    # Unknown options are kept and only missing defaults are appended.
+    assert main._go2rtc_source_url("rtsp://camera/stream#media=video") == "rtsp://camera/stream#media=video#transport=tcp#backchannel=0"
 
 
 def test_go2rtc_sync_is_noop_when_disabled(monkeypatch):
@@ -45,7 +54,7 @@ def test_camera_schema_migrates_existing_database(tmp_path, monkeypatch):
     columns = {row[1] for row in con.execute("PRAGMA table_info(cameras)")}
     tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     con.close()
-    assert {"telemetry_at", "last_error", "restart_requested_at"} <= columns
+    assert {"telemetry_at", "last_error", "restart_requested_at", "preview_mode"} <= columns
     assert "worker_status" in tables
 
 

@@ -1,3 +1,114 @@
+# ZMK Vision v2.16.4 — переключатель предпросмотра MJPEG / MSE + авторелизы в main
+
+## Режим предпросмотра на каждой камере
+
+В настройках камеры (создание/редактирование) появился переключатель
+**MSE · H.264** / **MJPEG · надёжный**. Значение хранится в базе отдельно для
+каждой камеры и возвращается API (`preview_mode: "mse" | "mjpeg"`, по умолчанию
+`"mse"` — текущее поведение не меняется).
+
+- **MSE (по умолчанию):** H.264 через go2rtc, как было — 25–60 FPS при работающем go2rtc.
+- **MJPEG:** надёжный multipart-JPEG поток `/api/cameras/{id}/mjpeg`, который
+  фронтенд декодирует сам. Работает и при отключённом/недоступном go2rtc —
+  запасной канал, который у вас стабильно работал.
+
+Переключатель влияет **только на отображение в браузере**; RTSP-подключение
+inference-воркера через go2rtc не затрагивается. Поле необязательное в
+обновлении: старые клиенты, не знающие про него, не сбрасывают сохранённое
+значение.
+
+**backend:** `preview_mode TEXT NOT NULL DEFAULT 'mse'` (автомиграция колонки),
+`CameraIn`/`CameraUpdate`, SELECT/INSERT/UPDATE камер, `bootstrap_env_camera`
+остаётся на дефолте. **frontend:** тип `Cam.preview_mode`, переключатель в
+модалке, `CameraPreview` ветка MJPEG-стрима с переподключением.
+
+## Релизы снова появляются в main автоматически
+
+Раньше релиз создавался только при ручном пуше тега `v*`, поэтому после v2.14.2
+теги не появлялись, а версия проекта (VERSION) расходилась с последним релизом
+GitHub. Теперь `.github/workflows/release.yml` срабатывает на **каждый push в
+`main`**: читает `VERSION`, и если релиза `v{VERSION}` ещё нет — прогоняет полный
+gate (pip-audit, ruff, bandit, pytest, сборку фронта и Docker) и публикует
+релиз с архивами автоматически. Повторный push с той же версией ничего не
+перевыпускает. Ручной push тега `v*` по-прежнему работает как запасной канал.
+
+## Проверка
+
+```bash
+PYTHONPATH=backend pytest backend/tests -q        # preview_mode в CRUD и миграции
+cd frontend && npm run lint && npm run build     # сборка проходит
+pytest tests -q
+```
+
+---
+
+# ZMK Vision v2.16.3 — fix go2rtc RTSP source options separator (cameras offline)
+
+## Ошибка в логах go2rtc
+
+```
+WRN [rtsp] error="streams: Get \"tcp&backchannel=0\": unsupported protocol scheme \"\"" stream=zmk-cam_env_01
+```
+
+## Причина
+
+go2rtc парсит опции RTSP-источника как `#key=value`-фрагменты, разделённые символом `#`
+(`internal/streams/helpers.go ParseQuery`). Бэкенд собирал источник как
+`rtsp://...#transport=tcp&backchannel=0`, то есть через `&`. Из-за этого go2rtc
+считал всю строку `tcp&backchannel=0` значением `transport`, уходил в ветку
+WebSocket-подключения и падал с `unsupported protocol scheme ""` — камера оставалась офлайн.
+
+## Фикс
+
+**backend/app/main.py `_go2rtc_source_url`:** опции теперь склеиваются через `#`:
+
+```
+rtsp://admin:…@…:554/h264/ch01/main/av_stream#transport=tcp#backchannel=0
+```
+
+- операторский `transport` (например `udp`) сохраняется, дефолт добавляется только если отсутствует;
+- явный `backchannel` оператора не перезаписывается и не дублируется;
+- неизвестные опции (например `media=video`) сохраняются;
+- `httpx` кодирует `#` в `%23`, поэтому go2rtc получает корректный `src`.
+
+**VERSION / APP_VERSION / package.json:** 2.16.2 → 2.16.3
+
+## Проверка
+
+```bash
+cd backend && pytest tests/test_camera_runtime.py -q   # 9 passed
+curl "http://HOST:1984/rtc/api/streams" | jq '.zmk-cam_env_01.producers[0].url'
+# rtsp://…/av_stream#transport=tcp#backchannel=0
+docker logs zmk-vision-go2rtc-1 --tail 20   # больше нет "unsupported protocol scheme"
+```
+
+# ZMK Vision v2.16.3 — одна команда снова ведёт на main после merge PR
+
+## Проблема
+
+После merge PR рабочая ветка `arena/…` остаётся на remote (она не удаляется), поэтому
+launcher `zmk-vision` продолжал «сидеть» на ней вечно и больше не получал обновления
+релизного канала `main`. Одной командой обновить и запустить `main` не получалось.
+
+## Фикс
+
+**installers/bootstrap-linux.sh:** после `git fetch` закреплённой ветки launcher сверяет её
+верхний коммит с историей `main` через `git merge-base --is-ancestor`:
+
+- shallow-клоны один раз распаковываются (`git fetch --unshallow origin main`), чтобы
+  merge-коммит с его вторым родителем был виден для точной проверки;
+- если закреплённый коммит уже в `main` — launcher переключается на `main` и дальше
+  `zmk-vision` (одна команда) обновляет и запускает релизный канал, как раньше;
+- если ветка ещё не слита — работа на ней продолжается без изменений.
+
+## Проверка
+
+```bash
+pytest tests/test_installers.py -q   # в т.ч. test_launcher_detects_merged_branch_and_switches_to_main
+```
+
+---
+
 # ZMK Vision v2.14.2 — fix frontend build TS1382 + TS2345
 
 ## Ошибка пользователя после обновления на v2.14.1 (из start.sh лога)
