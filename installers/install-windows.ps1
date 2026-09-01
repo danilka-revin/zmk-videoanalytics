@@ -127,7 +127,15 @@ switch ($messenger.ToLowerInvariant()) {
 # Training worker is always part of the stack. It reports GPU mode when NVIDIA
 # Container Toolkit is available and otherwise remains usable in CPU fallback.
 Set-DotEnvValue "TRAINING_WORKER_URL" "http://training-worker:8010"
-$inference = if ($NonInteractive) { $env:ENABLE_INFERENCE } else { Read-Host "Enable real RTSP YOLO inference worker? [y/N]" }
+# start-demo.bat exports ENABLE_INFERENCE=true so a single double-click can
+# enable the inference worker without asking the operator for yet another input.
+if ($env:ENABLE_INFERENCE) {
+  $inference = $env:ENABLE_INFERENCE
+} elseif ($NonInteractive) {
+  $inference = ''
+} else {
+  $inference = Read-Host "Enable real RTSP YOLO inference worker? [y/N]"
+}
 if ($inference -match '^(y|Y|true|1)$') {
   $workerToken = if ($env:ZMK_WORKER_TOKEN) { $env:ZMK_WORKER_TOKEN } else { [guid]::NewGuid().ToString('N') }
   Set-DotEnvValue "ZMK_WORKER_TOKEN" $workerToken
