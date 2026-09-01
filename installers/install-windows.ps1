@@ -52,7 +52,15 @@ if ($CheckOnly) {
 
 # --- Auto-update on startup: pull the latest GitHub release, verify it,
 #     unpack it and re-run this installer with the new build ---
-if ($env:ZMK_NO_AUTO_UPDATE -eq '1') {
+$isFeatureBranch = $false
+if (Test-Path (Join-Path $Root '.git') -and (Get-Command git -ErrorAction SilentlyContinue)) {
+  $branchOut = & git rev-parse --abbrev-ref HEAD 2>$null
+  $branch = if ($branchOut) { ($branchOut | Out-String).Trim() } else { '' }
+  if ($branch -and $branch -ne 'main' -and $branch -ne 'master') { $isFeatureBranch = $true }
+}
+if ($isFeatureBranch) {
+  Write-Host "Feature branch active; release auto-update is skipped to preserve this build." -ForegroundColor Yellow
+} elseif ($env:ZMK_NO_AUTO_UPDATE -eq '1') {
   Write-Host "Auto-update disabled via ZMK_NO_AUTO_UPDATE=1." -ForegroundColor Yellow
 } elseif ($env:ZMK_RELAUNCHED_AFTER_UPDATE -eq '1') {
   : # already running the freshly updated build

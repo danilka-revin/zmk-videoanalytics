@@ -15,7 +15,18 @@ $Root = Split-Path -Parent $PSScriptRoot
 Set-Location $Root
 
 if (-not (Test-Path (Join-Path $Root 'installers\auto-update.ps1'))) { throw "Missing installers\auto-update.ps1 — run install-windows.ps1 first." }
-if (-not ($env:ZMK_NO_AUTO_UPDATE -eq '1' -or $env:ZMK_RELAUNCHED_AFTER_UPDATE -eq '1')) {
+# Release auto-update rewrites the working tree to the latest GitHub release.
+# On a Git feature branch that would silently discard the current build, so the
+# Windows launcher now mirrors start.sh and keeps feature branches intact.
+$isFeatureBranch = $false
+if (Test-Path (Join-Path $Root '.git') -and (Get-Command git -ErrorAction SilentlyContinue)) {
+  $branchOut = & git rev-parse --abbrev-ref HEAD 2>$null
+  $branch = if ($branchOut) { ($branchOut | Out-String).Trim() } else { '' }
+  if ($branch -and $branch -ne 'main' -and $branch -ne 'master') { $isFeatureBranch = $true }
+}
+if ($isFeatureBranch) {
+  Write-Host '[start] Feature branch active; release auto-update is skipped to preserve this build.' -ForegroundColor Yellow
+} elseif (-not ($env:ZMK_NO_AUTO_UPDATE -eq '1' -or $env:ZMK_RELAUNCHED_AFTER_UPDATE -eq '1')) {
   & (Join-Path $Root 'installers\auto-update.ps1') -Relaunch start.ps1
 }
 
