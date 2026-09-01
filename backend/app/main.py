@@ -1828,14 +1828,76 @@ async def internal_event_frame(event_id:int,request:Request):
     temp=target.with_name(f".{target.stem}-{uuid.uuid4().hex}.tmp")
     temp.write_bytes(image); temp.replace(target)
 
+def _mjpeg_frame(image: bytes | None) -> bytes | None:
+    """Build one multipart MJPEG frame, or None for invalid input."""
+    if not image or not image.startswith(b"\xff\xd8"):
+        return None
+    return (
+        b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "
+        + str(len(image)).encode()
+        + b"\r\n\r\n"
+        + image
+        + b"\r\n"
+    )
+
+
 @app.get("/api/cameras/{camera_id}/mjpeg")
 def camera_mjpeg(camera_id:str):
     con=db(); row=con.execute("SELECT enabled FROM cameras WHERE id=?",(camera_id,)).fetchone(); con.close()
     if not row: raise HTTPException(404,"Камера не найдена")
     if not row[0]: raise HTTPException(409,"Аналитика камеры отключена")
-    # v2.15.0: WebRTC H264 is primary like VLC, but this MJPEG is reliable fallback.
-    # Never return 503 black screen - always try go2rtc, then live frames, then snapshot loop.
-    # Frontend now has JPEG polling too, so black screen impossible.
+    # v2.16.3: local-first MJPEG. The backend prefers the worker's in-memory
+    # live JPEG cache (always maintained by the inference worker), falls back to
+    # go2rtc only when that cache is stale/empty, then serves the last snapshot.
+    # This makes MJPEG mode show real video instead of a black card on Windows
+    # desktops where go2rtc/WebRTC ports are blocked or temporarily unavailable.
+
+    def local_generate():
+        sequence=-1
+        idle=0
+        while True:
+            with _live_frames_lock:
+                item=_live_frames.get(camera_id)
+            if item and item[0]!=sequence:
+                sequence,_,image=item
+                idle=0
+                frame=_mjpeg_frame(image)
+                if frame:
+                    yield frame
+            else:
+                idle+=1
+                # Keep the browser alive: after ~1s without a real live frame,
+                # stream the last persisted snapshot (a still image) instead of
+                # leaving a persistent black multipart stream.
+                if idle>=50:  # 50 * 0.02 = 1 sec
+                    try:
+                        snap_path = snapshot_path_for(camera_id)
+                    except (HTTPException, OSError, ValueError):
+                        snap_path = None
+                    if snap_path is not None and snap_path.exists():
+                        try:
+                            img = snap_path.read_bytes()
+                        except OSError:
+                            img = b""
+                        frame = _mjpeg_frame(img)
+                        if frame:
+                            yield frame
+                            idle=0
+                            time.sleep(0.5)
+                            continue
+                    # Periodically reset so the watchdog never gives up entirely.
+                    if idle>1500:
+                        idle=0
+            time.sleep(.02)
+
+    # Prefer a fresh worker frame; if present, skip go2rtc entirely (fewer
+    # moving parts, and MJPEG mode is explicitly requesting browser-decoded JPEGs).
+    with _live_frames_lock:
+        current=_live_frames.get(camera_id)
+    if current and time.time()-current[1] < 2.5:
+        return StreamingResponse(local_generate(),media_type="multipart/x-mixed-replace; boundary=frame",headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
+
+    # No fresh worker frame: try go2rtc before giving the browser only snapshots.
     if GO2RTC_ENABLED and GO2RTC_API_URL:
         for candidate_name in (f"zmk-{camera_id}", camera_id):
             try:
@@ -1853,42 +1915,10 @@ def camera_mjpeg(camera_id:str):
                         return StreamingResponse(go2rtc_generate(), media_type="multipart/x-mixed-replace; boundary=--go2rtc", headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
             except (httpx.HTTPError, OSError, RuntimeError, ValueError):
                 continue
-    # Fallback to worker live frames (now kept even when go2rtc enabled at 10 FPS for reliability)
-    def generate():
-        sequence=-1
-        idle=0
-        while True:
-            with _live_frames_lock:
-                item=_live_frames.get(camera_id)
-            if item and item[0]!=sequence:
-                sequence,_,image=item
-                idle=0
-                yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "+str(len(image)).encode()+b"\r\n\r\n"+image+b"\r\n"
-            else:
-                idle+=1
-                # If no live frame for 3 sec, try serving snapshot as MJPEG to avoid black screen
-                if idle>150:  # 150 * 0.02 = 3 sec
-                    try:
-                        snap_path = snapshot_path_for(camera_id)
-                    except (HTTPException, OSError):
-                        # Invalid camera id can never reach here (the camera row
-                        # was already validated above); keep the loop alive.
-                        snap_path = None
-                    if snap_path is not None and snap_path.exists():
-                        try:
-                            img = snap_path.read_bytes()
-                        except OSError:
-                            img = b""
-                        if img.startswith(b"\xff\xd8"):
-                            yield b"--frame\r\nContent-Type: image/jpeg\r\nContent-Length: "+str(len(img)).encode()+b"\r\n\r\n"+img+b"\r\n"
-                            idle=0
-                            time.sleep(0.5)
-                            continue
-                    # If still no frame, wait and continue loop (don't break - keep connection for snapshot fallback)
-                    if idle>500:  # 10 sec total, then reset idle to keep trying
-                        idle=0
-            time.sleep(.02)
-    return StreamingResponse(generate(),media_type="multipart/x-mixed-replace; boundary=frame",headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
+
+    # Local fallback now: it will serve a live frame as soon as the worker
+    # produces one, and a snapshot after 1s otherwise.
+    return StreamingResponse(local_generate(),media_type="multipart/x-mixed-replace; boundary=frame",headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
 
 @app.get("/api/cameras/{camera_id}/snapshot")
 def camera_snapshot(camera_id:str):

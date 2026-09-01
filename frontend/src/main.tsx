@@ -115,6 +115,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
  const hlsRetryRef=useRef<number>(0);
  const mjpegRetryRef=useRef<number>(0);
  const mjpegAbortRef=useRef<AbortController|null>(null);
+ const mjpegTimeoutRef=useRef<number>(0);
 
  useEffect(()=>{
   let cancelled=false;
@@ -476,6 +477,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
    if(mseRetryRef.current)clearTimeout(mseRetryRef.current);
    if(hlsRetryRef.current)clearTimeout(hlsRetryRef.current);
    if(mjpegRetryRef.current)clearTimeout(mjpegRetryRef.current);
+   if(mjpegTimeoutRef.current)clearTimeout(mjpegTimeoutRef.current);
    if(mjpegAbortRef.current){try{mjpegAbortRef.current.abort()}catch{};mjpegAbortRef.current=null}
    setTransport('mjpeg');
    const abort=new AbortController();
@@ -501,7 +503,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
      if(old&&old!==url&&old.startsWith('blob:'))try{URL.revokeObjectURL(old)}catch{};
      return url;
     });
-    if(!gotFrame){gotFrame=true;setLive(true)}
+    if(!gotFrame){gotFrame=true;setLive(true);if(mjpegTimeoutRef.current){clearTimeout(mjpegTimeoutRef.current);mjpegTimeoutRef.current=0}}
    };
    const pump=async()=>{
     let buf=new Uint8Array(0);let from=0;
@@ -529,6 +531,14 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
     mjpegRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginMjpeg()},900) as unknown as number;
    };
    void pump();
+   // Hard anti-black-screen watchdog: if the MJPEG endpoint never delivers a
+   // single JPEG, stop the hanging fetch and switch to snapshot polling instead
+   // of leaving a black/img 0-pixel camera card on screen.
+   mjpegTimeoutRef.current=window.setTimeout(()=>{
+    if(cancelled||gotFrame)return;
+    try{abort.abort()}catch{}
+    mjpegRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginSnapshot()},50) as unknown as number;
+   },2500) as unknown as number;
   };
 
   // start flow
@@ -562,6 +572,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
    if(mseRetryRef.current)clearTimeout(mseRetryRef.current);
    if(hlsRetryRef.current)clearTimeout(hlsRetryRef.current);
    if(mjpegRetryRef.current)clearTimeout(mjpegRetryRef.current);
+   if(mjpegTimeoutRef.current)clearTimeout(mjpegTimeoutRef.current);
    if(mjpegAbortRef.current){try{mjpegAbortRef.current.abort()}catch{}}
    cleanupMSE();cleanupHLS();
    if(currentBlob&&currentBlob.startsWith('blob:'))try{URL.revokeObjectURL(currentBlob)}catch{}

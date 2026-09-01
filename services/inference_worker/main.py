@@ -132,6 +132,12 @@ FFMPEG_FRAME_MAX_BYTES = _bounded_int("FFMPEG_FRAME_MAX_BYTES", 5_000_000, 100_0
 # Browser MJPEG preview follows the source as closely as the host permits.
 # The actual rate is still bounded by the camera/NVR and never fabricated.
 LIVE_PREVIEW_FPS = _bounded_float("CAMERA_LIVE_FPS", 60.0, 0.0, 60.0)
+# Always keep a cheap local MJPEG fallback even when go2rtc is the primary
+# transport. This prevents a black/frozen card when a camera is set to MJPEG
+# mode or when go2rtc becomes unavailable (the API falls back to this cache).
+# It is deliberately lower than LIVE_PREVIEW_FPS to avoid a CPU spike while
+# MSE/HLS remains the main 25-60 FPS path.
+MJPEG_LIVE_FPS = _bounded_float("CAMERA_MJPEG_LIVE_FPS", 15.0, 0.0, 60.0)
 # ML is intentionally sampled separately from the preview. A slow CPU model
 # must not drag a 25/30/50 FPS camera wall down to inference speed.
 INFERENCE_FPS = _bounded_float("CAMERA_INFERENCE_FPS", 8.0, 0.1, 30.0)
@@ -1343,18 +1349,23 @@ class Runtime:
             self._log(f"snapshot upload failed for {session.config.camera_id}: {redact_error(exc)}")
 
     async def _publish_live(self, session: CameraSession, image: Any) -> None:
-        # v2.16.0 REAL STREAM ONLY: go2rtc provides true H264 25-60 FPS via MSE/HLS directly to browser.
-        # MJPEG re-encode per frame is the 4 FPS bottleneck (JPEG encode + HTTP POST blocking decode loop).
-        # User explicitly banned MJPEG for preview: "только давай не через mjpeg а то там будет 4 фпс"
-        # So we DISABLE live-frame MJPEG publish when go2rtc is enabled, saving CPU and keeping decode at 60 FPS.
-        # Snapshot still published every 3 sec for evidence fallback, and boxes via /visual JSON.
-        if GO2RTC_PREVIEW_ENABLED and not GO2RTC_FORCE_MJPEG_FALLBACK and session.using_go2rtc:
-            # Using go2rtc -> frontend gets MSE/HLS directly, no need for MJPEG re-encode
-            return
-        if LIVE_PREVIEW_FPS <= 0:
+        # v2.16.3 robustness: the local MJPEG cache must be kept alive even when
+        # go2rtc is the primary MSE/HLS transport. If a camera is configured with
+        # preview_mode=mjpeg, or go2rtc briefly disappears, the /mjpeg endpoint
+        # can then serve real frames instead of a black/empty card.
+        #
+        # Performance is kept sane by publishing the fallback at its own lower
+        # rate (CAMERA_MJPEG_LIVE_FPS, default 15 FPS), while MSE/HLS stays the
+        # full-rate 25-60 FPS path for normal cameras.
+        fallback_fps = (
+            MJPEG_LIVE_FPS
+            if GO2RTC_PREVIEW_ENABLED and not GO2RTC_FORCE_MJPEG_FALLBACK and session.using_go2rtc
+            else LIVE_PREVIEW_FPS
+        )
+        if fallback_fps <= 0:
             return
         now = time.monotonic()
-        effective_fps = min(session.config.fps_limit, LIVE_PREVIEW_FPS)
+        effective_fps = min(session.config.fps_limit, fallback_fps)
         if effective_fps <= 0 or now - session.last_live_at < 1 / effective_fps:
             return
         session.last_live_at = now
