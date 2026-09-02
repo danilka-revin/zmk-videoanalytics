@@ -79,3 +79,72 @@ def test_username_roles_are_case_insensitive(monkeypatch):
         assert role_for(996) == "denied"
     finally:
         bot_main.RUNTIME.admins, bot_main.RUNTIME.operators, bot_main.RUNTIME.viewers, bot_main.RUNTIME.admin_usernames, bot_main.RUNTIME.operator_usernames, bot_main.RUNTIME.viewer_usernames = previous
+
+
+def test_project_log_shipping_posts_buffered_records(monkeypatch):
+    """Строки бота уходят в единый журнал проекта (вкладка «Логи»)."""
+    import main as bot_main
+    sent=[]
+    async def fake_api(method,path,**kwargs):
+        sent.append((method,path,kwargs['json'])); return {'accepted':1,'dropped':0}
+    monkeypatch.setattr(bot_main,'api',fake_api)
+    monkeypatch.setattr(bot_main,'LOG_SHIP_INTERVAL_SECONDS',.01)
+    bot_main._log_ship_lines.clear()
+    bot_main.log.warning('Telegram API недоступен, повтор через 5 с')
+
+    async def run_once():
+        task=asyncio.create_task(bot_main.log_ship_worker())
+        await asyncio.sleep(.05)
+        task.cancel()
+        await asyncio.gather(task,return_exceptions=True)
+    asyncio.run(run_once())
+
+    assert len(sent)==1
+    method,path,payload=sent[0]
+    assert method=='POST' and path=='/api/service-logs'
+    assert payload['service']=='bot-telegram'
+    assert payload['entries'][0]['level']=='WARNING'
+    assert 'недоступен' in payload['entries'][0]['message']
+    assert payload['entries'][0]['timestamp'].endswith('+00:00')
+    assert len(bot_main._log_ship_lines)==0
+
+
+def test_project_log_shipping_keeps_lines_when_api_is_down(monkeypatch):
+    import main as bot_main
+    async def failing_api(method,path,**kwargs):
+        raise RuntimeError('API недоступен')
+    monkeypatch.setattr(bot_main,'api',failing_api)
+    monkeypatch.setattr(bot_main,'LOG_SHIP_INTERVAL_SECONDS',.01)
+    bot_main._log_ship_lines.clear()
+    bot_main.log.error('Telegram polling session stopped')
+
+    async def run_once():
+        task=asyncio.create_task(bot_main.log_ship_worker())
+        await asyncio.sleep(.05)
+        task.cancel()
+        await asyncio.gather(task,return_exceptions=True)
+    asyncio.run(run_once())
+
+    assert len(bot_main._log_ship_lines)==1
+
+
+def test_project_log_handler_skips_service_noise_but_keeps_warnings():
+    """Отправка журнала не должна порождать новые строки (поток зациклится)."""
+    import logging
+
+    import main as bot_main
+    handler=bot_main._ProjectLogHandler(); handler.setFormatter(logging.Formatter('%(name)s: %(message)s'))
+    noisy=logging.getLogger('httpx'); serious=logging.getLogger('zmk.telegram.noise-test')
+    for logger in (noisy,serious): logger.addHandler(handler); logger.setLevel(logging.INFO)
+    bot_main._log_ship_lines.clear()
+    try:
+        noisy.info('HTTP Request: POST http://api:8000/api/service-logs "HTTP/1.1 202 Accepted"')
+        noisy.warning('HTTP Request failed: connection reset by peer')
+        serious.info('Опрос Telegram запущен')
+    finally:
+        for logger in (noisy,serious): logger.removeHandler(handler)
+    messages=[entry[2] for entry in bot_main._log_ship_lines]
+    assert not any('202 Accepted' in message for message in messages)
+    assert any('connection reset by peer' in message for message in messages)
+    assert any('Опрос Telegram запущен' in message for message in messages)
+    bot_main._log_ship_lines.clear()

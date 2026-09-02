@@ -68,3 +68,52 @@ def test_bot_api_token_reads_private_mount(tmp_path, monkeypatch):
     monkeypatch.setenv('ZMK_BOT_API_TOKEN_FILE',str(token_file))
     import main as bot_main
     assert bot_main._bot_api_token()=='service-token'
+
+
+def test_project_log_shipping_posts_buffered_records(monkeypatch):
+    """Строки бота уходят в единый журнал проекта (вкладка «Логи»)."""
+    import main as bot_main
+    sent=[]
+    async def fake_api(method,path,**kwargs):
+        sent.append((method,path,kwargs['json'])); return {'accepted':1,'dropped':0}
+    monkeypatch.setattr(bot_main,'api',fake_api)
+    monkeypatch.setattr(bot_main,'LOG_SHIP_INTERVAL_SECONDS',.01)
+    bot_main._log_ship_lines.clear()
+    bot_main.log.error('MAX polling session stopped')
+
+    async def run_once():
+        task=asyncio.create_task(bot_main.log_ship_worker())
+        await asyncio.sleep(.05)
+        task.cancel()
+        await asyncio.gather(task,return_exceptions=True)
+    asyncio.run(run_once())
+
+    assert len(sent)==1
+    method,path,payload=sent[0]
+    assert method=='POST' and path=='/api/service-logs'
+    assert payload['service']=='bot-max'
+    assert payload['entries'][0]['level']=='ERROR'
+    assert 'MAX polling session stopped' in payload['entries'][0]['message']
+    assert len(bot_main._log_ship_lines)==0
+
+
+def test_project_log_handler_skips_service_noise_but_keeps_warnings():
+    """Отправка журнала не должна порождать новые строки (поток зациклится)."""
+    import logging
+
+    import main as bot_main
+    handler=bot_main._ProjectLogHandler(); handler.setFormatter(logging.Formatter('%(name)s: %(message)s'))
+    noisy=logging.getLogger('httpx'); serious=logging.getLogger('zmk.max.noise-test')
+    for logger in (noisy,serious): logger.addHandler(handler); logger.setLevel(logging.INFO)
+    bot_main._log_ship_lines.clear()
+    try:
+        noisy.info('HTTP Request: POST http://api:8000/api/service-logs "HTTP/1.1 202 Accepted"')
+        noisy.error('HTTP Request failed: connection reset by peer')
+        serious.info('Опрос MAX запущен')
+    finally:
+        for logger in (noisy,serious): logger.removeHandler(handler)
+    messages=[entry[2] for entry in bot_main._log_ship_lines]
+    assert not any('202 Accepted' in message for message in messages)
+    assert any('connection reset by peer' in message for message in messages)
+    assert any('Опрос MAX запущен' in message for message in messages)
+    bot_main._log_ship_lines.clear()

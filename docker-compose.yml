@@ -238,10 +238,15 @@ services:
     volumes:
     - .:/workspace
     - /var/run/docker.sock:/var/run/docker.sock
+    # Тот же приватный том, что у ботов: сервисный токен для отправки журнала.
+    - bot-token-data:/bot-secrets:ro
     environment:
       UPDATE_ROOT: /workspace
       ZMK_UPDATE_TOKEN: ${ZMK_UPDATE_TOKEN:-}
       ZMK_UPDATE_REPO: ${ZMK_UPDATE_REPO:-danilka-revin/zmk-videoanalytics}
+      # Вкладка «Логи»: updater зеркалит свой журнал в API тем же токеном.
+      ZMK_API_URL: http://api:8000
+      ZMK_BOT_API_TOKEN_FILE: /bot-secrets/.api-token
     restart: unless-stopped
     healthcheck:
       test:
