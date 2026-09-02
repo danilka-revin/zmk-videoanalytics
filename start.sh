@@ -24,6 +24,40 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }
+
+# Select the Git branch before Docker starts. This is intentionally handled by
+# the launcher (not inside a container), so it also works while the old stack
+# is running: the selected branch is checked out and the stack is recreated.
+select_install_branch(){
+  local requested="${ZMK_INSTALL_BRANCH:-}" choice branch choose=0
+  if [[ "${1:-}" == "--branch" ]]; then
+    [[ -n "${2:-}" ]] || fail "Использование: ./start.sh --branch <ветка>"
+    requested="$2"
+    shift 2
+  elif [[ "${1:-}" == "--choose-branch" ]]; then
+    requested=""
+    choose=1
+    shift
+  fi
+  [[ -d .git ]] || { [[ -z "$requested" ]] || fail "Для выбора ветки нужен Git-клон проекта"; return 0; }
+  if [[ -z "$requested" && ( "$choose" == "1" || "${ZMK_CHOOSE_BRANCH:-0}" == "1" ) ]]; then
+    echo "Доступные ветки проекта:"
+    mapfile -t branches < <(git ls-remote --heads origin 2>/dev/null | sed -E 's#.*refs/heads/##' | sort -V)
+    ((${#branches[@]})) || fail "Не удалось получить список веток origin"
+    local i=1; for branch in "${branches[@]}"; do echo "  $i) $branch"; ((i++)); done
+    read -r -p "Выберите номер или введите имя ветки [main]: " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && ((choice>=1 && choice<=${#branches[@]})); then requested="${branches[$((choice-1))]}"
+    elif [[ -n "$choice" ]]; then requested="$choice"; else requested="main"; fi
+  fi
+  [[ -z "$requested" ]] && return 0
+  git fetch --quiet origin "$requested" || fail "Ветка '$requested' не найдена в origin"
+  if ! git diff --quiet || ! git diff --cached --quiet; then fail "Есть незакоммиченные изменения. Сохраните их перед сменой ветки."; fi
+  git checkout -q -B "$requested" "origin/$requested" || fail "Не удалось переключиться на ветку '$requested'"
+  echo "[start] Установлена ветка: $requested"
+}
+
+# --branch/--choose-branch are consumed here before normal startup logic.
+select_install_branch "${1:-}" "${2:-}"
 run_privileged(){
   if [[ "${EUID}" -eq 0 ]]; then "$@"; else command -v sudo >/dev/null 2>&1 || fail "sudo is required to start Docker"; sudo "$@"; fi
 }
@@ -37,16 +71,11 @@ if [[ -d .git ]]; then
   git config pull.rebase false >/dev/null 2>&1 || true
   git config pull.ff only >/dev/null 2>&1 || true
 fi
-# Release updater is intentionally skipped on feature branches. Otherwise a
-# one-command launch re-checkouts main and silently removes the current
-# go2rtc/WebRTC build. main is the only channel auto-update may rewrite.
+# Upgrade the selected branch itself. Release archives are used only on main.
 if [[ "${1:-}" != "--no-update" && -z "${ZMK_NO_AUTO_UPDATE:-}" && -f installers/auto-update.sh ]]; then
   if [[ -d .git ]]; then git config --global --add safe.directory "$(pwd)" >/dev/null 2>&1 || true; fi
-  if [[ -d .git ]] && git branch --show-current 2>/dev/null | grep -qvE '^(main|master)$'; then
-    echo "[start] Feature branch active; release auto-update is skipped to preserve this build."
-  else
+  ZMK_UPDATE_BRANCH="${ZMK_UPDATE_BRANCH:-$(git branch --show-current 2>/dev/null || true)}" \
     bash installers/auto-update.sh start.sh || echo "[start] auto-update check skipped."
-  fi
 fi
 
 # required project files

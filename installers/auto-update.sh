@@ -122,6 +122,23 @@ zmk_apply_update(){
 
 zmk_check_and_update(){
   local root="$1" relaunch="$2"
+  local branch="${ZMK_UPDATE_BRANCH:-$(git -C "$root" branch --show-current 2>/dev/null || true)}"
+  # Branch update channel: upgrade the currently selected branch instead of
+  # consulting GitHub releases (which always represent main).
+  if [[ -n "$branch" && "$branch" != "main" && "$branch" != "master" ]]; then
+    echo "[auto-update] Branch channel: ${branch}"
+    if ! git -C "$root" fetch --quiet origin "$branch"; then
+      echo "[auto-update] Could not fetch branch ${branch}; skipping update."
+      return 0
+    fi
+    if git -C "$root" diff --quiet && git -C "$root" diff --cached --quiet; then
+      git -C "$root" checkout -q -B "$branch" "origin/$branch" || { echo "[auto-update] Branch checkout failed."; return 0; }
+      echo "[auto-update] Branch ${branch} updated. Relaunching ${relaunch}..."
+      exec env ZMK_RELAUNCHED_AFTER_UPDATE=1 bash "$root/${relaunch}"
+    fi
+    echo "[auto-update] Local changes detected; branch update skipped."
+    return 0
+  fi
   local cur latest wd
   if [[ -d "$root/.git" ]]; then zmk_ensure_safe_git "$root"; fi
   cur=$(zmk_current_version "$root")
