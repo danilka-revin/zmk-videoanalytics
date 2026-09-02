@@ -1847,47 +1847,22 @@ def camera_mjpeg(camera_id:str):
     if not row: raise HTTPException(404,"Камера не найдена")
     if not row[0]: raise HTTPException(409,"Аналитика камеры отключена")
     # v2.16.3: local-first MJPEG. The backend prefers the worker's in-memory
-    # live JPEG cache (always maintained by the inference worker), falls back to
-    # go2rtc only when that cache is stale/empty, then serves the last snapshot.
-    # This makes MJPEG mode show real video instead of a black card on Windows
-    # desktops where go2rtc/WebRTC ports are blocked or temporarily unavailable.
+    # live JPEG cache (maintained by the inference worker), falling back to
+    # go2rtc only when that cache is stale/empty. Never serve a persisted still
+    # image from a live endpoint: MJPEG means real multipart video only.
 
     def local_generate():
         sequence=-1
-        idle=0
         while True:
             with _live_frames_lock:
                 item=_live_frames.get(camera_id)
             if item and item[0]!=sequence:
                 sequence,_,image=item
-                idle=0
                 frame=_mjpeg_frame(image)
                 if frame:
                     yield frame
-            else:
-                idle+=1
-                # Keep the browser alive: after ~1s without a real live frame,
-                # stream the last persisted snapshot (a still image) instead of
-                # leaving a persistent black multipart stream.
-                if idle>=50:  # 50 * 0.02 = 1 sec
-                    try:
-                        snap_path = snapshot_path_for(camera_id)
-                    except (HTTPException, OSError, ValueError):
-                        snap_path = None
-                    if snap_path is not None and snap_path.exists():
-                        try:
-                            img = snap_path.read_bytes()
-                        except OSError:
-                            img = b""
-                        frame = _mjpeg_frame(img)
-                        if frame:
-                            yield frame
-                            idle=0
-                            time.sleep(0.5)
-                            continue
-                    # Periodically reset so the watchdog never gives up entirely.
-                    if idle>1500:
-                        idle=0
+            # Never turn a live endpoint into a still-image endpoint. When the
+            # worker reconnects, this remains an empty multipart stream.
             time.sleep(.02)
 
     # Prefer a fresh worker frame; if present, skip go2rtc entirely (fewer
@@ -1897,7 +1872,8 @@ def camera_mjpeg(camera_id:str):
     if current and time.time()-current[1] < 2.5:
         return StreamingResponse(local_generate(),media_type="multipart/x-mixed-replace; boundary=frame",headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
 
-    # No fresh worker frame: try go2rtc before giving the browser only snapshots.
+    # No fresh worker frame: try the direct go2rtc MJPEG relay before waiting
+    # for the worker to publish a real frame.
     if GO2RTC_ENABLED and GO2RTC_API_URL:
         for candidate_name in (f"zmk-{camera_id}", camera_id):
             try:

@@ -100,19 +100,19 @@ function EventEvidenceModal({event,close}:{event:Event,close:()=>void}){const[sr
 function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'}:{id:string;status:string;age:number|null;telemetryStale?:boolean;lastError?:string;previewMode?:'mse'|'mjpeg'}){
  const videoRef=useRef<HTMLVideoElement|null>(null);
  const hlsRef=useRef<any>(null);
- const mseRef=useRef<{ws:WebSocket|null,ms:MediaSource|null,sb:SourceBuffer|null,queue:Uint8Array[],closing:boolean}>({ws:null,ms:null,sb:null,queue:[],closing:false});
- const [snapshotSrc,setSnapshotSrc]=useState('');
+ const mseRef=useRef<{ws:WebSocket|null,ms:MediaSource|null,sb:SourceBuffer|null,queue:Uint8Array[],closing:boolean,objectUrl:string}>({ws:null,ms:null,sb:null,queue:[],closing:false,objectUrl:''});
+ const [mjpegSrc,setMjpegSrc]=useState('');
  const [live,setLive]=useState(false);
- const [transport,setTransport]=useState<'mse'|'hls'|'mjpeg'|'snapshot'|'waiting'|'webrtc'>('waiting');
+ // A preview is always a real stream: H264 over MSE/HLS or multipart MJPEG.
+ const [transport,setTransport]=useState<'mse'|'hls'|'mjpeg'|'waiting'>('waiting');
  const [boxes,setBoxes]=useState<{bbox:number[],label:string,semantic:string,confidence:number}[]>([]);
  const [shape,setShape]=useState<[number,number]|null>(null);
  const [retry,setRetry]=useState(0);
  const apiKey=localStorage.getItem('zmk_api_key')||'';
- const snapshotRef=useRef<number>(0);
  const visualRef=useRef<number>(0);
  const retryRef=useRef<number>(0);
  const mseRetryRef=useRef<number>(0);
- const hlsRetryRef=useRef<number>(0);const webrtcRef=useRef<RTCPeerConnection|null>(null);
+ const hlsRetryRef=useRef<number>(0);
  const mjpegRetryRef=useRef<number>(0);
  const mjpegAbortRef=useRef<AbortController|null>(null);
  const mjpegTimeoutRef=useRef<number>(0);
@@ -120,26 +120,6 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
  useEffect(()=>{
   let cancelled=false;
   const controller=new AbortController();
-  let currentBlob='';
-  const replaceSnap=(next:string)=>{
-   if(cancelled){try{URL.revokeObjectURL(next)}catch{};return}
-   setSnapshotSrc(old=>{
-    if(old&&old!==next&&old.startsWith('blob:'))try{URL.revokeObjectURL(old)}catch{};
-    return next;
-   });
-   currentBlob=next;
-  };
-  const fetchSnapshot=async()=>{
-   try{
-    const headers:Record<string,string>={};
-    if(apiKey)headers['X-API-Key']=apiKey;
-    const r=await fetch(`/api/cameras/${id}/snapshot?t=${Date.now()}`,{headers,signal:controller.signal,cache:'no-store'});
-    if(!r.ok)return;
-    const blob=await r.blob();
-    if(blob.size<100)return;
-    replaceSnap(URL.createObjectURL(blob));
-   }catch{}
-  };
   const fetchVisual=async()=>{
    try{
     const headers:Record<string,string>={};
@@ -172,6 +152,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
     }catch{}
     m.ms=null;
    }
+   if(m.objectUrl){try{URL.revokeObjectURL(m.objectUrl)}catch{};m.objectUrl=''}
    m.queue=[];
    m.closing=false;
    if(videoRef.current){
@@ -186,14 +167,6 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
     try{videoRef.current.pause()}catch{}
     // don't clear src immediately if MSE will reuse, but for HLS cleanup we clear
    }
-  };
-  const beginSnapshot=()=>{
-   if(cancelled)return;
-   cleanupMSE();cleanupHLS();
-   setTransport('snapshot');setLive(false);
-   void fetchSnapshot();
-   if(snapshotRef.current)clearInterval(snapshotRef.current);
-   snapshotRef.current=window.setInterval(fetchSnapshot,2000) as unknown as number;
   };
   const beginHls=async(srcNames?:string[])=>{
    if(cancelled)return;
@@ -232,7 +205,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
        if(data&&data.fatal){
         try{hls.destroy()}catch{};hlsRef.current=null;
         if(streamName===names[names.length-1]){
-         hlsRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginSnapshot()},800) as unknown as number;
+         hlsRetryRef.current=window.setTimeout(()=>{if(!cancelled){setLive(false);setTransport('hls')}},800) as unknown as number;
         }
        }
       });
@@ -240,7 +213,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
       hlsRetryRef.current=window.setTimeout(()=>{
        if(cancelled)return;
        if(!live&&streamName===names[names.length-1]){
-        try{hls.destroy()}catch{};hlsRef.current=null;beginSnapshot();
+        try{hls.destroy()}catch{};hlsRef.current=null;setLive(false);setTransport('hls');
        }
       },5000) as unknown as number;
       return;
@@ -253,14 +226,13 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
      continue;
     }
    }
-   beginSnapshot();
+   setLive(false);setTransport('hls');
   };
   const beginMSE=async(srcNames?:string[])=>{
    if(cancelled)return;
    cleanupHLS();
    if(mseRetryRef.current)clearTimeout(mseRetryRef.current);
    if(hlsRetryRef.current)clearTimeout(hlsRetryRef.current);
-   if(snapshotRef.current){clearInterval(snapshotRef.current);snapshotRef.current=0}
    setTransport('mse');
    const names=srcNames||[`zmk-${id}`,id];
    // Prefer MediaSource
@@ -361,7 +333,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
            mseRef.current.ms=ms;
            mseRef.current.queue=queue;
            if(videoRef.current){
-            videoRef.current.src=URL.createObjectURL(ms);
+            mseRef.current.objectUrl=URL.createObjectURL(ms);videoRef.current.src=mseRef.current.objectUrl;
             ms.addEventListener('sourceopen',()=>{
              if(!ms||ms.readyState!=='open')return;
              // try create buffer now
@@ -411,7 +383,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
         mseRef.current.ms=ms;
         mseRef.current.queue=queue;
         if(videoRef.current){
-         videoRef.current.src=URL.createObjectURL(ms);
+         mseRef.current.objectUrl=URL.createObjectURL(ms);videoRef.current.src=mseRef.current.objectUrl;
          ms.addEventListener('sourceopen',()=>{
           if(!ms||ms.readyState!=='open')return;
           if(!sb){
@@ -473,12 +445,14 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
   const beginMjpeg=()=>{
    if(cancelled)return;
    cleanupMSE();cleanupHLS();
-   if(snapshotRef.current){clearInterval(snapshotRef.current);snapshotRef.current=0}
    if(mseRetryRef.current)clearTimeout(mseRetryRef.current);
    if(hlsRetryRef.current)clearTimeout(hlsRetryRef.current);
    if(mjpegRetryRef.current)clearTimeout(mjpegRetryRef.current);
    if(mjpegTimeoutRef.current)clearTimeout(mjpegTimeoutRef.current);
    if(mjpegAbortRef.current){try{mjpegAbortRef.current.abort()}catch{};mjpegAbortRef.current=null}
+   // Do not keep showing the previous frame while a new MJPEG stream opens.
+   setMjpegSrc(old=>{if(old&&old.startsWith('blob:'))try{URL.revokeObjectURL(old)}catch{};return ''});
+   setLive(false);
    setTransport('mjpeg');
    const abort=new AbortController();
    mjpegAbortRef.current=abort;
@@ -499,7 +473,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
     if(now-lastEmit<40)return; // cap at 25 FPS; avoid excessive blob-URL churn
     lastEmit=now;
     const url=URL.createObjectURL(new Blob([jpeg as unknown as BlobPart],{type:'image/jpeg'}));
-    setSnapshotSrc(old=>{
+    setMjpegSrc(old=>{
      if(old&&old!==url&&old.startsWith('blob:'))try{URL.revokeObjectURL(old)}catch{};
      return url;
     });
@@ -527,23 +501,23 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
      }
     }catch{}
     if(cancelled)return;
-    if(!gotFrame){beginSnapshot();return}
+    if(!gotFrame){
+     mjpegRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginMjpeg()},900) as unknown as number;
+     return;
+    }
     mjpegRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginMjpeg()},900) as unknown as number;
    };
    void pump();
-   // Hard anti-black-screen watchdog: if the MJPEG endpoint never delivers a
-   // single JPEG, stop the hanging fetch and switch to snapshot polling instead
-   // of leaving a black/img 0-pixel camera card on screen.
+   // If the endpoint is temporarily empty, retry the selected MJPEG stream
+   // instead of replacing it with a still image.
    mjpegTimeoutRef.current=window.setTimeout(()=>{
     if(cancelled||gotFrame)return;
     try{abort.abort()}catch{}
-    mjpegRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginSnapshot()},50) as unknown as number;
+    mjpegRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginMjpeg()},900) as unknown as number;
    },2500) as unknown as number;
   };
 
-  const beginWebrtc=async()=>{if(cancelled||!window.RTCPeerConnection)return false;try{const pc=new RTCPeerConnection({iceServers:[]});webrtcRef.current=pc;pc.addTransceiver('video',{direction:'recvonly'});pc.ontrack=e=>{if(videoRef.current&&e.streams[0]){videoRef.current.srcObject=e.streams[0];setLive(true);setTransport('webrtc');void videoRef.current.play().catch(()=>{})}};const offer=await pc.createOffer();await pc.setLocalDescription(offer);await new Promise<void>(resolve=>{if(pc.iceGatheringState==='complete')resolve();else pc.onicecandidate=e=>{if(!e.candidate)resolve()}});const signalController=new AbortController();const signalTimeout=window.setTimeout(()=>signalController.abort(),5000);const response=await fetch(`/rtc/api/webrtc?src=${encodeURIComponent(`zmk-${id}`)}`,{method:'POST',headers:{'Content-Type':'application/sdp'},body:pc.localDescription?.sdp||'',signal:signalController.signal});clearTimeout(signalTimeout);if(!response.ok)throw new Error('WebRTC signaling failed');const answer=await response.text();await pc.setRemoteDescription({type:'answer',sdp:answer});return true}catch{try{webrtcRef.current?.close()}catch{}webrtcRef.current=null;return false}};
   // start flow
-  void fetchSnapshot();
   void fetchVisual();
   visualRef.current=window.setInterval(fetchVisual,350) as unknown as number;
 
@@ -555,7 +529,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
    // relay; MJPEG is used only when selected explicitly in camera settings.
    void beginMSE();
   }else{
-   beginSnapshot();
+   setLive(false);setTransport('waiting');
   }
 
   // periodic health check - if not live and status online, retry transport
@@ -571,7 +545,6 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
   return()=>{
    cancelled=true;
    controller.abort();
-   if(snapshotRef.current)clearInterval(snapshotRef.current);
    if(visualRef.current)clearInterval(visualRef.current);
    if(retryRef.current)clearInterval(retryRef.current);
    if(mseRetryRef.current)clearTimeout(mseRetryRef.current);
@@ -579,28 +552,22 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
    if(mjpegRetryRef.current)clearTimeout(mjpegRetryRef.current);
    if(mjpegTimeoutRef.current)clearTimeout(mjpegTimeoutRef.current);
    if(mjpegAbortRef.current){try{mjpegAbortRef.current.abort()}catch{}}
-   cleanupMSE();cleanupHLS();try{webrtcRef.current?.close()}catch{}webrtcRef.current=null;
-   if(currentBlob&&currentBlob.startsWith('blob:'))try{URL.revokeObjectURL(currentBlob)}catch{}
+   cleanupMSE();cleanupHLS();
   };
  },[id,status,apiKey,previewMode]);
 
- const ageText=age===null?null:(age<5?'только что':(age<60?`${age} сек назад`:`${Math.floor(age/60)} мин назад`));
  const renderOverlay=()=>{if(!boxes.length||!shape)return null;const [h,w]=shape;if(!h||!w)return null;return <div className="camera-overlay">{boxes.map((b,i)=>{const [x1,y1,x2,y2]=b.bbox;const left=(x1/w)*100;const top=(y1/h)*100;const width=Math.max(1,((x2-x1)/w)*100);const height=Math.max(1,((y2-y1)/h)*100);const isNoHelmet=b.semantic==='no_helmet';const isNoVest=b.semantic==='no_vest';const isPerson=b.semantic==='person';const color=isNoHelmet||isNoVest?'#ff3b30':isPerson?'#007aff':b.semantic==='helmet'?'#34c759':b.semantic==='vest'?'#af52de':'#ff9500';const label=b.semantic==='no_helmet'?'NO HELMET':b.semantic==='no_vest'?'NO VEST':b.semantic.toUpperCase();return <div key={i} className="camera-box" style={{left:`${left}%`,top:`${top}%`,width:`${width}%`,height:`${height}%`,borderColor:color}}><span style={{background:color}}>{label} {Math.round(b.confidence*100)}%</span></div>})}</div>};
 
- const label=transport==='webrtc'?(live?'● WebRTC H264':'● WebRTC connecting…'):transport==='mse'?(live?'● MSE H264 25-60 FPS':'● MSE connecting…'):transport==='hls'?(live?'● HLS H264':'● HLS…'):transport==='mjpeg'?(live?'● MJPEG':'● MJPEG…'):transport==='snapshot'?'● SNAPSHOT':`retry ${retry}`;
+ const label=transport==='mse'?(live?'● MSE H264 25-60 FPS':'● MSE connecting…'):transport==='hls'?(live?'● HLS H264':'● HLS…'):transport==='mjpeg'?(live?'● MJPEG':'● MJPEG…'):`retry ${retry}`;
 
- if(transport==='mjpeg'&&snapshotSrc){
-  return <div className="camera-feed-wrap"><img className="camera-snapshot" src={snapshotSrc} alt={`Поток ${id}`} />{renderOverlay()}<em className="frame-age">{live?label:'● MJPEG…'}</em></div>;
+ if(transport==='mjpeg'&&mjpegSrc){
+  return <div className="camera-feed-wrap"><img className="camera-snapshot" src={mjpegSrc} alt={`Поток ${id}`} />{renderOverlay()}<em className="frame-age">{live?label:'● MJPEG…'}</em></div>;
  }
- if(transport==='mse'||transport==='hls'||transport==='webrtc'){
+ if(transport==='mse'||transport==='hls'){
   return <div className="camera-feed-wrap">
-    {snapshotSrc&&!live&&<img className="camera-snapshot" src={snapshotSrc} alt={`Поток ${id}`} style={{position:'absolute',inset:0,width:'100%',height:'100%',objectFit:'cover'}} />}
     <video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline preload="auto" aria-label={`Поток камеры ${id}`} style={{position:'relative',zIndex:1,background: live?'transparent':'transparent', opacity: live?1:0.01}} />
-    {renderOverlay()}<em className="frame-age" style={{zIndex:2}}>{label}{snapshotSrc&&!live?' · SNAPSHOT fallback':''}</em>
+    {renderOverlay()}<em className="frame-age" style={{zIndex:2}}>{label}</em>
   </div>;
- }
- if(transport==='snapshot'&&snapshotSrc){
-  return <div className="camera-feed-wrap"><img className="camera-snapshot" src={snapshotSrc} alt={`Поток ${id}`} />{renderOverlay()}<em className="frame-age">{live?label:(ageText||label)}</em></div>;
  }
  return <div className="feed-empty">{telemetryStale?<><WifiOff size={20}/><span>Нет телеметрии</span><small>worker давно не подтверждал поток</small></>:status==='connecting'?<><RefreshCw className="spin" size={20}/><span>Подключение</span><small>{lastError||'go2rtc открывает RTSP'}</small></>:status==='offline'||status==='error'||status==='unknown'?<><WifiOff size={20}/><span>Поток не подключён</span><small>{lastError||'RTSP недоступен'}</small></>:<><Camera size={20}/><span>Кадр не получен</span><small>{lastError||'Нет снимка от worker'}</small></>}</div>;
 }
