@@ -71,16 +71,11 @@ if [[ -d .git ]]; then
   git config pull.rebase false >/dev/null 2>&1 || true
   git config pull.ff only >/dev/null 2>&1 || true
 fi
-# Release updater is intentionally skipped on feature branches. Otherwise a
-# one-command launch re-checkouts main and silently removes the current
-# go2rtc/WebRTC build. main is the only channel auto-update may rewrite.
+# Upgrade the selected branch itself. Release archives are used only on main.
 if [[ "${1:-}" != "--no-update" && -z "${ZMK_NO_AUTO_UPDATE:-}" && -f installers/auto-update.sh ]]; then
   if [[ -d .git ]]; then git config --global --add safe.directory "$(pwd)" >/dev/null 2>&1 || true; fi
-  if [[ -d .git ]] && git branch --show-current 2>/dev/null | grep -qvE '^(main|master)$'; then
-    echo "[start] Feature branch active; release auto-update is skipped to preserve this build."
-  else
+  ZMK_UPDATE_BRANCH="${ZMK_UPDATE_BRANCH:-$(git branch --show-current 2>/dev/null || true)}" \
     bash installers/auto-update.sh start.sh || echo "[start] auto-update check skipped."
-  fi
 fi
 
 # required project files
