@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import io
 import json
+import logging
 import os
 import re
 import secrets
@@ -21,6 +22,7 @@ import threading
 import time
 import uuid
 import zipfile
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
@@ -38,10 +40,10 @@ import yaml
 from fastapi import Body, FastAPI, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.utils import get_openapi
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-APP_VERSION = "2.16.4"
+APP_VERSION = "2.17.0"
 TZ = timezone(timedelta(hours=7))
 CAMERA_TELEMETRY_STALE_SECONDS = 30
 HIGH_FPS_MODE = os.getenv("CAMERA_HIGH_FPS_MODE", "true").strip().lower() not in {"0","false","no","off"}
@@ -226,6 +228,216 @@ def timestamp_age_seconds(value: str | None) -> int | None:
         return max(0,int((datetime.now(TZ)-stamp.astimezone(TZ)).total_seconds()))
     except (TypeError,ValueError):
         return None
+# ---------------------------------------------------------------------------
+# Единый журнал проекта (Web → вкладка «Логи»)
+#
+# Подсистемы API пишут в таблицу logs, а отдельные процессы (inference worker,
+# training worker, боты, updater) зеркалят свой stdout/stderr в
+# /api/service-logs. Процесс API дополнительно держит кольцевой буфер в памяти
+# для строк, которые не нужно хранить вечно: uvicorn, необработанные исключения
+# и неуспешные запросы. Так баг можно разобрать из браузера, не запуская
+# `docker compose logs` на сервере.
+# ---------------------------------------------------------------------------
+LOG_LEVELS=("DEBUG","INFO","WARNING","ERROR","CRITICAL")
+# logs.service -> (понятное имя источника, компонент проекта)
+LOG_SOURCE_LABELS:dict[str,tuple[str,str]]={
+    "api":("API · ядро","api"),
+    "auth":("API · доступ","api"),
+    "camera_manager":("API · камеры","api"),
+    "event_manager":("API · события","api"),
+    "model_manager":("API · модели","api"),
+    "inference_gateway":("API · приём детекций","api"),
+    "integration":("API · интеграции","api"),
+    "admin":("API · администрирование","api"),
+    "bot_admin":("API · боты","api"),
+    "inference":("Inference worker","inference"),
+    "training":("Training worker","training"),
+    "bot-telegram":("Telegram бот","bot-telegram"),
+    "bot-max":("MAX бот","bot-max"),
+    "updater":("Updater","updater"),
+    "go2rtc":("go2rtc","go2rtc"),
+}
+# Отдельные процессы, которым разрешено присылать собственные строки журнала.
+LOG_SHIPPING_SERVICES=frozenset({"inference","training","bot-telegram","bot-max","updater","go2rtc"})
+# Полный список компонентов: молчащие тоже видны во вкладке «Логи».
+LOG_PROJECT_COMPONENTS:tuple[str,...]=tuple(dict.fromkeys(component for _,component in LOG_SOURCE_LABELS.values()))
+try: RUNTIME_LOG_LIMIT=max(200,min(20_000,int(os.getenv("PROJECT_LOG_RUNTIME_LIMIT","2000"))))
+except ValueError: RUNTIME_LOG_LIMIT=2000
+try: SERVICE_LOG_RATE_PER_MINUTE=max(60,min(20_000,int(os.getenv("PROJECT_LOG_SHIP_RATE","1200"))))
+except ValueError: SERVICE_LOG_RATE_PER_MINUTE=1200
+# Зеркалирование stdout заметно увеличивает объём журнала, поэтому кроме
+# retention_days держим жёсткий потолок по числу строк.
+try: LOG_TABLE_MAX_ROWS=max(1_000,min(5_000_000,int(os.getenv("PROJECT_LOG_MAX_ROWS","200000"))))
+except ValueError: LOG_TABLE_MAX_ROWS=200_000
+_logs_prune_at=0.0
+PROJECT_LOG_WINDOW_CAP=4000
+_runtime_logs:deque[dict[str,Any]]=deque(maxlen=RUNTIME_LOG_LIMIT)
+_runtime_log_lock=threading.Lock()
+_runtime_log_seq=0
+_service_log_buckets:dict[str,list[float]]={}
+_failed_request_seen:dict[str,float]={}
+
+def normalize_log_level(value:Any)->str:
+    """Map any producer spelling onto the five levels the UI understands."""
+    level=str(value or "").strip().upper()
+    if level in {"WARN","WARNING"}: return "WARNING"
+    if level in {"ERR","ERROR"}: return "ERROR"
+    if level in {"FATAL","CRIT","CRITICAL"}: return "CRITICAL"
+    return level if level in LOG_LEVELS else "INFO"
+
+def clean_log_message(value:Any)->str:
+    """Keep readable text (multi-line tracebacks included), blank out control noise."""
+    text="".join(ch if ch in "\n\t" or ch.isprintable() else " " for ch in str(value or ""))
+    return text.strip()[:2000]
+
+def normalize_log_timestamp(value:Any)->str:
+    """Workers ship UTC; the journal is stored in the operator timezone."""
+    text=str(value or "").strip()
+    if not text: return now_iso()
+    try: stamp=datetime.fromisoformat(text.replace("Z","+00:00"))
+    except ValueError: return now_iso()
+    if stamp.tzinfo is None: stamp=stamp.replace(tzinfo=timezone.utc)
+    return stamp.astimezone(TZ).isoformat(timespec="seconds")
+
+def log_source_label(service:str)->str: return LOG_SOURCE_LABELS.get(service,(service or "unknown",service or "unknown"))[0]
+def log_component(service:str)->str: return LOG_SOURCE_LABELS.get(service,(service or "unknown",service or "unknown"))[1]
+
+def runtime_log(level:Any,message:Any,service:str="api",camera_id:str|None=None)->None:
+    """Append one non-persisted line of this API process to the ring buffer."""
+    clean=clean_log_message(message)
+    if not clean: return
+    global _runtime_log_seq
+    with _runtime_log_lock:
+        _runtime_log_seq+=1
+        _runtime_logs.append({"id":_runtime_log_seq,"timestamp":now_iso(),"level":normalize_log_level(level),"service":service,"message":clean,"camera_id":camera_id or None,"source":"runtime"})
+
+def runtime_log_snapshot()->list[dict[str,Any]]:
+    with _runtime_log_lock: return [dict(item) for item in _runtime_logs]
+
+class _RuntimeLogHandler(logging.Handler):
+    """Mirror python logging (uvicorn, libraries) into the project log."""
+    # Технический шум (каждый HTTP-запрос, служебные события asyncio) только
+    # вытеснил бы из буфера осмысленные строки — такие логгеры не зеркалим.
+    SKIP_LOGGERS=frozenset({"httpx","httpx2","httpcore","multipart","asyncio","urllib3","uvicorn.access"})
+    def emit(self,record:logging.LogRecord)->None:
+        # Служебный шум (каждый HTTP-запрос) ниже WARNING отбрасываем, иначе он
+        # вытеснит из буфера осмысленные строки; предупреждения проходят всегда.
+        if (record.name in self.SKIP_LOGGERS or record.name.split(".",1)[0] in self.SKIP_LOGGERS) and record.levelno<logging.WARNING: return
+        # Одна и та же запись проходит через несколько логгеров (uvicorn.error →
+        # uvicorn → root): помечаем её, чтобы в журнале не было дублей.
+        if getattr(record,"_zmk_project_log",False): return
+        record._zmk_project_log=True
+        try: runtime_log(record.levelname,self.format(record))
+        except Exception: self.handleError(record)  # noqa: BLE001 - logging must never break a request
+
+def install_runtime_log_capture()->None:
+    """Attach the ring-buffer handler once; uvicorn loggers do not propagate."""
+    handler=_RuntimeLogHandler(); handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+    for name in ("","uvicorn","uvicorn.error"):
+        logger=logging.getLogger(name)
+        if any(isinstance(item,_RuntimeLogHandler) for item in logger.handlers): continue
+        logger.addHandler(handler)
+        if logger.level==logging.NOTSET or logger.level>logging.INFO: logger.setLevel(logging.INFO)
+install_runtime_log_capture()
+
+def _log_failed_request(method:str,path:str,status:int)->None:
+    """Keep a deduplicated trace of failing API calls — the usual bug source."""
+    key=f"{method} {path} {status}"; now=time.monotonic()
+    if len(_failed_request_seen)>=500: _failed_request_seen.clear()
+    if now-_failed_request_seen.get(key,0.)<5: return
+    _failed_request_seen[key]=now
+    runtime_log("ERROR" if status>=500 else "WARNING",f"{method} {path} → {status}")
+
+def _json_deny(request:Request,status:int,detail:str,headers:dict[str,str]|None=None)->JSONResponse:
+    """Single place that refuses a request: the reason always reaches «Логи»."""
+    _log_failed_request(request.method,request.url.path,status)
+    return JSONResponse({"detail":detail},status_code=status,headers=headers)
+
+def prune_log_table(con:sqlite3.Connection)->None:
+    """Keep the newest LOG_TABLE_MAX_ROWS lines; checked at most once per 5 min."""
+    global _logs_prune_at
+    now=time.monotonic()
+    if now-_logs_prune_at<300: return
+    _logs_prune_at=now
+    if con.execute("SELECT COUNT(*) FROM logs").fetchone()[0]<=LOG_TABLE_MAX_ROWS: return
+    con.execute("DELETE FROM logs WHERE id<(SELECT MIN(id) FROM (SELECT id FROM logs ORDER BY id DESC LIMIT ?))",(LOG_TABLE_MAX_ROWS,))
+
+def ingest_service_log_entries(service:str,entries:list[dict[str,Any]])->dict[str,int]:
+    """Persist a mirrored batch from another process with a per-service quota."""
+    name=str(service or "").strip().lower()
+    if name not in LOG_SHIPPING_SERVICES: raise HTTPException(422,f"Неизвестный компонент журнала: {service}")
+    now=time.monotonic()
+    bucket=[stamp for stamp in _service_log_buckets.get(name,[]) if now-stamp<60]
+    quota=max(0,SERVICE_LOG_RATE_PER_MINUTE-len(bucket))
+    batch=entries[:quota]; dropped=len(entries)-len(batch)
+    bucket.extend([now]*len(batch)); _service_log_buckets[name]=bucket
+    con=db(); inserted=0
+    try:
+        for raw in batch:
+            message=clean_log_message(raw.get("message",""))
+            if not message: dropped+=1; continue
+            camera_id=str(raw.get("camera_id") or "").strip() or None
+            if camera_id and not _valid_camera_id(camera_id): camera_id=None
+            con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(normalize_log_timestamp(raw.get("timestamp")),normalize_log_level(raw.get("level")),name,message,camera_id))
+            inserted+=1
+        if inserted: prune_log_table(con)
+        con.commit()
+    finally: con.close()
+    return {"service":name,"accepted":inserted,"dropped":dropped}
+
+def project_log_sources(since:str)->list[dict[str,Any]]:
+    """Per-component counters for the period, including silent components."""
+    con=db()
+    try:
+        stored={row[0]:row for row in con.execute("SELECT service,COUNT(*),SUM(CASE WHEN level IN ('ERROR','CRITICAL') THEN 1 ELSE 0 END),MAX(timestamp) FROM logs WHERE timestamp>=? GROUP BY service",(since,)).fetchall()}
+    finally: con.close()
+    counts:dict[str,dict[str,Any]]={}
+    for service,row in stored.items():
+        counts[service]={"entries":int(row[1] or 0),"errors":int(row[2] or 0),"last_timestamp":row[3]}
+    for item in runtime_log_snapshot():
+        if item["timestamp"]<since: continue
+        entry=counts.setdefault(item["service"],{"entries":0,"errors":0,"last_timestamp":""})
+        entry["entries"]+=1
+        if item["level"] in {"ERROR","CRITICAL"}: entry["errors"]+=1
+        entry["last_timestamp"]=max(entry["last_timestamp"] or "",item["timestamp"])
+    known=set(counts)|set(LOG_PROJECT_COMPONENTS)
+    return sorted(({"id":service,"label":log_source_label(service),"component":log_component(service),"entries":data["entries"],"errors":data["errors"],"last_timestamp":data["last_timestamp"] or None,"age_seconds":timestamp_age_seconds(data["last_timestamp"])} for service,data in ((service,counts.get(service,{"entries":0,"errors":0,"last_timestamp":""})) for service in known)),key=lambda item:(-item["entries"],item["id"]))
+
+def query_project_logs(service:str="all",level:str="all",q:str="",camera_id:str|None=None,hours:int=24,limit:int=400)->dict[str,Any]:
+    """Unified, filterable journal: SQLite audit rows + this process' runtime lines."""
+    since=(datetime.now(TZ)-timedelta(hours=hours)).isoformat()
+    wanted={item.strip().lower() for item in str(service or "all").split(",") if item.strip() and item.strip().lower()!="all"}
+    # Уровень можно задать списком: «ERROR,CRITICAL» — обычный запрос оператора.
+    requested_levels={item.strip() for item in str(level or "all").split(",") if item.strip() and item.strip().lower()!="all"}
+    unknown_levels=[item for item in requested_levels if item.upper() not in {*LOG_LEVELS,"WARN","ERR","FATAL","CRIT"}]
+    if unknown_levels: raise HTTPException(422,f"Недопустимый уровень журнала: {','.join(unknown_levels)}")
+    wanted_levels={normalize_log_level(item) for item in requested_levels}
+    term=str(q or "").strip().casefold()
+    con=db()
+    try:
+        sql="SELECT id,timestamp,level,service,message,camera_id FROM logs WHERE timestamp>=?"
+        args:list[Any]=[since]
+        if wanted: sql+=f" AND service IN ({','.join('?'*len(wanted))})"; args.extend(sorted(wanted))
+        if wanted_levels: sql+=f" AND level IN ({','.join('?'*len(wanted_levels))})"; args.extend(sorted(wanted_levels))
+        if camera_id: sql+=" AND camera_id=?"; args.append(camera_id)
+        sql+=" ORDER BY id DESC LIMIT ?"; args.append(PROJECT_LOG_WINDOW_CAP if term else limit)
+        items=[{**dict(row),"source":"db"} for row in con.execute(sql,tuple(args)).fetchall()]
+    finally: con.close()
+    for item in runtime_log_snapshot():
+        if item["timestamp"]<since: continue
+        if wanted and item["service"] not in wanted: continue
+        if wanted_levels and item["level"] not in wanted_levels: continue
+        if camera_id and item["camera_id"]!=camera_id: continue
+        items.append(dict(item))
+    if term: items=[item for item in items if term in str(item["message"]).casefold()]
+    items.sort(key=lambda item:(item["timestamp"],0 if item["source"]=="db" else 1,int(item["id"])),reverse=True)
+    shown=items[:limit]
+    counts={name:0 for name in LOG_LEVELS}
+    for item in items: counts[normalize_log_level(item["level"])]=counts.get(normalize_log_level(item["level"]),0)+1
+    for item in shown:
+        item["level"]=normalize_log_level(item["level"]); item["label"]=log_source_label(item["service"]); item["component"]=log_component(item["service"])
+    return {"generated_at":now_iso(),"filters":{"service":",".join(sorted(wanted)) or "all","level":",".join(sorted(wanted_levels)) or "all","q":str(q or "").strip(),"camera_id":camera_id or None,"hours":hours},"counts":counts,"sources":project_log_sources(since),"items":shown,"matched":len(items),"truncated":len(items)>len(shown)}
+
 def db():
     DB_PATH.parent.mkdir(parents=True,exist_ok=True)
     con = sqlite3.connect(DB_PATH,timeout=10)
@@ -476,6 +688,8 @@ def init_db():
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_severity_ack ON events(severity,acknowledged)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_review_status ON events(review_status,timestamp DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_logs_timestamp_level ON logs(timestamp DESC,level)")
+    # Вкладка «Логи» группирует журнал по компонентам проекта.
+    con.execute("CREATE INDEX IF NOT EXISTS ix_logs_service_timestamp ON logs(service,timestamp DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_training_status ON training_jobs(status,created_at DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_capture_jobs_status ON dataset_capture_jobs(status,created_at DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_auth_sessions_expires ON auth_sessions(expires_at)")
@@ -567,6 +781,8 @@ class AuthRecoveryVerifyIn(AuthRecoveryRequestIn):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # Первая строка единого журнала: сразу видно, что процесс API живой.
+    runtime_log("INFO",f"API {APP_VERSION} запущен (db={DB_PATH.name}, go2rtc={'on' if GO2RTC_ENABLED and GO2RTC_API_URL else 'off'})")
     # Push the configured camera list into go2rtc as soon as the API starts.
     # go2rtc may still be starting; sync is idempotent and is repeated on every
     # camera CRUD operation and on a low-frequency background reconcile.
@@ -580,6 +796,7 @@ async def lifespan(app: FastAPI):
         sync_task = asyncio.create_task(_go2rtc_sync_loop(), name="go2rtc-camera-sync")
     try: yield
     finally:
+        runtime_log("INFO","API останавливается")
         if sync_task is not None and not sync_task.done():
             sync_task.cancel()
         for task in [*list(_training_tasks.values()),*list(_dataset_capture_tasks.values())]: task.cancel()
@@ -643,13 +860,12 @@ async def security_middleware(request: Request, call_next):
     public=path in {"/api/health","/docs","/openapi.json","/redoc"} or not path.startswith("/api/")
     worker_token_ok=bool(WORKER_TOKEN and hmac.compare_digest(request.headers.get("X-Worker-Token",""),WORKER_TOKEN))
     if path.startswith("/api/internal/"):
-        from fastapi.responses import JSONResponse
         # A worker token is auto-provisioned on the shared model-data volume.
         # We only 503 if it could not be provisioned at all (e.g. volume
         # read-only). Otherwise we require it strictly (constant-time).
         if not WORKER_TOKEN:
-            return JSONResponse({"detail":"Worker token could not be provisioned: ensure model-data volume is writable"},status_code=503)
-        if not worker_token_ok: return JSONResponse({"detail":"Invalid worker token"},status_code=401)
+            return _json_deny(request,503,"Worker token could not be provisioned: ensure model-data volume is writable")
+        if not worker_token_ok: return _json_deny(request,401,"Invalid worker token")
     api_key_ok=bool(API_KEY and hmac.compare_digest(request.headers.get("X-API-Key",""),API_KEY))
     telegram_role=telegram_webapp_role(request.headers.get("X-Telegram-Init-Data",""))
     bot_service_ok=bool(BOT_API_TOKEN and hmac.compare_digest(request.headers.get("X-Bot-Service-Token",""),BOT_API_TOKEN))
@@ -657,17 +873,16 @@ async def security_middleware(request: Request, call_next):
     password_session=_auth_session(request) if PASSWORD_AUTH_ENABLED and path.startswith("/api/") else None
     session_ok=bool(password_session)
     request.state.password_session=password_session
-    worker_service_ok=worker_token_ok and path.startswith(("/api/internal/","/api/inference/"))
+    # /api/service-logs is the journal shipping endpoint: the inference worker
+    # authenticates with the worker token, workers/bots with the service token.
+    worker_service_ok=worker_token_ok and path.startswith(("/api/internal/","/api/inference/","/api/service-logs"))
     access_ok=api_key_ok or bool(telegram_role) or bot_service_ok or session_ok or worker_service_ok
     if API_KEY and not public and not auth_public and not access_ok:
-        from fastapi.responses import JSONResponse
-        return JSONResponse({"detail":"Invalid or missing API credentials"},status_code=401,headers={"WWW-Authenticate":"ApiKey"})
+        return _json_deny(request,401,"Invalid or missing API credentials",{"WWW-Authenticate":"ApiKey"})
     if PASSWORD_AUTH_ENABLED and path.startswith("/api/") and not public and not auth_public and not access_ok:
-        from fastapi.responses import JSONResponse
-        return JSONResponse({"detail":"Password authentication required"},status_code=401,headers={"WWW-Authenticate":"Session"})
+        return _json_deny(request,401,"Password authentication required",{"WWW-Authenticate":"Session"})
     if PASSWORD_AUTH_ENABLED and session_ok and not (api_key_ok or telegram_role or bot_service_ok) and _auth_setting("auth_password_must_change","false")=="true" and path.startswith("/api/") and path not in {"/api/auth/status","/api/auth/password","/api/auth/logout"}:
-        from fastapi.responses import JSONResponse
-        return JSONResponse({"detail":"Change the initial password before using the system"},status_code=403)
+        return _json_deny(request,403,"Change the initial password before using the system")
     if telegram_role and not api_key_ok and not bot_service_ok:
         admin_write=path.startswith(("/api/admin/","/api/bots/","/api/training/","/api/settings","/api/models/")) and request.method!="GET"
         admin_read=path.startswith(("/api/admin/","/api/bots/","/api/logs","/api/settings"))
@@ -675,8 +890,7 @@ async def security_middleware(request: Request, call_next):
         viewer_write=telegram_role=="viewer" and request.method!="GET"
         operator_write=telegram_role=="operator" and request.method!="GET" and not (path.startswith("/api/events/") and (path.endswith(("/ack","/reject")) or path in {"/api/events/ack-bulk","/api/events/reject-bulk"}))
         if (telegram_role!="admin" and (admin_write or admin_read)) or (telegram_role=="viewer" and operator_only) or viewer_write or operator_write:
-            from fastapi.responses import JSONResponse
-            return JSONResponse({"detail":"Insufficient Telegram role"},status_code=403)
+            return _json_deny(request,403,"Insufficient Telegram role")
     length=request.headers.get("content-length")
     # Dataset ZIPs and model artifacts are streamed directly to persistent
     # volumes and can be substantially larger than normal JSON API payloads.
@@ -688,23 +902,27 @@ async def security_middleware(request: Request, call_next):
     try: too_large=bool(length and int(length)>cap)
     except ValueError: too_large=True
     if too_large:
-        from fastapi.responses import JSONResponse
-        return JSONResponse({"detail":"Request body too large"},status_code=413)
+        return _json_deny(request,413,"Request body too large")
     if path.startswith(("/api/admin/","/api/inference/")):
         now=time.time(); client_id=request.headers.get("x-real-ip") or (request.client.host if request.client else "unknown"); key=f"{client_id}:{path.split('/')[2]}"
         if len(_rate_buckets)>=10_000 and key not in _rate_buckets:
             for old_key in [k for k,v in _rate_buckets.items() if not v or now-v[-1]>=60]: _rate_buckets.pop(old_key,None)
             if len(_rate_buckets)>=10_000:
-                from fastapi.responses import JSONResponse
-                return JSONResponse({"detail":"Rate limiter capacity exceeded"},status_code=429,headers={"Retry-After":"60"})
+                return _json_deny(request,429,"Rate limiter capacity exceeded",{"Retry-After":"60"})
         bucket=[x for x in _rate_buckets.get(key,[]) if now-x<60]
         if len(bucket)>=RATE_LIMIT_PER_MINUTE:
-            from fastapi.responses import JSONResponse
-            return JSONResponse({"detail":"Rate limit exceeded"},status_code=429,headers={"Retry-After":"60"})
+            return _json_deny(request,429,"Rate limit exceeded",{"Retry-After":"60"})
         bucket.append(now); _rate_buckets[key]=bucket
-    response=await call_next(request)
+    try: response=await call_next(request)
+    except Exception as exc:
+        # A traceback in docker logs is not enough: the same line must reach the
+        # «Логи» tab so the failure can be reported straight from the browser.
+        runtime_log("CRITICAL",f"Unhandled error on {request.method} {path}: {type(exc).__name__}: {exc}")
+        raise
     response.headers.update({"X-Content-Type-Options":"nosniff","X-Frame-Options":"SAMEORIGIN","Referrer-Policy":"no-referrer","Permissions-Policy":"camera=(), microphone=(), geolocation=()"})
-    if path.startswith("/api/"): response.headers["Cache-Control"]="no-store"
+    if path.startswith("/api/"):
+        response.headers["Cache-Control"]="no-store"
+        if response.status_code>=400: _log_failed_request(request.method,path,response.status_code)
     return response
 
 @app.get("/api/auth/status")
@@ -1483,12 +1701,14 @@ def dashboard():
     model=con.execute("SELECT m.name,m.precision,m.recall FROM model_registry m JOIN settings s ON s.key='active_model' AND s.value=m.name").fetchone()
     bot_settings={row[0]:row[1] for row in con.execute("SELECT key,value FROM settings WHERE key IN ('telegram_bot_enabled','max_bot_enabled')").fetchall()}
     messenger_provider=_active_bot_provider(bot_settings)
+    # Счётчик для бейджа вкладки «Логи»: сколько раз проект сообщил об ошибке.
+    log_errors=con.execute("SELECT COUNT(*) FROM logs WHERE level IN ('ERROR','CRITICAL') AND timestamp>=?",((datetime.now(TZ)-timedelta(days=1)).isoformat(),)).fetchone()[0]
     trend=[]
     for h in range(11,-1,-1):
         end=datetime.now(TZ)-timedelta(hours=h); start=end-timedelta(hours=1)
         n=con.execute("SELECT COUNT(*) FROM events WHERE timestamp BETWEEN ? AND ?",(start.isoformat(),end.isoformat())).fetchone()[0]
         trend.append({"label":end.strftime("%H:00"),"value":n})
-    con.close(); gpu=gpu_metrics(); return {"cameras":{"total":total,"online":online},"events24h":events24,"critical_unacked":critical,"avg_fps":round(avg[0],1),"avg_latency_ms":round(avg[1]),"gpu_load":gpu["gpu"],"gpu_temp":gpu["gpu_temp"],"messenger_provider":messenger_provider,"active_model":model[0] if model else None,"precision":model[1] if model else None,"recall":model[2] if model else None,"trend":trend}
+    con.close(); gpu=gpu_metrics(); return {"cameras":{"total":total,"online":online},"events24h":events24,"critical_unacked":critical,"avg_fps":round(avg[0],1),"avg_latency_ms":round(avg[1]),"gpu_load":gpu["gpu"],"gpu_temp":gpu["gpu_temp"],"messenger_provider":messenger_provider,"active_model":model[0] if model else None,"precision":model[1] if model else None,"recall":model[2] if model else None,"log_errors_24h":log_errors,"trend":trend}
 
 EVENT_LABELS={"no_helmet":"Без каски","no_vest":"Без жилета","phone_usage":"Телефон","smoking":"Курение","restricted_zone":"Опасная зона","immobility":"Неподвижность"}
 REVIEW_LABELS={"pending":"Требуют внимания","accepted":"Приняты","rejected":"Не приняты"}
@@ -2256,6 +2476,39 @@ def toggle_user(user_id:int):
 @app.get("/api/logs")
 def logs(level:str|None=None,camera_id:str|None=None,limit:int=Query(100,ge=1,le=500)):
     return rows("SELECT * FROM logs WHERE (? IS NULL OR level=?) AND (? IS NULL OR camera_id=?) ORDER BY id DESC LIMIT ?",(level,level,camera_id,camera_id,limit))
+
+class ServiceLogEntryIn(BaseModel):
+    timestamp:str=Field(default="",max_length=40)
+    level:str=Field(default="INFO",max_length=16)
+    message:str=Field(min_length=1,max_length=2000)
+    camera_id:str|None=Field(default=None,max_length=64)
+class ServiceLogBatchIn(BaseModel):
+    service:str=Field(min_length=2,max_length=40,pattern=r"^[a-z0-9][a-z0-9._-]*$")
+    entries:list[ServiceLogEntryIn]=Field(min_length=1,max_length=200)
+
+@app.post("/api/service-logs",status_code=202)
+def ship_service_logs(payload:ServiceLogBatchIn):
+    """Принять зеркало stdout/stderr отдельного процесса проекта.
+
+    Inference worker шлёт пакет с worker-токеном, training worker и боты —
+    с сервисным токеном. Строки попадают в общий журнал и видны во вкладке
+    «Логи» рядом с записями самого API.
+    """
+    return ingest_service_log_entries(payload.service,[entry.model_dump() for entry in payload.entries])
+
+@app.get("/api/logs/project")
+def project_logs(service:str="all",level:str="all",q:str="",camera_id:str|None=None,hours:int=Query(24,ge=1,le=720),limit:int=Query(400,ge=1,le=2000)):
+    """Единый журнал всего проекта: фильтры, счётчики уровней и состав сервисов."""
+    return query_project_logs(service=service,level=level,q=q,camera_id=camera_id,hours=hours,limit=limit)
+
+@app.get("/api/logs/project.csv")
+def project_logs_csv(service:str="all",level:str="all",q:str="",camera_id:str|None=None,hours:int=Query(24,ge=1,le=720),limit:int=Query(2000,ge=1,le=5000)):
+    """Выгрузка того же среза журнала в CSV — чтобы приложить к баг-репорту."""
+    fields=["timestamp","level","service","source","camera_id","message"]
+    items=query_project_logs(service=service,level=level,q=q,camera_id=camera_id,hours=hours,limit=limit)["items"]
+    out=io.StringIO(); writer=csv.DictWriter(out,fieldnames=fields,extrasaction="ignore"); writer.writeheader()
+    writer.writerows(sanitize_csv_rows([{key:item.get(key) for key in fields} for item in items]))
+    return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":f"attachment; filename=zmk-project-logs-{hours}h.csv"})
 @app.get("/api/settings")
 def settings(): return {r["key"]:r["value"] for r in rows("SELECT * FROM settings")}
 @app.put("/api/settings/{key}")

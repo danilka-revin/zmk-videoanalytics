@@ -6,6 +6,8 @@ import logging
 import os
 import re
 import tempfile
+import threading
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,6 +19,62 @@ from maxapi.types import Command, InputMedia, MessageCreated
 
 logging.basicConfig(level=os.getenv("LOG_LEVEL", "INFO"), format="%(asctime)s %(levelname)s %(name)s %(message)s")
 log = logging.getLogger("zmk.max")
+
+
+# --- Зеркалирование журнала в API (вкладка «Логи») ---------------------------
+# Полный журнал по-прежнему доступен в `docker compose logs max-bot`, но
+# разбирать баг удобнее в веб-консоли: строки бота дополнительно уходят в
+# /api/service-logs и видны рядом с записями API и worker-ов.
+LOG_SHIP_SERVICE = "bot-max"
+LOG_SHIP_BATCH = 100
+LOG_SHIP_INTERVAL_SECONDS = 5.0
+_log_ship_lines: deque[tuple[str, str, str]] = deque(maxlen=400)
+_log_ship_lock = threading.Lock()
+
+
+def _log_ship_append(level: str, text: str) -> None:
+    with _log_ship_lock:
+        _log_ship_lines.append((datetime.now(timezone.utc).isoformat(timespec="seconds"), level, text[:1800]))
+
+
+class _ProjectLogHandler(logging.Handler):
+    """Buffer every bot log record for the unified project journal."""
+
+    # Служебный шум ниже WARNING не шлём: иначе каждая отправка журнала
+    # порождает новую строку httpx и поток зацикливается сам на себе.
+    SKIP_LOGGERS = frozenset({"httpx", "httpx2", "httpcore", "asyncio", "urllib3", "aiohttp.access", "aiogram.event"})
+
+    def emit(self, record: logging.LogRecord) -> None:
+        if (record.name in self.SKIP_LOGGERS or record.name.split(".", 1)[0] in self.SKIP_LOGGERS) and record.levelno < logging.WARNING:
+            return
+        # Ошибку emit logging сам отдаёт в handleError: процесс бота не упадёт.
+        _log_ship_append(record.levelname, self.format(record).strip())
+
+
+def install_log_shipping() -> None:
+    handler = _ProjectLogHandler()
+    handler.setFormatter(logging.Formatter("%(name)s: %(message)s"))
+    root = logging.getLogger()
+    if not any(isinstance(item, _ProjectLogHandler) for item in root.handlers): root.addHandler(handler)
+
+
+install_log_shipping()
+
+
+async def log_ship_worker() -> None:
+    """Периодически отдавать накопленные строки в единый журнал проекта."""
+    while True:
+        await asyncio.sleep(LOG_SHIP_INTERVAL_SECONDS)
+        with _log_ship_lock:
+            if not _log_ship_lines: continue
+            batch = [_log_ship_lines.popleft() for _ in range(min(LOG_SHIP_BATCH, len(_log_ship_lines)))]
+        payload = {"service": LOG_SHIP_SERVICE, "entries": [{"timestamp": stamp, "level": level, "message": line} for stamp, level, line in batch]}
+        try:
+            await api("POST", "/api/service-logs", json=payload)
+        except Exception:  # сеть не должна останавливать бота
+            log.debug("Project log shipping failed", exc_info=True)
+            with _log_ship_lock:
+                for entry in reversed(batch): _log_ship_lines.appendleft(entry)
 # .env remains a headless fallback; a token entered in Admin → Боты is read
 # from the API's private, read-only-mounted token directory instead.
 TOKEN = os.getenv("MAX_BOT_TOKEN", "")
@@ -449,6 +507,7 @@ async def run_bot_session(token: str) -> None:
     await bot.delete_webhook()
     runtime=asyncio.create_task(runtime_worker())
     alerts=asyncio.create_task(alert_worker())
+    ship_logs=asyncio.create_task(log_ship_worker())
     polling=asyncio.create_task(dp.start_polling(bot))
     token_watch=asyncio.create_task(_wait_for_token_change(token))
     try:
@@ -464,9 +523,9 @@ async def run_bot_session(token: str) -> None:
         if token_watch not in done and isinstance(result[0],Exception):
             raise result[0]
     finally:
-        for task in (runtime,alerts,token_watch):
+        for task in (runtime,alerts,token_watch,ship_logs):
             if not task.done(): task.cancel()
-        await asyncio.gather(runtime,alerts,token_watch,return_exceptions=True)
+        await asyncio.gather(runtime,alerts,token_watch,ship_logs,return_exceptions=True)
         # maxapi's current SDK calls this ``close_session``; retain a generic
         # fallback for compatible versions without coupling deployment to one
         # exact transport implementation.

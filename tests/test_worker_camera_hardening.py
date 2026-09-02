@@ -6,12 +6,14 @@ that failures do not block other streams, and that transport fallback works.
 """
 import asyncio
 import importlib.util
+import io
 import sys
 import time
 import types
 from pathlib import Path
 from typing import ClassVar
 
+import httpx
 import pytest
 
 WORKER = Path(__file__).resolve().parents[1] / "services" / "inference_worker" / "main.py"
@@ -699,3 +701,42 @@ def test_camera_test_uses_lower_test_confidence(worker_mod):
 
     assert visual is not None and visual.boxes
     assert seen == [.10]
+
+
+def test_worker_mirrors_printed_lines_into_the_project_log(worker_mod):
+    """Каждая строка stdout worker-а уходит в /api/service-logs (вкладка «Логи»)."""
+    runtime = worker_mod.Runtime()
+    calls = _record_internal(runtime)
+    original = io.StringIO()
+    stream = worker_mod._LogShippingStream(original)
+    stream.write("inference: camera cam_01 opened via TCP\n")
+    stream.write("inference: model load failed: CUDA error\n")
+    stream.flush()
+    # Зеркалирование не должно ломать обычный вывод в docker logs.
+    assert original.getvalue() == "inference: camera cam_01 opened via TCP\ninference: model load failed: CUDA error\n"
+
+    runtime._last_log_ship_at = 0.0
+    asyncio.run(runtime._flush_logs())
+
+    assert len(calls) == 1
+    path, payload = calls[0]
+    assert path == "/api/service-logs" and payload["service"] == "inference"
+    levels = {entry["message"]: entry["level"] for entry in payload["entries"]}
+    assert levels["inference: camera cam_01 opened via TCP"] == "INFO"
+    assert levels["inference: model load failed: CUDA error"] == "ERROR"
+    assert all(entry["timestamp"].endswith("+00:00") for entry in payload["entries"])
+    assert worker_mod.log_ship_pending() == 0
+
+
+def test_worker_keeps_buffered_lines_when_the_api_is_unreachable(worker_mod):
+    runtime = worker_mod.Runtime()
+
+    async def post_internal(path, data):
+        raise httpx.ConnectError("api is down")
+
+    runtime.post_internal = post_internal
+    worker_mod.log_ship_capture("camera cam_02 went offline")
+    runtime._last_log_ship_at = 0.0
+    asyncio.run(runtime._flush_logs())
+
+    assert worker_mod.log_ship_pending() == 1
