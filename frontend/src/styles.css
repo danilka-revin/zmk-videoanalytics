@@ -812,3 +812,12 @@ html[data-theme=dark] .tgapp-full{background:radial-gradient(28rem 18rem at 100%
 .feed:has(.camera-feed-wrap){background:#050907}
 .frame-age{position:absolute;left:10px;bottom:8px;z-index:5;background:#0a100dcc;color:#d7e2dc;font-size:8px;padding:3px 6px;border-radius:4px}
 
+/* Custom RGB accent picker */
+.accent-picker{align-items:center}
+.accent-color-control{display:flex;flex:1;flex-direction:column;gap:3px;cursor:pointer}
+.accent-color-control span{color:var(--text);font-size:9px;font-weight:700}
+.accent-color-control small{color:var(--muted);font-size:7px;font-weight:500}
+.accent-color-circle{position:relative;display:block;flex:0 0 auto;width:34px;height:34px;border:4px solid var(--surface);border-radius:50%;box-shadow:0 0 0 1px var(--line),0 3px 8px rgb(23 33 29 / .15);cursor:pointer;transition:transform .16s ease,box-shadow .16s ease}
+.accent-color-circle:hover{transform:scale(1.08);box-shadow:0 0 0 2px rgb(var(--accent-rgb) / .45),0 4px 10px rgb(23 33 29 / .16)}
+.accent-color-circle input{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}
+.accent-picker code{min-width:58px;color:var(--muted);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:8px;text-align:right}
