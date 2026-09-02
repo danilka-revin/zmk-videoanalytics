@@ -232,7 +232,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
        if(data&&data.fatal){
         try{hls.destroy()}catch{};hlsRef.current=null;
         if(streamName===names[names.length-1]){
-         hlsRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginMjpeg()},800) as unknown as number;
+         hlsRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginSnapshot()},800) as unknown as number;
         }
        }
       });
@@ -240,7 +240,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
       hlsRetryRef.current=window.setTimeout(()=>{
        if(cancelled)return;
        if(!live&&streamName===names[names.length-1]){
-        try{hls.destroy()}catch{};hlsRef.current=null;beginMjpeg();
+        try{hls.destroy()}catch{};hlsRef.current=null;beginSnapshot();
        }
       },5000) as unknown as number;
       return;
@@ -552,7 +552,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
    else // WebRTC is intentionally not used as the first hop here. On many camera
    // networks the browser can receive the SDP but cannot reach the ICE candidate,
    // which looks like an endless reconnect. MSE/HLS use the same-origin HTTP
-   // relay and then fall back to the worker's reliable MJPEG feed.
+   // relay; MJPEG is used only when selected explicitly in camera settings.
    void beginMSE();
   }else{
    beginSnapshot();
