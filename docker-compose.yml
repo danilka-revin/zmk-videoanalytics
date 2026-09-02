@@ -192,7 +192,7 @@ services:
       CAMERA_LIVE_FPS: ${CAMERA_LIVE_FPS:-60}
       # Cheap local MJPEG fallback kept alive alongside go2rtc so the reliable
       # MJPEG preview mode and the go2rtc-down fallback never show a black card.
-      CAMERA_MJPEG_LIVE_FPS: ${CAMERA_MJPEG_LIVE_FPS:-15}
+      CAMERA_MJPEG_LIVE_FPS: ${CAMERA_MJPEG_LIVE_FPS:-25}
       # AI is sampled separately so model speed does not throttle the preview.
       CAMERA_INFERENCE_FPS: ${CAMERA_INFERENCE_FPS:-8}
       CAMERA_HIGH_FPS_MODE: ${CAMERA_HIGH_FPS_MODE:-true}
