@@ -232,7 +232,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
        if(data&&data.fatal){
         try{hls.destroy()}catch{};hlsRef.current=null;
         if(streamName===names[names.length-1]){
-         hlsRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginSnapshot()},800) as unknown as number;
+         hlsRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginMjpeg()},800) as unknown as number;
         }
        }
       });
@@ -240,7 +240,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
       hlsRetryRef.current=window.setTimeout(()=>{
        if(cancelled)return;
        if(!live&&streamName===names[names.length-1]){
-        try{hls.destroy()}catch{};hlsRef.current=null;beginSnapshot();
+        try{hls.destroy()}catch{};hlsRef.current=null;beginMjpeg();
        }
       },5000) as unknown as number;
       return;
@@ -496,7 +496,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
    const emit=(jpeg:Uint8Array)=>{
     if(cancelled||!jpeg.length)return;
     const now=Date.now();
-    if(now-lastEmit<60)return; // cap ~16 FPS to keep blob-URL churn low
+    if(now-lastEmit<40)return; // cap at 25 FPS; avoid excessive blob-URL churn
     lastEmit=now;
     const url=URL.createObjectURL(new Blob([jpeg as unknown as BlobPart],{type:'image/jpeg'}));
     setSnapshotSrc(old=>{
@@ -549,7 +549,11 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='mse'
 
   if(['online','connecting','recovering'].includes(status)){
    if(previewMode==='mjpeg')beginMjpeg();
-   else void beginWebrtc().then(ok=>{if(!ok&&!cancelled)void beginMSE()});
+   else // WebRTC is intentionally not used as the first hop here. On many camera
+   // networks the browser can receive the SDP but cannot reach the ICE candidate,
+   // which looks like an endless reconnect. MSE/HLS use the same-origin HTTP
+   // relay and then fall back to the worker's reliable MJPEG feed.
+   void beginMSE();
   }else{
    beginSnapshot();
   }

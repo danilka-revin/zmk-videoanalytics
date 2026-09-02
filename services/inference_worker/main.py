@@ -1365,7 +1365,12 @@ class Runtime:
         if fallback_fps <= 0:
             return
         now = time.monotonic()
-        effective_fps = min(session.config.fps_limit, fallback_fps)
+        # fps_limit controls analytics sampling in the camera configuration. It
+        # must not throttle the transport: a camera configured for 4 FPS used to
+        # make the browser preview look exactly like the broken decoder. Keep
+        # the preview rate independent so it follows the source (up to the
+        # configured live-preview ceiling).
+        effective_fps = fallback_fps
         if effective_fps <= 0 or now - session.last_live_at < 1 / effective_fps:
             return
         session.last_live_at = now
