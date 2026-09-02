@@ -5,13 +5,7 @@ import multiprocessing as mp
 import os
 import queue
 import shutil
-import sys
-import threading
-from collections import deque
-from contextlib import asynccontextmanager, suppress
-from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
 
 import cv2
 import httpx
@@ -26,79 +20,14 @@ def service_token():
  path=Path(os.getenv('ZMK_BOT_API_TOKEN_FILE','/bot-secrets/.api-token'))
  try: return path.read_text(encoding='utf-8').strip() if path.is_file() else ''
  except OSError: return ''
-# --- Зеркалирование журнала в API (вкладка «Логи») ---------------------------
-# `docker compose logs` остаётся полным журналом контейнера, но разбирать баг
-# быстрее в веб-консоли: строки stdout/stderr и этапы обучения дополнительно
-# уходят в /api/service-logs. Отправка piggyback-ом на отчётах о прогрессе,
-# поэтому отдельная фоновая задача не нужна.
-LOG_SHIP_SERVICE='training'; LOG_SHIP_BATCH=100
-_log_ship_lines:deque[tuple[str,str,str]]=deque(maxlen=400); _log_ship_lock=threading.Lock()
-def log_ship_level(line:str)->str:
- text=line.lower()
- if any(word in text for word in ('traceback','error','exception','failed','critical')): return 'ERROR'
- if 'warn' in text: return 'WARNING'
- return 'INFO'
-def _log_ship_append(level:str,text:str)->None:
- with _log_ship_lock: _log_ship_lines.append((datetime.now(timezone.utc).isoformat(timespec='seconds'),level,text[:1800]))
-def log_ship_capture(line:str)->None:
- text=line.rstrip()
- if not text: return
- with suppress(Exception): _log_ship_append(log_ship_level(text),text)  # журнал не имеет права ломать обучение
-def ship_log(message:str,level:str='INFO')->None:
- """Put an explicit worker event (job stage, failure) into the project log."""
- text=str(message).strip()
- if text: _log_ship_append(level,text)
-class _LogShippingStream:
- """Tee for sys.stdout/sys.stderr: original stream plus the project log buffer."""
- def __init__(self,stream:Any)->None: self._stream=stream; self._tail=''
- def write(self,text:str)->int:
-  with suppress(Exception): self._stream.write(text)  # печать в docker logs не должна падать
-  with suppress(Exception): self._absorb(text)
-  return len(text)
- def _absorb(self,text:str)->None:
-  parts=(self._tail+str(text)).split('\n'); self._tail=parts.pop()
-  for line in parts[:200]: log_ship_capture(line)
- def flush(self)->None:
-  with suppress(Exception): self._stream.flush()
- def isatty(self)->bool:
-  with suppress(Exception): return bool(self._stream.isatty())
-  return False
- def __getattr__(self,name:str)->Any: return getattr(self._stream,name)
-def install_log_shipping()->None:
- """Mirror everything this process prints; called once on app startup."""
- if not isinstance(sys.stdout,_LogShippingStream): sys.stdout=_LogShippingStream(sys.stdout)
- if not isinstance(sys.stderr,_LogShippingStream): sys.stderr=_LogShippingStream(sys.stderr)
-async def ship_logs(client:httpx.AsyncClient|None=None)->None:
- """Flush buffered lines to /api/service-logs; never breaks the caller."""
- with _log_ship_lock:
-  if not _log_ship_lines: return
-  batch=[_log_ship_lines.popleft() for _ in range(min(LOG_SHIP_BATCH,len(_log_ship_lines)))]
- headers={'X-API-Key':KEY} if KEY else {}
- token=service_token()
- if token: headers['X-Bot-Service-Token']=token
- payload={'service':LOG_SHIP_SERVICE,'entries':[{'timestamp':stamp,'level':level,'message':line} for stamp,level,line in batch]}
- try:
-  if client is not None: (await client.post('/api/service-logs',json=payload)).raise_for_status(); return
-  async with httpx.AsyncClient(base_url=API,headers=headers,timeout=15) as own: (await own.post('/api/service-logs',json=payload)).raise_for_status()
- except (httpx.HTTPError,OSError,RuntimeError,ValueError):
-  with _log_ship_lock:
-   for entry in reversed(batch): _log_ship_lines.appendleft(entry)
-@asynccontextmanager
-async def lifespan(app:FastAPI):
- install_log_shipping(); ship_log(f'training worker started (device={DEVICE}, base={BASE_MODEL})')
- try: yield
- finally: await ship_logs()
-app=FastAPI(title='ZMK Training Worker',version='1.0.0',lifespan=lifespan); running:set[int]=set(); tasks:dict[int,asyncio.Task]={}
+app=FastAPI(title='ZMK Training Worker',version='1.0.0'); running:set[int]=set(); tasks:dict[int,asyncio.Task]={}
 class Job(BaseModel):
  id:int; camera_id:str=''; rtsp_url:str=''; target_name:str; base_artifact:str|None=None; image_count:int=Field(ge=20,le=5000); epochs:int=Field(ge=1,le=300); fps_limit:float=Field(default=2,gt=0,le=10); batch:int=Field(default=8,ge=1,le=128); imgsz:int=Field(default=640,ge=320,le=1920); patience:int=Field(default=20,ge=0,le=100); confidence:float=Field(default=.35,ge=.05,le=.95); val_split:float=Field(default=.2,ge=.1,le=.4); source:str='camera'; dataset_path:str|None=None; dataset_kind:str='yolo'; frame_skip:int=Field(default=8,ge=1,le=120)
 async def callback(job:int,**values):
  headers={'X-API-Key':KEY} if KEY else {}
  token=service_token()
  if token: headers['X-Bot-Service-Token']=token
- async with httpx.AsyncClient(base_url=API,headers=headers,timeout=30) as c:
-  (await c.put(f'/api/training/jobs/{job}/progress',json=values)).raise_for_status()
-  # Журнал проекта уезжает тем же соединением, что и отчёт о прогрессе.
-  await ship_logs(c)
+ async with httpx.AsyncClient(base_url=API,headers=headers,timeout=30) as c: (await c.put(f'/api/training/jobs/{job}/progress',json=values)).raise_for_status()
 def capture(job:Job,path:Path):
  cap=cv2.VideoCapture(job.rtsp_url); interval=max(1,int((cap.get(cv2.CAP_PROP_FPS) or 25)/job.fps_limit)); saved=frame=0
  while saved<job.image_count:
@@ -308,7 +237,6 @@ def train_entry(payload, updates):
   updates.put(('error',str(exc)[:500]))
 async def execute(job:Job):
  running.add(job.id); ctx=mp.get_context('spawn'); updates=ctx.Queue(); process=ctx.Process(target=train_entry,args=(job.model_dump(),updates),daemon=True); process.start()
- ship_log(f"job {job.id} started: target={job.target_name} source={job.source} epochs={job.epochs} device={DEVICE}")
  try:
   await callback(job.id,status='running',progress=5,stage='Обучение на готовом датасете' if job.source=='dataset' else 'Захват RTSP кадров')
   empty_after_exit=0
@@ -322,23 +250,17 @@ async def execute(job:Job):
    empty_after_exit=0
    if message[0]=='progress': await callback(job.id,status='running',progress=message[1],stage=message[2])
    elif message[0]=='error': raise RuntimeError(message[1])
-   elif message[0]=='success':
-    ship_log(f"job {job.id} completed: artifact={message[1]} precision={message[2]} recall={message[3]}")
-    await callback(job.id,status='completed',progress=100,stage='Модель обучена',artifact_uri=f'file://{message[1]}',precision=message[2],recall=message[3]); return
+   elif message[0]=='success': await callback(job.id,status='completed',progress=100,stage='Модель обучена',artifact_uri=f'file://{message[1]}',precision=message[2],recall=message[3]); return
   raise RuntimeError(f'Training process exited without result (code {process.exitcode})')
  except asyncio.CancelledError:
   if process.is_alive(): process.terminate(); process.join(timeout=10)
-  ship_log(f"job {job.id} cancelled by operator",'WARNING')
   await callback(job.id,status='cancelled',progress=0,stage='Отменено'); raise
  except Exception as exc:  # noqa: BLE001 - report all ML/RTSP/CUDA failures
   if process.is_alive(): process.terminate(); process.join(timeout=10)
-  ship_log(f"job {job.id} failed: {str(exc)[:500]}",'ERROR')
   await callback(job.id,status='failed',progress=0,stage='Ошибка',error=str(exc)[:500])
  finally:
   if process.is_alive(): process.terminate()
   process.join(timeout=5); running.discard(job.id); tasks.pop(job.id,None); updates.close()
-  # Дожимаем хвост журнала: последние строки задачи важнее всего при разборе бага.
-  await ship_logs()
 @app.get('/health')
 def health(): return {'status':'ok','gpu':torch.cuda.is_available(),'device':str(DEVICE),'running_jobs':list(running)}
 @app.post('/preview')

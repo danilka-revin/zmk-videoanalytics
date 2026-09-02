@@ -12,11 +12,7 @@ import base64
 import hashlib
 import os
 import re
-import sys
-import threading
 import time
-from collections import deque
-from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -434,84 +430,6 @@ def redact_error(value: object, limit: int = 300) -> str:
     return text[:limit] or "Неизвестная ошибка потока"
 
 
-# --- Зеркалирование журнала в API (вкладка «Логи») ---------------------------
-# `docker compose logs` остаётся полным журналом контейнера, но разбирать баг
-# быстрее в веб-консоли: каждая строка stdout/stderr дополнительно уходит в
-# /api/service-logs. Буфер ограничен, а отправка не блокирует кадры.
-LOG_SHIP_SERVICE = "inference"
-LOG_SHIP_BATCH = 100
-LOG_SHIP_INTERVAL_SECONDS = _bounded_float("PROJECT_LOG_SHIP_SECONDS", 5.0, 1.0, 300.0)
-_log_ship_lines: deque[tuple[str, str]] = deque(maxlen=_bounded_int("PROJECT_LOG_BUFFER", 400, 50, 5000))
-_log_ship_lock = threading.Lock()
-
-
-def log_ship_level(line: str) -> str:
-    """Best-effort level for a plain stdout line; the API normalises it again."""
-    text = line.lower()
-    if any(word in text for word in ("traceback", "error", "exception", "failed", "critical")):
-        return "ERROR"
-    if "warn" in text:
-        return "WARNING"
-    return "INFO"
-
-
-def log_ship_capture(line: str) -> None:
-    """Mirror one printed line into the bounded buffer; never raises."""
-    text = line.rstrip()
-    if not text:
-        return
-    # журнал не имеет права ломать worker
-    with suppress(Exception), _log_ship_lock:
-        _log_ship_lines.append((datetime.now(timezone.utc).isoformat(timespec="seconds"), text[:1800]))
-
-
-def log_ship_pending() -> int:
-    with _log_ship_lock:
-        return len(_log_ship_lines)
-
-
-class _LogShippingStream:
-    """Tee for sys.stdout/sys.stderr: the original stream plus the log buffer."""
-
-    def __init__(self, stream: Any) -> None:
-        self._stream = stream
-        self._tail = ""
-
-    def write(self, text: str) -> int:
-        # Ни печать в docker logs, ни зеркало в журнал не имеют права падать.
-        with suppress(Exception):
-            self._stream.write(text)
-        with suppress(Exception):
-            self._absorb(text)
-        return len(text)
-
-    def _absorb(self, text: str) -> None:
-        parts = (self._tail + str(text)).split("\n")
-        self._tail = parts.pop()
-        for line in parts[:200]:
-            log_ship_capture(line)
-
-    def flush(self) -> None:
-        with suppress(Exception):
-            self._stream.flush()
-
-    def isatty(self) -> bool:
-        with suppress(Exception):
-            return bool(self._stream.isatty())
-        return False
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._stream, name)
-
-
-def install_log_shipping() -> None:
-    """Start mirroring everything this process prints into the project log."""
-    if not isinstance(sys.stdout, _LogShippingStream):
-        sys.stdout = _LogShippingStream(sys.stdout)
-    if not isinstance(sys.stderr, _LogShippingStream):
-        sys.stderr = _LogShippingStream(sys.stderr)
-
-
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -644,7 +562,6 @@ class Runtime:
         self._last_heartbeat_at = 0.0
         self._last_no_camera_log = 0.0
         self._last_loop_error_at = 0.0
-        self._last_log_ship_at = 0.0
         self._capture_open_lock = asyncio.Lock()
         self._inference_lock = asyncio.Lock()
         self.model: Any | None = None
@@ -831,26 +748,6 @@ class Runtime:
         if force or now - self._last_loop_error_at >= 10:
             print(f"inference: {message}", flush=True)
             self._last_loop_error_at = now
-
-    async def _flush_logs(self) -> None:
-        """Ship buffered stdout/stderr lines into the unified project log."""
-        now = time.monotonic()
-        if now - self._last_log_ship_at < LOG_SHIP_INTERVAL_SECONDS:
-            return
-        self._last_log_ship_at = now
-        with _log_ship_lock:
-            if not _log_ship_lines:
-                return
-            batch = [_log_ship_lines.popleft() for _ in range(min(LOG_SHIP_BATCH, len(_log_ship_lines)))]
-        payload = {"service": LOG_SHIP_SERVICE, "entries": [{"timestamp": stamp, "level": log_ship_level(line), "message": line} for stamp, line in batch]}
-        try:
-            await self.post_internal("/api/service-logs", payload)
-        except (httpx.HTTPError, OSError, RuntimeError, ValueError) as exc:
-            # Строки возвращаются в буфер: сеть не должна съедать журнал.
-            with _log_ship_lock:
-                for entry in reversed(batch):
-                    _log_ship_lines.appendleft(entry)
-            self._log(f"project log shipping rejected: {redact_error(exc)}")
 
     async def _report(
         self,
@@ -1767,7 +1664,6 @@ class Runtime:
 
                     self._cleanup_deferred_releases()
                     await self._heartbeat()
-                    await self._flush_logs()
                     wake_times = [self._next_control_poll, self._last_heartbeat_at + HEARTBEAT_INTERVAL_SECONDS]
                     for session in self.sessions.values():
                         if session.frame_task is not None and not session.frame_task.done():
@@ -1796,5 +1692,4 @@ class Runtime:
 
 
 if __name__ == "__main__":
-    install_log_shipping()
     asyncio.run(Runtime().run())
