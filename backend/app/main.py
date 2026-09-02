@@ -2278,8 +2278,8 @@ def toggle_user(user_id:int):
     active=0 if row[0] else 1; con.execute("UPDATE users SET active=? WHERE id=?",(active,user_id)); con.commit(); con.close(); return {"id":user_id,"active":bool(active)}
 
 @app.get("/api/logs")
-def logs(level:str|None=None,limit:int=Query(100,ge=1,le=500)):
-    return rows("SELECT * FROM logs WHERE (? IS NULL OR level=?) ORDER BY id DESC LIMIT ?",(level,level,limit))
+def logs(level:str|None=None,camera_id:str|None=None,limit:int=Query(100,ge=1,le=500)):
+    return rows("SELECT * FROM logs WHERE (? IS NULL OR level=?) AND (? IS NULL OR camera_id=?) ORDER BY id DESC LIMIT ?",(level,level,camera_id,camera_id,limit))
 @app.get("/api/settings")
 def settings(): return {r["key"]:r["value"] for r in rows("SELECT * FROM settings")}
 @app.put("/api/settings/{key}")
