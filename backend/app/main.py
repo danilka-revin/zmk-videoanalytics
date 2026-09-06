@@ -100,6 +100,14 @@ def _normalize_role(value: str | None) -> str:
     # read-only seat and maps onto `viewer`.
     return role if role in AUTH_ROLES else ("viewer" if role=="director" else DEFAULT_AUTH_ROLE)
 
+# Admin → Пользователи historically used `operator` and `director`; map them
+# onto the panel roles («Аналитик» / «Гость») so old clients keep working.
+ADMIN_ROLE_ALIASES={"operator":"analyst","director":"viewer"}
+
+def _normalize_admin_role(value: str | None) -> str:
+    role=str(value or DEFAULT_AUTH_ROLE).strip().lower()
+    return ADMIN_ROLE_ALIASES.get(role,role)
+
 def _normalize_account_login(value: str | None) -> str:
     return str(value or DEFAULT_AUTH_LOGIN).strip().lower()[:32] or DEFAULT_AUTH_LOGIN
 
@@ -677,7 +685,7 @@ def _set_auth_cookie(response: Response, token: str, request: Request) -> None:
 # Non-administrator accounts work from an explicit allowlist, so a new
 # administrative endpoint is never exposed to them by accident.
 PANEL_READ_PREFIXES=("/api/dashboard","/api/cameras","/api/events","/api/analytics","/api/reports","/api/search","/api/session","/api/health","/api/auth/")
-PANEL_WRITE_PATHS={"/api/auth/logout","/api/auth/password"}
+PANEL_WRITE_PATHS={"/api/auth/logout","/api/auth/password","/api/auth/login"}
 # «Аналитик» works the review queue: accepting and rejecting detections is the
 # whole job, everything that configures the platform stays closed.
 EVENT_REVIEW_PATHS={"/api/events/ack-bulk","/api/events/reject-bulk"}
@@ -1605,6 +1613,49 @@ class UserIn(BaseModel):
     name:str=Field(min_length=2,max_length=80)
     login:str=Field(min_length=2,max_length=40,pattern=r"^[a-zA-Z0-9._-]+$")
     role:Literal["admin","operator","viewer"]
+class AdminUserCreateIn(BaseModel):
+    """A real, login-capable account created from Admin → Пользователи."""
+    name:str=Field(min_length=2,max_length=60)
+    login:str=Field(min_length=2,max_length=32)
+    role:str=Field(default=DEFAULT_AUTH_ROLE,max_length=20)
+    password:str=Field(min_length=4,max_length=128)
+    @field_validator("login")
+    @classmethod
+    def validate_login(cls,value:str)->str:
+        login=str(value or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9._-]{2,32}",login): raise ValueError("Логин: 2–32 символа, латиница, цифры, точка, дефис")
+        return login
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls,value:str)->str:
+        role=_normalize_admin_role(value)
+        if role not in AUTH_ROLES: raise ValueError("Неизвестная роль")
+        return role
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls,value:str)->str:
+        name=str(value or "").strip()
+        if len(name)<2: raise ValueError("Имя пользователя слишком короткое")
+        return name[:60]
+class AdminUserUpdateIn(BaseModel):
+    name:str|None=Field(default=None,max_length=60)
+    role:str|None=Field(default=None,max_length=20)
+    password:str|None=Field(default=None,min_length=4,max_length=128)
+    active:bool|None=None
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls,value:str|None)->str|None:
+        if value is None: return None
+        role=_normalize_admin_role(value)
+        if role not in AUTH_ROLES: raise ValueError("Неизвестная роль")
+        return role
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls,value:str|None)->str|None:
+        if value is None: return None
+        name=str(value).strip()
+        if len(name)<2: raise ValueError("Имя пользователя слишком короткое")
+        return name[:60]
 class ModelIn(BaseModel):
     name:str=Field(min_length=2,max_length=120,pattern=r"^[a-zA-Z0-9._-]+$")
     format:Literal["ONNX","ONNX FP16","TensorRT","TensorRT FP16","PyTorch"]
@@ -2806,22 +2857,112 @@ def complete_bot_command(provider: Literal["telegram","max"], command_id:int, pa
         con.close()
 
 
+def _auth_account_admin_view(row) -> dict[str,Any]:
+    """Shape an `auth_accounts` row for Admin → Пользователи (and legacy clients)."""
+    login=str(row[0]); role=_normalize_role(row[2])
+    return {"id":login,"login":login,"name":str(row[1]),"label":str(row[1]),"role":role,
+            "role_label":AUTH_ROLES[role]["label"],"active":bool(row[3]),"built_in":bool(row[4]),
+            "created_at":str(row[5] or "")}
+
 @app.get("/api/admin/users")
-def get_users(): return rows("SELECT id,name,login,role,active,created_at FROM users ORDER BY id")
-@app.post("/api/admin/users",status_code=201)
-def create_user(payload:UserIn):
+def get_users():
     con=db()
-    try: cur=con.execute("INSERT INTO users(name,login,role,active,created_at) VALUES(?,?,?,?,?)",(payload.name,payload.login,payload.role,1,now_iso())); con.commit()
-    except sqlite3.IntegrityError: con.close(); raise HTTPException(409,"Логин уже используется")
-    uid=cur.lastrowid; con.close(); return {"id":uid,**payload.model_dump(),"active":True}
+    try:
+        rows=con.execute("SELECT login,label,role,active,built_in,created_at FROM auth_accounts ORDER BY built_in DESC,login ASC").fetchall()
+        return {"accounts":[_auth_account_admin_view(row) for row in rows],"roles":[dict(role) for role in AUTH_ROLES.values()]}
+    finally:
+        con.close()
+
+@app.post("/api/admin/users",status_code=201)
+def create_user(payload:AdminUserCreateIn,request:Request):
+    session=_auth_session(request)
+    login=payload.login
+    con=db()
+    try:
+        if con.execute("SELECT 1 FROM auth_accounts WHERE login=?",(login,)).fetchone():
+            raise HTTPException(409,"Логин уже используется")
+        con.execute("INSERT INTO auth_accounts(login,label,role,password_hash,active,built_in,created_at) VALUES(?,?,?,?,1,0,?)",
+                    (login,payload.name,payload.role,_hash_password(payload.password),now_iso()))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",
+                    (now_iso(),"INFO","auth",f"Account {login} ({payload.role}) created by {session.get('login') or 'admin'!s}"))
+        con.commit()
+        row=con.execute("SELECT login,label,role,active,built_in,created_at FROM auth_accounts WHERE login=?",(login,)).fetchone()
+    finally:
+        con.close()
+    return {"created":True,"account":_auth_account_admin_view(row)}
+
+@app.put("/api/admin/users/{user_id}")
+def update_user(user_id:str,payload:AdminUserUpdateIn,request:Request):
+    session=_auth_session(request)
+    login=_normalize_account_login(user_id)
+    con=db()
+    try:
+        row=con.execute("SELECT login,label,role,active,built_in FROM auth_accounts WHERE login=?",(login,)).fetchone()
+        if not row: raise HTTPException(404,"Пользователь не найден")
+        built_in=bool(row[4])
+        role=_normalize_role(payload.role if payload.role is not None else row[2])
+        # The platform must never end up without an administrator.
+        if built_in and login==DEFAULT_AUTH_LOGIN and (role!="admin" or payload.active is False):
+            raise HTTPException(422,"Встроенного администратора нельзя разжаловать или отключить")
+        if payload.active is False and login==str(session.get("login")):
+            raise HTTPException(422,"Нельзя отключить собственный аккаунт")
+        label=str(payload.name).strip() if payload.name is not None else str(row[1])
+        con.execute("UPDATE auth_accounts SET label=?,role=?,active=? WHERE login=?",(label,role,1 if (payload.active is None or payload.active) else 0,login))
+        if payload.password:
+            con.execute("UPDATE auth_accounts SET password_hash=? WHERE login=?",(_hash_password(payload.password),login))
+            con.execute("DELETE FROM auth_sessions WHERE login=? AND id!=?",(login,str(session.get("id"))))
+        if payload.active is False:
+            con.execute("DELETE FROM auth_sessions WHERE login=?",(login,))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",
+                    (now_iso(),"INFO","auth",f"Account {login} updated by {session.get('login') or 'admin'!s}"))
+        con.commit()
+        updated=con.execute("SELECT login,label,role,active,built_in,created_at FROM auth_accounts WHERE login=?",(login,)).fetchone()
+    finally:
+        con.close()
+    return {"updated":True,"account":_auth_account_admin_view(updated)}
+
+@app.delete("/api/admin/users/{user_id}")
+def delete_user(user_id:str,request:Request):
+    session=_auth_session(request)
+    login=_normalize_account_login(user_id)
+    if login==DEFAULT_AUTH_LOGIN:
+        raise HTTPException(422,"Встроенного администратора нельзя удалить")
+    if login==str(session.get("login")):
+        raise HTTPException(422,"Нельзя удалить собственный аккаунт")
+    con=db()
+    try:
+        row=con.execute("SELECT 1 FROM auth_accounts WHERE login=?",(login,)).fetchone()
+        if not row: raise HTTPException(404,"Пользователь не найден")
+        con.execute("DELETE FROM auth_accounts WHERE login=?",(login,))
+        con.execute("DELETE FROM auth_sessions WHERE login=?",(login,))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",
+                    (now_iso(),"WARNING","auth",f"Account {login} deleted by {session.get('login') or 'admin'!s}"))
+        con.commit()
+    finally:
+        con.close()
+    return {"deleted":True,"login":login}
+
 @app.patch("/api/admin/users/{user_id}/toggle")
-def toggle_user(user_id:int):
-    con=db(); row=con.execute("SELECT active,role FROM users WHERE id=?",(user_id,)).fetchone()
-    if not row: con.close(); raise HTTPException(404,"Пользователь не найден")
-    if row[1]=="admin" and row[0]:
-        admins=con.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
-        if admins<=1: con.close(); raise HTTPException(409,"Нельзя отключить последнего администратора")
-    active=0 if row[0] else 1; con.execute("UPDATE users SET active=? WHERE id=?",(active,user_id)); con.commit(); con.close(); return {"id":user_id,"active":bool(active)}
+def toggle_user(user_id:str,request:Request):
+    session=_auth_session(request)
+    login=_normalize_account_login(user_id)
+    if login==DEFAULT_AUTH_LOGIN:
+        raise HTTPException(422,"Встроенного администратора нельзя отключить")
+    if login==str(session.get("login")):
+        raise HTTPException(422,"Нельзя отключить собственный аккаунт")
+    con=db()
+    try:
+        row=con.execute("SELECT active,built_in FROM auth_accounts WHERE login=?",(login,)).fetchone()
+        if not row: raise HTTPException(404,"Пользователь не найден")
+        active=0 if row[0] else 1
+        con.execute("UPDATE auth_accounts SET active=? WHERE login=?",(active,login))
+        if not active: con.execute("DELETE FROM auth_sessions WHERE login=?",(login,))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",
+                    (now_iso(),"INFO","auth",f"Account {login} {'disabled' if not active else 'enabled'} by {session.get('login') or 'admin'!s}"))
+        con.commit()
+    finally:
+        con.close()
+    return {"id":login,"login":login,"active":bool(active)}
 
 @app.get("/api/logs")
 def logs(level:str|None=None,camera_id:str|None=None,limit:int=Query(100,ge=1,le=500)):
@@ -3724,7 +3865,7 @@ def cancel_training(job_id:int):
 
 @app.get("/api/admin/summary")
 def admin_summary():
-    con=db(); result={"users":con.execute("SELECT COUNT(*) FROM users WHERE active=1").fetchone()[0],"audit24h":con.execute("SELECT COUNT(*) FROM logs WHERE timestamp>=?",((datetime.now(TZ)-timedelta(days=1)).isoformat(),)).fetchone()[0],"errors24h":con.execute("SELECT COUNT(*) FROM logs WHERE level IN ('ERROR','CRITICAL') AND timestamp>=?",((datetime.now(TZ)-timedelta(days=1)).isoformat(),)).fetchone()[0],"training_running":con.execute("SELECT COUNT(*) FROM training_jobs WHERE status IN ('queued','running')").fetchone()[0]}; con.close(); return result
+    con=db(); result={"users":con.execute("SELECT COUNT(*) FROM auth_accounts WHERE active=1").fetchone()[0],"audit24h":con.execute("SELECT COUNT(*) FROM logs WHERE timestamp>=?",((datetime.now(TZ)-timedelta(days=1)).isoformat(),)).fetchone()[0],"errors24h":con.execute("SELECT COUNT(*) FROM logs WHERE level IN ('ERROR','CRITICAL') AND timestamp>=?",((datetime.now(TZ)-timedelta(days=1)).isoformat(),)).fetchone()[0],"training_running":con.execute("SELECT COUNT(*) FROM training_jobs WHERE status IN ('queued','running')").fetchone()[0]}; con.close(); return result
 @app.get("/api/reports/errors")
 def error_report(hours:int=Query(24,ge=1,le=720)):
     since=(datetime.now(TZ)-timedelta(hours=hours)).isoformat()

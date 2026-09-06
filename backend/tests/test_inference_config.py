@@ -47,9 +47,15 @@ def test_user_rbac_safety():
     with TestClient(app) as c:
         users = c.get('/api/admin/users')
         assert users.status_code == 200
-        assert {x['role'] for x in users.json()} >= {'admin','operator','viewer'}
-        admin = next(x for x in users.json() if x['role'] == 'admin')
-        assert c.patch(f"/api/admin/users/{admin['id']}/toggle").status_code == 409
+        body = users.json()
+        assert 'accounts' in body and 'roles' in body
+        accounts = body['accounts']
+        # The panel roles are admin / analyst / viewer; legacy `operator` maps
+        # onto «Аналитик» so every account can actually log in.
+        assert {x['role'] for x in accounts} <= {'admin','analyst','viewer'}
+        assert {x['role'] for x in accounts} >= {'admin','viewer'}
+        admin = next(x for x in accounts if x['role'] == 'admin')
+        assert c.patch(f"/api/admin/users/{admin['id']}/toggle").status_code == 422
 
 
 def test_bulk_acknowledgement_preserves_operator_note():
