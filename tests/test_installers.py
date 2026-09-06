@@ -211,7 +211,11 @@ def test_compose_and_environment_are_consistent():
     compose = yaml.safe_load((ROOT/'docker-compose.yml').read_text())
     gpu_override = yaml.safe_load((ROOT/'docker-compose.gpu.yml').read_text())
     assert gpu_override['services']['training-worker']['gpus'] == 'all'
-    assert compose['services']['web']['build'] == './frontend'
+    # web uses long-form build so the web stage can receive the NPM_REGISTRY
+    # build arg (regional npm mirror for the `npm ci` step); context is still
+    # ./frontend.
+    assert compose['services']['web']['build']['context'] == './frontend'
+    assert 'NPM_REGISTRY' in compose['services']['web']['build']['args']
     assert 'healthcheck' in compose['services']['api']
     assert compose['services']['api']['environment']['VIDEOANALYTICS_DB'] == '/app/data/videoanalytics.db'
     assert compose['services']['api']['environment']['MODEL_UPLOAD_MAX_BYTES'] == '${MODEL_UPLOAD_MAX_BYTES:-2000000000}'
