@@ -274,7 +274,12 @@ except ValueError: SERVICE_LOG_RATE_PER_MINUTE=1200
 # retention_days держим жёсткий потолок по числу строк.
 try: LOG_TABLE_MAX_ROWS=max(1_000,min(5_000_000,int(os.getenv("PROJECT_LOG_MAX_ROWS","200000"))))
 except ValueError: LOG_TABLE_MAX_ROWS=200_000
-_logs_prune_at=0.0
+# "Never yet pruned" sentinel. Using a large negative value (not 0.0) keeps the
+# monotonic-clock throttle arithmetic valid even on a freshly booted host, where
+# time.monotonic() can be smaller than the 300 s throttle window; otherwise the
+# first prune within the first minutes of boot would be skipped and the log
+# table could grow past its cap.
+_logs_prune_at=-1e9
 PROJECT_LOG_WINDOW_CAP=4000
 _runtime_logs:deque[dict[str,Any]]=deque(maxlen=RUNTIME_LOG_LIMIT)
 _runtime_log_lock=threading.Lock()
