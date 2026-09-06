@@ -85,7 +85,14 @@ services:
       timeout: 3s
       retries: 3
   web:
-    build: ./frontend
+    build:
+      context: ./frontend
+      args:
+        # Optional npm registry mirror for the web image build stage (npm ci).
+        # Set NPM_REGISTRY in .env when registry.npmjs.org is slow or
+        # unreachable (e.g. https://registry.npmmirror.com); leave empty to use
+        # the default registry with resilient retries (see frontend/.npmrc).
+        NPM_REGISTRY: ${NPM_REGISTRY:-}
     ports:
     - 5173:80
     extra_hosts:
