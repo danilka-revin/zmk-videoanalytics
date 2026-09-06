@@ -73,7 +73,9 @@ function AuthGate({render}:{render:(account:AuthAccount,actions:{switchUser:()=>
  const sessionAccount:AuthAccount={login:activeLogin,label:status?.label||accounts.find(item=>item.login===activeLogin)?.label||'Администратор',role:status?.role||'admin'};
  const initials=(value:string)=>value.trim().split(/\s+/).slice(0,2).map(word=>word.slice(0,1).toUpperCase()).join('')||'ZM';
  const signedIn=Boolean(status?.authenticated&&!status?.must_change);
- const openSwitcher=()=>{setMode('pick');setPicked(null);setPassword('');setError('');setNotice('');setSwitching(true)};
+ // The account list is re-read every time the switcher opens: an administrator
+ // may have created, renamed or disabled somebody since the panel was loaded.
+ const openSwitcher=()=>{setMode('pick');setPicked(null);setPassword('');setError('');setNotice('');setSwitching(true);void refresh()};
  const cancelSwitch=()=>{setSwitching(false);setMode('pick');setPicked(null);setPassword('');setError('');setNotice('')};
  const signOut=()=>{void submit(async()=>{await authRequest('/api/auth/logout',{method:'POST'});setSwitching(false);setMode('pick');setPicked(null);setPassword('')})};
  const login=async()=>{const result=await authRequest<{must_change:boolean}>('/api/auth/login',{method:'POST',body:JSON.stringify({login:picked?.login||'admin',password})});if(result.must_change){setCurrent(password);setMode('change');return}

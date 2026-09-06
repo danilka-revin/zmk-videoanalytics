@@ -849,6 +849,15 @@ header .switch-user{color:var(--muted)}
 header .switch-user:hover{color:var(--accent)}
 /* Read-only account: the operator decisions are not offered at all. */
 .event-readonly{display:inline-flex;align-items:center;gap:5px;border:1px solid rgb(var(--ink-rgb) / .14);border-radius:99px;background:rgb(var(--surface-2-rgb) / .6);color:var(--muted);padding:5px 9px;font-size:8px;white-space:nowrap}
+@media(max-width:560px){
+  .auth-switch-actions{align-items:stretch;flex-direction:column}
+  .auth-switch-actions .auth-link{justify-content:center}
+  .auth-current{flex-wrap:wrap}
+  .auth-current-badge{margin-left:auto}
+  .account-row{align-items:flex-start}
+  .account-actions{width:100%;justify-content:flex-end}
+  .account-edit,.account-create-grid{grid-template-columns:1fr}
+}
 @media(max-width:560px){.auth-blur-scene{grid-template-columns:1fr}.auth-ghost-sidebar{display:none}.auth-card{padding:23px}.auth-settings-grid{grid-template-columns:1fr}}
 
 /* Telegram Mini App: operational intelligence, review queue and mobile actions. */
