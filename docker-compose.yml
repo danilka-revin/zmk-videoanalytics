@@ -42,6 +42,9 @@ services:
       GO2RTC_RTSP_URL: ${GO2RTC_RTSP_URL:-rtsp://host.docker.internal:8554}
       GO2RTC_ENABLED: ${GO2RTC_ENABLED:-true}
       GO2RTC_RTSP_TRANSPORT: ${GO2RTC_RTSP_TRANSPORT:-tcp}
+      # Add a VP8 ffmpeg producer to every camera stream so WebRTC browsers that
+      # cannot decode H.264 (Firefox on Ubuntu) still get a live preview.
+      GO2RTC_WEBRTC_VP8: ${GO2RTC_WEBRTC_VP8:-true}
       # Training worker is part of the default stack and remains available in
       # CPU mode when NVIDIA is absent; docker-compose.gpu.yml adds GPUs.
       TRAINING_WORKER_URL: ${TRAINING_WORKER_URL:-http://training-worker:8010}

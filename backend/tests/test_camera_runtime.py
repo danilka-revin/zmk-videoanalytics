@@ -42,6 +42,129 @@ def test_go2rtc_sync_is_noop_when_disabled(monkeypatch):
     assert main.sync_go2rtc_cameras() == {"ok": False, "reason": "go2rtc disabled"}
 
 
+class _FakeResp:
+    def __init__(self, payload=None):
+        self.status_code = 200
+        self._payload = payload if payload is not None else {}
+
+    def json(self):
+        return self._payload
+
+
+class _FakeClient:
+    """Records go2rtc PUT requests so we can assert the VP8 ffmpeg source."""
+
+    def __init__(self):
+        self.puts = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def get(self, url, **kwargs):
+        return _FakeResp({})
+
+    def put(self, url, params=None, **kwargs):
+        self.puts.append({"url": url, "params": params})
+        return _FakeResp({})
+
+
+def test_go2rtc_sync_adds_vp8_source_when_enabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "GO2RTC_API_URL", "http://go2rtc:1984/rtc")
+    monkeypatch.setattr(main, "GO2RTC_ENABLED", True)
+    monkeypatch.setattr(main, "GO2RTC_WEBRTC_VP8", True)
+    monkeypatch.setattr(main, "SEED_TEST_DATA", False)
+    db = tmp_path / "vp8.db"
+    monkeypatch.setattr(main, "DB_PATH", db)
+    main.init_db()
+    con = main.sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,preview_mode)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "cam01",
+            "VP8 Cam",
+            "Test",
+            "",
+            "rtsp://user:pass@camera/stream",
+            30,
+            "online",
+            25,
+            80,
+            1,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+            "auto",
+        ),
+    )
+    con.commit()
+    con.close()
+
+    fake = _FakeClient()
+    monkeypatch.setattr(main.httpx, "Client", lambda **kwargs: fake)
+
+    result = main.sync_go2rtc_cameras()
+    assert result["ok"] is True
+    assert fake.puts, "expected go2rtc stream PUT requests"
+    vp8_seen = False
+    for req in fake.puts:
+        params = req["params"]
+        # params is a list of (name, value); both zmk-cam01 and cam01 get sources.
+        srcs = [v for k, v in params if k == "src"]
+        names = [v for k, v in params if k == "name"]
+        if "cam01" in names:
+            # Every stream should carry the direct RTSP feed and the VP8 transcode.
+            assert any(s.startswith("rtsp://") for s in srcs), srcs
+            if any(s.startswith("ffmpeg:") for s in srcs):
+                vp8_seen = True
+    assert vp8_seen, "expected an ffmpeg:...#video=vp8 source to be registered"
+
+
+def test_go2rtc_sync_omits_vp8_source_when_disabled(tmp_path, monkeypatch):
+    monkeypatch.setattr(main, "GO2RTC_API_URL", "http://go2rtc:1984/rtc")
+    monkeypatch.setattr(main, "GO2RTC_ENABLED", True)
+    monkeypatch.setattr(main, "GO2RTC_WEBRTC_VP8", False)
+    monkeypatch.setattr(main, "SEED_TEST_DATA", False)
+    db = tmp_path / "norp8.db"
+    monkeypatch.setattr(main, "DB_PATH", db)
+    main.init_db()
+    con = main.sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,preview_mode)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "cam02",
+            "No VP8 Cam",
+            "Test",
+            "",
+            "rtsp://user:pass@camera/stream",
+            30,
+            "online",
+            25,
+            80,
+            1,
+            "2026-01-01T00:00:00Z",
+            "2026-01-01T00:00:00Z",
+            "auto",
+        ),
+    )
+    con.commit()
+    con.close()
+
+    fake = _FakeClient()
+    monkeypatch.setattr(main.httpx, "Client", lambda **kwargs: fake)
+
+    result = main.sync_go2rtc_cameras()
+    assert result["ok"] is True
+    assert fake.puts
+    for req in fake.puts:
+        params = req["params"]
+        srcs = [v for k, v in params if k == "src"]
+        assert not any(s.startswith("ffmpeg:") for s in srcs), srcs
+
+
 def test_camera_schema_migrates_existing_database(tmp_path, monkeypatch):
     legacy = tmp_path / "legacy.db"
     con = main.sqlite3.connect(legacy)

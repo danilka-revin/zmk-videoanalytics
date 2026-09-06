@@ -46,8 +46,9 @@ def test_camera_full_crud_search_telemetry_and_diagnostics(monkeypatch):
         camera=c.get(f'/api/cameras/{camera_id}').json()
         assert camera['description']=='Ворота №2' and camera['fps_limit']==6
         assert 'rtsp_url' not in camera
-        # preview_mode defaults to mse and is returned per camera.
-        assert camera['preview_mode']=='mse'
+        # preview_mode defaults to auto (browser picks H.264 or VP8) and is
+        # returned per camera.
+        assert camera['preview_mode']=='auto'
         updated=c.put(f'/api/cameras/{camera_id}',json={'name':'Склад Южный','zone':'Склад','description':'После переноса','rtsp_url':None,'fps_limit':4.5,'enabled':True,'preview_mode':'mjpeg'})
         assert updated.status_code==200 and updated.json()['preview_mode']=='mjpeg'
         assert c.get(f'/api/cameras/{camera_id}').json()['preview_mode']=='mjpeg'
