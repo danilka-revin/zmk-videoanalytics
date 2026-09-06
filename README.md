@@ -6,7 +6,7 @@
 
 > Впервые работаете с Docker и серверными приложениями? Откройте **[подробную инструкцию для начинающих](docs/BEGINNER_GUIDE_RU.md)** — в ней пошагово разобраны Windows, Linux, Telegram, MAX, камеры, безопасность, обновление и типовые ошибки.
 
-![Version](https://img.shields.io/badge/version-2.12.0-25332d)
+![Version](https://img.shields.io/badge/version-2.19.0-25332d)
 ![Python](https://img.shields.io/badge/Python-3.11%2B-3776ab)
 ![FastAPI](https://img.shields.io/badge/FastAPI-0.141-009688)
 ![React](https://img.shields.io/badge/React-TypeScript-61dafb)
@@ -505,7 +505,7 @@ docker-compose.yml       Локальная и production-конфигураци
 
 ## Статус
 
-Версия `2.12.0` является рабочим интеграционным контуром без витринных данных. Web-панель, REST API, camera CRUD, диагностика, поиск, отчёты, Telegram/MAX и внешний inference gateway работают локально. Для распознавания подключите RTSP ingestion worker и зарегистрируйте реальный артефакт модели. Training worker запускается вместе с проектом и доступен в CPU fallback; реальная GPU-скорость требует NVIDIA Driver и NVIDIA Container Toolkit.
+Версия `2.19.0` является рабочим интеграционным контуром без витринных данных. Web-панель, REST API, camera CRUD, диагностика, поиск, отчёты, Telegram/MAX и внешний inference gateway работают локально. Для распознавания подключите RTSP ingestion worker и зарегистрируйте реальный артефакт модели. Training worker запускается вместе с проектом и доступен в CPU fallback; реальная GPU-скорость требует NVIDIA Driver и NVIDIA Container Toolkit.
 
 ## Вход по паролю и восстановление доступа
 
