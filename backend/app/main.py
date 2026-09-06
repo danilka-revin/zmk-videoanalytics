@@ -837,7 +837,7 @@ def init_db():
         # The panel ships with ready-to-use local accounts (admin / директор), so
         # a first login is not blocked by a forced password change any more. The
         # gate itself is still enforced for databases that have the flag set.
-        "active_model":"", "active_model_slots":"{}", "active_model_disabled":"false", "ppe_trial_previous_model":"", "model_test_mode":"false", "auth_email":"", "auth_password_must_change":"false", "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
+        "active_model":"", "active_model_slots":"{}", "active_model_disabled":"false", "ppe_trial_previous_model":"", "model_test_mode":"false", "auth_email":"", "auth_password_must_change":str(False).lower(), "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
         "retention_days":"90", "archive_quality":"90", "archive_clip_seconds":"10",
         "inference_fps":"8", "inference_device":"cuda:0", "batch_size":"4", "nms_iou":"0.45", "model_test_conf":str(MODEL_TEST_CONF_DEFAULT),
         "helmet_conf":"0.85", "vest_conf":"0.80", "phone_conf":"0.78", "smoking_conf":"0.80", "restricted_zone_conf":"0.82", "immobility_conf":"0.80", "min_model_precision":"90", "min_model_recall":"85",
