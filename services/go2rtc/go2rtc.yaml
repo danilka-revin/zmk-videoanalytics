@@ -1,21 +1,22 @@
-# ZMK Vision go2rtc v2.16.0 — REAL STREAM ONLY, NO MJPEG, TRUE 25-60 FPS
+# ZMK Vision go2rtc v2.18.0 — REAL STREAM ONLY, TRUE 25-60 FPS
 #
-# Architecture v2.16.0: COMPLETELY NEW STREAMING METHOD (no MJPEG)
+# Architecture v2.18.0 (codec-agnostic browser preview):
 # - go2rtc is the ONLY RTSP client to camera (single connection, like VLC)
 # - API creates streams zmk-{id} via PUT /rtc/api/streams?src=rtsp://...#transport=tcp#backchannel=0
+#   and, when GO2RTC_WEBRTC_VP8 is on, adds a VP8 ffmpeg transcode of that feed:
+#   src=ffmpeg:zmk-{id}#video=vp8
 # - Inference worker pulls from go2rtc RTSP rtsp://host.docker.internal:8554/zmk-{id} (low-delay flags)
-# - Frontend PRIMARY: MSE fMP4 over WebSocket /rtc/api/ws?src=zmk-{id} -> true H264 25-60 FPS, no STUN, HTTP-based, reliable
-# - Frontend FALLBACK: HLS fMP4 low-latency /rtc/api/stream.m3u8?src=zmk-{id}&mp4 via hls.js (also true H264)
-# - Frontend LAST: snapshot polling 1 FPS (not MJPEG stream) to avoid black screen
-# - NO MJPEG anywhere for preview (fixes 4 FPS bottleneck)
+# - Frontend PRIMARY (modern): WebRTC over /rtc/api/ws?src=zmk-{id}. Browsers with an
+#   H.264 decoder get H.264 passthrough; browsers WITHOUT one (Firefox on Ubuntu) get
+#   a VP8 track, so the card is never black.
+# - Frontend FALLBACK: MSE fMP4 over WebSocket /rtc/api/ws?src=zmk-{id} (H.264), then
+#   HLS fMP4 /rtc/api/stream.m3u8?src=zmk-{id}&mp4 via hls.js for H.264-capable browsers.
+# - Frontend LAST: multipart MJPEG /api/cameras/{id}/mjpeg so a card is never empty.
 #
-# Why previous black screen:
-# - WebRTC candidates included 127.0.0.1:8555 (browser tries to connect to itself -> fail)
-# - STUN-only WebRTC fails behind NAT/firewall, and frontend fallback chain was too complex and tried JPEG polling which also needs ffmpeg
-# - New method: MSE over WS is same-origin, no ICE, no STUN, just HTTP WebSocket, always works if go2rtc has stream
-# - HLS as fallback is also HTTP, no ICE, works everywhere
-#
-# Quality: H264 passthrough, no re-encode, no quality cut, full FPS like VLC
+# Why previous black screen on Firefox/Ubuntu:
+# - MSE/HLS only ever carry H.264. Ubuntu Firefox ships without an H.264 decoder, so
+#   the picture stayed black even though the stream worked. VP8 is a royalty-free codec
+#   that Firefox always decodes, hence the WebRTC/VP8 primary for those browsers.
 
 log:
   format: text
@@ -31,11 +32,19 @@ rtsp:
   # mp4 = H264/H265 passthrough for MSE/HLS, no transcoding, true FPS
   default_query: "mp4"
 
+# FFmpeg templates used by the API's VP8 producer (ffmpeg:{name}#video=vp8).
+# `libvpx` is the royalty-free VP8 encoder that every browser can decode — it is
+# what makes the camera card render on Firefox/Ubuntu where H.264 is missing.
+# Real-time low-latency settings keep the preview live without a visible delay;
+# the encoder only runs while a browser is connected to the stream.
+ffmpeg:
+  vp8: "-c:v libvpx -g 50 -pix_fmt yuv420p -b:v 2M -maxrate:v 2M -bufsize:v 4M -deadline realtime -cpu-used 5 -error-resilient 1 -threads 2"
+
 webrtc:
   listen: ":8555"
-  # FIX v2.16.0: Remove 127.0.0.1:8555 which caused browser to try localhost and black screen
-  # With host network mode, go2rtc auto-discovers LAN IPs. Keep only STUN for public IP.
-  # TCP candidate removed - MSE/HLS over HTTP is primary, WebRTC optional for low latency
+  # With host network mode, go2rtc auto-discovers LAN IPs. `stun:8555` only adds a
+  # dynamic-public-IP candidate. Media flows directly browser <-> go2rtc on 8555
+  # (both TCP and UDP). MSE/HLS stay as HTTP fallbacks for H.264-capable browsers.
   candidates:
     - stun:8555
   ice_servers:
@@ -43,5 +52,5 @@ webrtc:
 
 # Camera RTSP sources managed by ZMK API
 # Each stream is created as zmk-{id} with source rtsp://camera#transport=tcp#backchannel=0
-# go2rtc keeps single RTSP connection and fans out to inference + MSE/HLS browsers
+# go2rtc keeps single RTSP connection and fans out to inference + WebRTC/MSE/HLS browsers
 streams: {}

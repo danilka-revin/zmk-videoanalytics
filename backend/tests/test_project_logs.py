@@ -213,7 +213,7 @@ def test_project_log_accepts_a_list_of_levels():
 def test_shipped_logs_cannot_grow_the_journal_forever(monkeypatch):
     """Потолок по числу строк: зеркало stdout не должно раздувать базу."""
     main._service_log_buckets.clear()
-    main._logs_prune_at = 0.0
+    main._logs_prune_at = -1e9
     monkeypatch.setattr(main, "LOG_TABLE_MAX_ROWS", 10)
     with TestClient(main.app) as c:
         for index in range(25):
@@ -225,4 +225,4 @@ def test_shipped_logs_cannot_grow_the_journal_forever(monkeypatch):
         con.close()
         assert total <= 10 and newest == "новая строка worker-а"
     main._service_log_buckets.clear()
-    main._logs_prune_at = 0.0
+    main._logs_prune_at = -1e9

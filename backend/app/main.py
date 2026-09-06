@@ -114,6 +114,11 @@ if GO2RTC_RTSP_TRANSPORT not in {"tcp", "udp"}:
     GO2RTC_RTSP_TRANSPORT = "tcp"
 GO2RTC_SYNC_TIMEOUT_SECONDS = 5.0
 GO2RTC_USE_FOR_INFERENCE = os.getenv("GO2RTC_USE_FOR_INFERENCE", "true").strip().lower() not in {"0", "false", "no", "off"}
+# When enabled (default), every camera stream also gets a VP8 ffmpeg producer
+# in go2rtc. Browsers that cannot decode H.264 (e.g. Firefox on Ubuntu without
+# the OpenH264/gstreamer codec) receive a VP8 WebRTC track instead of a black
+# H.264 MSE/HLS stream. The transcode only starts while a browser is watching.
+GO2RTC_WEBRTC_VP8 = os.getenv("GO2RTC_WEBRTC_VP8", "true").strip().lower() not in {"0", "false", "no", "off"}
 TRAINING_WORKER_URL = os.getenv("TRAINING_WORKER_URL", "").rstrip("/")
 DATASET_DIR = Path(os.getenv("DATASET_DIR", "")) if os.getenv("DATASET_DIR") else (DB_PATH.parent / "datasets")
 MODEL_DIR = Path(os.getenv("MODEL_DIR", "")) if os.getenv("MODEL_DIR") else (DB_PATH.parent / "models")
@@ -269,7 +274,12 @@ except ValueError: SERVICE_LOG_RATE_PER_MINUTE=1200
 # retention_days держим жёсткий потолок по числу строк.
 try: LOG_TABLE_MAX_ROWS=max(1_000,min(5_000_000,int(os.getenv("PROJECT_LOG_MAX_ROWS","200000"))))
 except ValueError: LOG_TABLE_MAX_ROWS=200_000
-_logs_prune_at=0.0
+# "Never yet pruned" sentinel. Using a large negative value (not 0.0) keeps the
+# monotonic-clock throttle arithmetic valid even on a freshly booted host, where
+# time.monotonic() can be smaller than the 300 s throttle window; otherwise the
+# first prune within the first minutes of boot would be skipped and the log
+# table could grow past its cap.
+_logs_prune_at=-1e9
 PROJECT_LOG_WINDOW_CAP=4000
 _runtime_logs:deque[dict[str,Any]]=deque(maxlen=RUNTIME_LOG_LIMIT)
 _runtime_log_lock=threading.Lock()
@@ -650,7 +660,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS auth_recovery_codes(id TEXT PRIMARY KEY, email TEXT NOT NULL, code_hash TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, used_at TEXT NOT NULL DEFAULT '');
     """)
     camera_columns={r[1] for r in con.execute("PRAGMA table_info(cameras)").fetchall()}
-    for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''","telemetry_at":"TEXT NOT NULL DEFAULT ''","last_error":"TEXT NOT NULL DEFAULT ''","restart_requested_at":"TEXT NOT NULL DEFAULT ''","preview_mode":"TEXT NOT NULL DEFAULT 'mse'"}.items():
+    for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''","telemetry_at":"TEXT NOT NULL DEFAULT ''","last_error":"TEXT NOT NULL DEFAULT ''","restart_requested_at":"TEXT NOT NULL DEFAULT ''","preview_mode":"TEXT NOT NULL DEFAULT 'auto'"}.items():
         if column not in camera_columns: con.execute(f"ALTER TABLE cameras ADD COLUMN {column} {ddl}")
     con.execute("UPDATE cameras SET created_at=updated_at WHERE created_at='' OR created_at IS NULL")
     # A live MJPEG browser stream has a deliberate upper bound: keep stored
@@ -1180,9 +1190,12 @@ class CameraIn(BaseModel):
     fps_limit:float=Field(default=30,ge=.1,le=60)
     enabled:bool=True
     # Browser preview transport only. It never changes the inference worker's
-    # own RTSP connection (which always runs through go2rtc). mse = H.264 over
-    # Media Source via go2rtc (default); mjpeg = reliable multipart JPEG stream.
-    preview_mode:Literal["mse","mjpeg"]="mse"
+    # own RTSP connection (which always runs through go2rtc). auto (default)
+    # lets the browser pick the best codec (VP8 WebRTC when H.264 is unavailable,
+    # e.g. Firefox on Ubuntu; H.264 MSE/HLS otherwise). mse = H.264 over Media
+    # Source via go2rtc; webrtc = always VP8 WebRTC (works anywhere, uses a CPU
+    # ffmpeg transcode on the host); mjpeg = reliable multipart JPEG stream.
+    preview_mode:Literal["auto","mse","webrtc","mjpeg"]="auto"
     @field_validator("rtsp_url")
     @classmethod
     def validate_rtsp(cls,value:str):
@@ -1196,7 +1209,7 @@ class CameraUpdate(BaseModel):
     enabled:bool=True
     # Optional so older clients that never heard of the toggle keep the current
     # stored value unchanged on update.
-    preview_mode:Literal["mse","mjpeg"]|None=None
+    preview_mode:Literal["auto","mse","webrtc","mjpeg"]|None=None
     @field_validator("rtsp_url")
     @classmethod
     def validate_rtsp(cls,value:str|None):
@@ -1357,7 +1370,9 @@ def sync_go2rtc_cameras() -> dict[str, Any]:
     v2.14.0 ARCHITECTURE: go2rtc is the ONLY RTSP client to camera.
     - Backend creates streams zmk-{id} and {id} in go2rtc (single connection to camera)
     - Inference worker pulls from go2rtc RTSP rtsp://host.docker.internal:8554/zmk-{id} (local, high FPS)
-    - Frontend pulls from go2rtc via WebRTC H264 direct (true 25-60 FPS, no re-encode)
+    - Frontend pulls from go2rtc via WebRTC: H.264 passthrough when the browser can
+      decode it, or a VP8 ffmpeg transcode (GO2RTC_WEBRTC_VP8) when it cannot
+      (Firefox on Ubuntu has no H.264 decoder). True 25-60 FPS.
     This eliminates double RTSP connections that caused 4 FPS and constant reconnects.
     go2rtc is optional: a slow/absent relay must never break camera CRUD.
     """
@@ -1391,12 +1406,22 @@ def sync_go2rtc_cameras() -> dict[str, Any]:
             # and fan-out to multiple consumers (inference RTSP + WebRTC browsers)
             for name, rtsp_url in desired_map.items():
                 source = _go2rtc_source_url(rtsp_url)
-                # Use PUT with src param - go2rtc will create stream on demand
-                # and keep it alive while consumers exist (inference worker always connected)
+                # A stream can carry several producers; each `src` adds one.
+                # The first is the direct camera RTSP feed. When GO2RTC_WEBRTC_VP8
+                # is on we also add a VP8 ffmpeg transcode of that feed so WebRTC
+                # browsers without an H.264 decoder (Firefox on Ubuntu) can watch.
+                sources = [source]
+                if GO2RTC_WEBRTC_VP8:
+                    # go2rtc lazily starts this ffmpeg producer only while a
+                    # browser is actually connected, so no idle CPU cost.
+                    sources.append(f"ffmpeg:{name}#video=vp8")
+                # Use PUT with repeated src params - go2rtc will create stream on
+                # demand and keep it alive while consumers exist (inference worker
+                # always connected).
                 try:
                     response = client.put(
                         f"{GO2RTC_API_URL}/api/streams",
-                        params=[("name", name), ("src", source)],
+                        params=[("name", name), *[("src", s) for s in sources]],
                         timeout=5.0,
                     )
                     if response.status_code >= 400:
