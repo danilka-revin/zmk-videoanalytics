@@ -43,7 +43,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-APP_VERSION = "2.19.0"
+APP_VERSION = "2.21.0"
 TZ = timezone(timedelta(hours=7))
 CAMERA_TELEMETRY_STALE_SECONDS = 30
 HIGH_FPS_MODE = os.getenv("CAMERA_HIGH_FPS_MODE", "true").strip().lower() not in {"0","false","no","off"}
@@ -99,6 +99,14 @@ def _normalize_role(value: str | None) -> str:
     # `director` was a role name in the first two-account release; it is the
     # read-only seat and maps onto `viewer`.
     return role if role in AUTH_ROLES else ("viewer" if role=="director" else DEFAULT_AUTH_ROLE)
+
+# Admin → Пользователи historically used `operator` and `director`; map them
+# onto the panel roles («Аналитик» / «Гость») so old clients keep working.
+ADMIN_ROLE_ALIASES={"operator":"analyst","director":"viewer"}
+
+def _normalize_admin_role(value: str | None) -> str:
+    role=str(value or DEFAULT_AUTH_ROLE).strip().lower()
+    return ADMIN_ROLE_ALIASES.get(role,role)
 
 def _normalize_account_login(value: str | None) -> str:
     return str(value or DEFAULT_AUTH_LOGIN).strip().lower()[:32] or DEFAULT_AUTH_LOGIN
@@ -677,7 +685,7 @@ def _set_auth_cookie(response: Response, token: str, request: Request) -> None:
 # Non-administrator accounts work from an explicit allowlist, so a new
 # administrative endpoint is never exposed to them by accident.
 PANEL_READ_PREFIXES=("/api/dashboard","/api/cameras","/api/events","/api/analytics","/api/reports","/api/search","/api/session","/api/health","/api/auth/")
-PANEL_WRITE_PATHS={"/api/auth/logout","/api/auth/password"}
+PANEL_WRITE_PATHS={"/api/auth/logout","/api/auth/password","/api/auth/login"}
 # «Аналитик» works the review queue: accepting and rejecting detections is the
 # whole job, everything that configures the platform stays closed.
 EVENT_REVIEW_PATHS={"/api/events/ack-bulk","/api/events/reject-bulk"}
@@ -808,12 +816,14 @@ def init_db():
         con.execute("ALTER TABLE events ADD COLUMN review_status TEXT NOT NULL DEFAULT 'pending'")
         con.execute("UPDATE events SET review_status=CASE WHEN acknowledged=1 THEN 'accepted' ELSE 'pending' END")
     if "reviewed_at" not in event_columns: con.execute("ALTER TABLE events ADD COLUMN reviewed_at TEXT NOT NULL DEFAULT ''")
+    if "reviewed_by" not in event_columns: con.execute("ALTER TABLE events ADD COLUMN reviewed_by TEXT NOT NULL DEFAULT ''")
     con.execute("UPDATE events SET review_status='pending' WHERE review_status NOT IN ('pending','accepted','rejected') OR review_status='' OR review_status IS NULL")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_events_external_id ON events(external_id) WHERE external_id IS NOT NULL")
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_timestamp ON events(timestamp DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_camera_timestamp ON events(camera_id,timestamp DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_severity_ack ON events(severity,acknowledged)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_review_status ON events(review_status,timestamp DESC)")
+    con.execute("CREATE INDEX IF NOT EXISTS ix_events_reviewed_by ON events(reviewed_by,review_status,reviewed_at)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_logs_timestamp_level ON logs(timestamp DESC,level)")
     # Вкладка «Логи» группирует журнал по компонентам проекта.
     con.execute("CREATE INDEX IF NOT EXISTS ix_logs_service_timestamp ON logs(service,timestamp DESC)")
@@ -1605,6 +1615,49 @@ class UserIn(BaseModel):
     name:str=Field(min_length=2,max_length=80)
     login:str=Field(min_length=2,max_length=40,pattern=r"^[a-zA-Z0-9._-]+$")
     role:Literal["admin","operator","viewer"]
+class AdminUserCreateIn(BaseModel):
+    """A real, login-capable account created from Admin → Пользователи."""
+    name:str=Field(min_length=2,max_length=60)
+    login:str=Field(min_length=2,max_length=32)
+    role:str=Field(default=DEFAULT_AUTH_ROLE,max_length=20)
+    password:str=Field(min_length=4,max_length=128)
+    @field_validator("login")
+    @classmethod
+    def validate_login(cls,value:str)->str:
+        login=str(value or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9._-]{2,32}",login): raise ValueError("Логин: 2–32 символа, латиница, цифры, точка, дефис")
+        return login
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls,value:str)->str:
+        role=_normalize_admin_role(value)
+        if role not in AUTH_ROLES: raise ValueError("Неизвестная роль")
+        return role
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls,value:str)->str:
+        name=str(value or "").strip()
+        if len(name)<2: raise ValueError("Имя пользователя слишком короткое")
+        return name[:60]
+class AdminUserUpdateIn(BaseModel):
+    name:str|None=Field(default=None,max_length=60)
+    role:str|None=Field(default=None,max_length=20)
+    password:str|None=Field(default=None,min_length=4,max_length=128)
+    active:bool|None=None
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls,value:str|None)->str|None:
+        if value is None: return None
+        role=_normalize_admin_role(value)
+        if role not in AUTH_ROLES: raise ValueError("Неизвестная роль")
+        return role
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls,value:str|None)->str|None:
+        if value is None: return None
+        name=str(value).strip()
+        if len(name)<2: raise ValueError("Имя пользователя слишком короткое")
+        return name[:60]
 class ModelIn(BaseModel):
     name:str=Field(min_length=2,max_length=120,pattern=r"^[a-zA-Z0-9._-]+$")
     format:Literal["ONNX","ONNX FP16","TensorRT","TensorRT FP16","PyTorch"]
@@ -2518,6 +2571,85 @@ def events(limit:int=Query(50,ge=1,le=500),severity:str|None=None,event_type:str
     for item in data: item["has_frame"]=event_frame_path_for(int(item["id"])).is_file()
     return data
 
+@app.get("/api/reports/analysts")
+def analyst_summary(request:Request,hours:int=Query(24,ge=1,le=2160),start:str|None=Query(default=None,max_length=40),end:str|None=Query(default=None,max_length=40)):
+    """Сводка по аналитикам/операторам: принято, не принято, время работы.
+
+    Counts every panel/Telegram account that actually reviewed detections in
+    the period (an event keeps its reviewer — `reviewed_by`), so the
+    «Обзор» and «Админ» can show a short operator digest for the director
+    and the administrator without exposing it to the reviewer itself.
+    """
+    since=start or (datetime.now(TZ)-timedelta(hours=hours)).isoformat(timespec="seconds")
+    until=end or now_iso()
+    # Сводка предназначена директору и администратору, а не самому аналитику.
+    if PASSWORD_AUTH_ENABLED:
+        session=_auth_session(request)
+        if session and _normalize_role(session.get("role",""))=="analyst":
+            raise HTTPException(403,"Сводка по аналитикам доступна директору и администратору")
+    try:
+        since_dt=datetime.fromisoformat(since); until_dt=datetime.fromisoformat(until)
+    except ValueError:
+        raise HTTPException(422,"Некорректный период")
+    if until_dt<since_dt: raise HTTPException(422,"Конец периода раньше начала")
+    brief=max(1,min(2160,int((until_dt-since_dt).total_seconds()//3600)))
+    con=db()
+    try:
+        rows_all=con.execute("""SELECT reviewed_by,
+            SUM(CASE WHEN review_status='accepted' THEN 1 ELSE 0 END) accepted,
+            SUM(CASE WHEN review_status='rejected' THEN 1 ELSE 0 END) rejected,
+            COUNT(*) total, MIN(reviewed_at) first_at, MAX(reviewed_at) last_at
+            FROM events WHERE reviewed_by!='' AND review_status IN ('accepted','rejected')
+            AND reviewed_at>=? AND reviewed_at<=? GROUP BY reviewed_by ORDER BY accepted DESC,rejected DESC""",(since,until)).fetchall()
+        # «Время работы» — сумма активных сессий: промежутки между соседними
+        # проверками, пока перерыв меньше 30 минут. Паузы (обед и т.п.) в
+        # работу не входят.
+        active_marks=con.execute("""SELECT reviewed_by,reviewed_at FROM events
+            WHERE reviewed_by!='' AND review_status IN ('accepted','rejected')
+            AND reviewed_at>=? AND reviewed_at<=? ORDER BY reviewed_by,reviewed_at""",(since,until)).fetchall()
+        work_by_login:dict[str,int]={}
+        by_reviewer:dict[str,list[str]]={}
+        for reviewer,mark in active_marks:
+            by_reviewer.setdefault(str(reviewer),[]).append(str(mark))
+        for reviewer,marks in by_reviewer.items():
+            total=0; prev:datetime.datetime|None=None
+            for mark in marks:
+                try: current=datetime.fromisoformat(mark)
+                except ValueError: continue
+                if prev is not None:
+                    gap=(current-prev).total_seconds()
+                    if 0<gap<=1800: total+=int(gap)
+                prev=current
+            work_by_login[reviewer]=total
+        accounts=con.execute("SELECT login,label,role,active,built_in FROM auth_accounts ORDER BY built_in DESC,login ASC").fetchall()
+        known={str(r[0]):{"label":str(r[1]),"role":_normalize_role(r[2]),"active":bool(r[3]),"built_in":bool(r[4])} for r in accounts}
+        profiles:list[dict[str,Any]]=[]
+        for row in rows_all:
+            reviewer=str(row[0] or "")
+            if not reviewer: continue
+            accepted=int(row[1] or 0); rejected=int(row[2] or 0)
+            first_at=str(row[4] or ""); last_at=str(row[5] or "")
+            seconds=work_by_login.get(reviewer,0)
+            profile=known.get(reviewer,{"label":reviewer,"role":"","active":True,"built_in":False})
+            profiles.append({"login":reviewer,"label":profile["label"],"role":profile["role"],
+                "accepted":accepted,"rejected":rejected,"total":int(row[3] or 0),
+                "first_at":first_at,"last_at":last_at,"work_seconds":seconds,
+                "work_hours":round(seconds/3600,2),"active":bool(profile["active"]),"built_in":bool(profile["built_in"])})
+        # Accounts that did not act in the period are still listed as «0», so the
+        # director sees the whole team at a glance.
+        seen={p["login"] for p in profiles}
+        for login,meta in known.items():
+            if login in seen: continue
+            profiles.append({"login":login,"label":meta["label"],"role":meta["role"],"accepted":0,"rejected":0,"total":0,
+                "first_at":"","last_at":"","work_seconds":0,"work_hours":0,"active":bool(meta["active"]),"built_in":bool(meta["built_in"])})
+        profiles.sort(key=lambda p:(p["accepted"]+p["rejected"]+p["total"],p["login"]),reverse=True)
+        return {"generated_at":now_iso(),"period":{"from":since,"to":until,"hours":brief},
+            "totals":{"accepted":sum(p["accepted"] for p in profiles),"rejected":sum(p["rejected"] for p in profiles),
+                      "total":sum(p["total"] for p in profiles),"active_analysts":sum(1 for p in profiles if p["accepted"]+p["rejected"]>0)},
+            "analysts":profiles}
+    finally:
+        con.close()
+
 @app.get("/api/events/by-id/{event_id}")
 def event_by_id(event_id:int):
     data=rows("""SELECT e.*,c.name camera_name,c.zone FROM events e JOIN cameras c ON c.id=e.camera_id
@@ -2534,11 +2666,28 @@ def event_frame(event_id:int):
     if not target.is_file(): raise HTTPException(404,"Кадр события ещё не сохранён")
     return FileResponse(target,media_type="image/jpeg",headers={"Cache-Control":"no-store"})
 
-def _bulk_review_events(payload:BulkAckIn,review_status:Literal["accepted","rejected"],default_note:str) -> dict:
+def _reviewer_label(request: Request) -> str:
+    """Who is acting right now: panel login, Telegram identity or a service client."""
+    session=_auth_session(request) if PASSWORD_AUTH_ENABLED else None
+    if session:
+        return _normalize_account_login(str(session.get("login") or DEFAULT_AUTH_LOGIN))
+    init_data=request.headers.get("X-Telegram-Init-Data","")
+    if telegram_webapp_role(init_data):
+        try:
+            values=dict(parse_qsl(init_data,keep_blank_values=True))
+            raw=json.loads(values.get("user","{}"))
+            name=str(raw.get("username") or raw.get("first_name") or "")[:40]
+            return f"telegram:{name}" if name else "telegram"
+        except (TypeError,ValueError,json.JSONDecodeError):
+            return "telegram"
+    return "api"
+
+def _bulk_review_events(payload:BulkAckIn,review_status:Literal["accepted","rejected"],default_note:str,request:Request) -> dict:
     """Apply one review decision to a validated group of event IDs."""
     event_ids=payload.event_ids
     marks=",".join("?" for _ in event_ids)
     note=payload.note.strip() or default_note
+    reviewer=_reviewer_label(request)
     con=db()
     try:
         rows_found=con.execute(f"SELECT id,review_status FROM events WHERE id IN ({marks})",event_ids).fetchall()  # nosec B608 - placeholders only
@@ -2548,34 +2697,36 @@ def _bulk_review_events(payload:BulkAckIn,review_status:Literal["accepted","reje
         already=[event_id for event_id in event_ids if found.get(event_id)==review_status]
         if updated:
             update_marks=",".join("?" for _ in updated)
-            con.execute(f"UPDATE events SET acknowledged=1,review_status=?,reviewed_at=?,note=? WHERE id IN ({update_marks})",(review_status,now_iso(),note,*updated))  # nosec B608 - placeholders only
-        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","event_manager",f"Bulk review status={review_status} updated={len(updated)} already={len(already)} missing={len(missing)}"))
+            con.execute(f"UPDATE events SET acknowledged=1,review_status=?,reviewed_at=?,note=?,reviewed_by=? WHERE id IN ({update_marks})",(review_status,now_iso(),note,reviewer,*updated))  # nosec B608 - placeholders only
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","event_manager",f"Bulk review status={review_status} reviewer={reviewer} updated={len(updated)} already={len(already)} missing={len(missing)}"))
         con.commit()
         return {"updated_ids":updated,"already_ids":already,"missing_ids":missing,"review_status":review_status,"note":note}
     finally:
         con.close()
 
 @app.post("/api/events/ack-bulk")
-def ack_events_bulk(payload:BulkAckIn):
-    result=_bulk_review_events(payload,"accepted","Проверено оператором")
+def ack_events_bulk(payload:BulkAckIn,request:Request):
+    result=_bulk_review_events(payload,"accepted","Проверено оператором",request)
     return {**result,"acknowledged_ids":result["updated_ids"],"already_acknowledged_ids":result["already_ids"]}
 
 @app.post("/api/events/reject-bulk")
-def reject_events_bulk(payload:BulkAckIn):
-    result=_bulk_review_events(payload,"rejected","Не принято оператором")
+def reject_events_bulk(payload:BulkAckIn,request:Request):
+    result=_bulk_review_events(payload,"rejected","Не принято оператором",request)
     return {**result,"rejected_ids":result["updated_ids"],"already_rejected_ids":result["already_ids"]}
 
 @app.post("/api/events/{event_id}/ack")
-def ack(event_id:int,payload:AckIn):
+def ack(event_id:int,payload:AckIn,request:Request):
     note=payload.note.strip() or "Проверено оператором"
-    con=db(); cur=con.execute("UPDATE events SET acknowledged=1,review_status='accepted',reviewed_at=?,note=? WHERE id=?",(now_iso(),note,event_id)); con.commit(); con.close()
+    reviewer=_reviewer_label(request)
+    con=db(); cur=con.execute("UPDATE events SET acknowledged=1,review_status='accepted',reviewed_at=?,note=?,reviewed_by=? WHERE id=?",(now_iso(),note,reviewer,event_id)); con.commit(); con.close()
     if not cur.rowcount: raise HTTPException(404,"Событие не найдено")
     return {"id":event_id,"acknowledged":True,"review_status":"accepted","note":note}
 
 @app.post("/api/events/{event_id}/reject")
-def reject_event(event_id:int,payload:AckIn):
+def reject_event(event_id:int,payload:AckIn,request:Request):
     note=payload.note.strip() or "Не принято оператором"
-    con=db(); cur=con.execute("UPDATE events SET acknowledged=1,review_status='rejected',reviewed_at=?,note=? WHERE id=?",(now_iso(),note,event_id)); con.commit(); con.close()
+    reviewer=_reviewer_label(request)
+    con=db(); cur=con.execute("UPDATE events SET acknowledged=1,review_status='rejected',reviewed_at=?,note=?,reviewed_by=? WHERE id=?",(now_iso(),note,reviewer,event_id)); con.commit(); con.close()
     if not cur.rowcount: raise HTTPException(404,"Событие не найдено")
     return {"id":event_id,"acknowledged":True,"review_status":"rejected","note":note}
 @app.post("/api/inference/detections")
@@ -2806,22 +2957,112 @@ def complete_bot_command(provider: Literal["telegram","max"], command_id:int, pa
         con.close()
 
 
+def _auth_account_admin_view(row) -> dict[str,Any]:
+    """Shape an `auth_accounts` row for Admin → Пользователи (and legacy clients)."""
+    login=str(row[0]); role=_normalize_role(row[2])
+    return {"id":login,"login":login,"name":str(row[1]),"label":str(row[1]),"role":role,
+            "role_label":AUTH_ROLES[role]["label"],"active":bool(row[3]),"built_in":bool(row[4]),
+            "created_at":str(row[5] or "")}
+
 @app.get("/api/admin/users")
-def get_users(): return rows("SELECT id,name,login,role,active,created_at FROM users ORDER BY id")
-@app.post("/api/admin/users",status_code=201)
-def create_user(payload:UserIn):
+def get_users():
     con=db()
-    try: cur=con.execute("INSERT INTO users(name,login,role,active,created_at) VALUES(?,?,?,?,?)",(payload.name,payload.login,payload.role,1,now_iso())); con.commit()
-    except sqlite3.IntegrityError: con.close(); raise HTTPException(409,"Логин уже используется")
-    uid=cur.lastrowid; con.close(); return {"id":uid,**payload.model_dump(),"active":True}
+    try:
+        rows=con.execute("SELECT login,label,role,active,built_in,created_at FROM auth_accounts ORDER BY built_in DESC,login ASC").fetchall()
+        return {"accounts":[_auth_account_admin_view(row) for row in rows],"roles":[dict(role) for role in AUTH_ROLES.values()]}
+    finally:
+        con.close()
+
+@app.post("/api/admin/users",status_code=201)
+def create_user(payload:AdminUserCreateIn,request:Request):
+    session=_auth_session(request)
+    login=payload.login
+    con=db()
+    try:
+        if con.execute("SELECT 1 FROM auth_accounts WHERE login=?",(login,)).fetchone():
+            raise HTTPException(409,"Логин уже используется")
+        con.execute("INSERT INTO auth_accounts(login,label,role,password_hash,active,built_in,created_at) VALUES(?,?,?,?,1,0,?)",
+                    (login,payload.name,payload.role,_hash_password(payload.password),now_iso()))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",
+                    (now_iso(),"INFO","auth",f"Account {login} ({payload.role}) created by {session.get('login') or 'admin'!s}"))
+        con.commit()
+        row=con.execute("SELECT login,label,role,active,built_in,created_at FROM auth_accounts WHERE login=?",(login,)).fetchone()
+    finally:
+        con.close()
+    return {"created":True,"account":_auth_account_admin_view(row)}
+
+@app.put("/api/admin/users/{user_id}")
+def update_user(user_id:str,payload:AdminUserUpdateIn,request:Request):
+    session=_auth_session(request)
+    login=_normalize_account_login(user_id)
+    con=db()
+    try:
+        row=con.execute("SELECT login,label,role,active,built_in FROM auth_accounts WHERE login=?",(login,)).fetchone()
+        if not row: raise HTTPException(404,"Пользователь не найден")
+        built_in=bool(row[4])
+        role=_normalize_role(payload.role if payload.role is not None else row[2])
+        # The platform must never end up without an administrator.
+        if built_in and login==DEFAULT_AUTH_LOGIN and (role!="admin" or payload.active is False):
+            raise HTTPException(422,"Встроенного администратора нельзя разжаловать или отключить")
+        if payload.active is False and login==str(session.get("login")):
+            raise HTTPException(422,"Нельзя отключить собственный аккаунт")
+        label=str(payload.name).strip() if payload.name is not None else str(row[1])
+        con.execute("UPDATE auth_accounts SET label=?,role=?,active=? WHERE login=?",(label,role,1 if (payload.active is None or payload.active) else 0,login))
+        if payload.password:
+            con.execute("UPDATE auth_accounts SET password_hash=? WHERE login=?",(_hash_password(payload.password),login))
+            con.execute("DELETE FROM auth_sessions WHERE login=? AND id!=?",(login,str(session.get("id"))))
+        if payload.active is False:
+            con.execute("DELETE FROM auth_sessions WHERE login=?",(login,))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",
+                    (now_iso(),"INFO","auth",f"Account {login} updated by {session.get('login') or 'admin'!s}"))
+        con.commit()
+        updated=con.execute("SELECT login,label,role,active,built_in,created_at FROM auth_accounts WHERE login=?",(login,)).fetchone()
+    finally:
+        con.close()
+    return {"updated":True,"account":_auth_account_admin_view(updated)}
+
+@app.delete("/api/admin/users/{user_id}")
+def delete_user(user_id:str,request:Request):
+    session=_auth_session(request)
+    login=_normalize_account_login(user_id)
+    if login==DEFAULT_AUTH_LOGIN:
+        raise HTTPException(422,"Встроенного администратора нельзя удалить")
+    if login==str(session.get("login")):
+        raise HTTPException(422,"Нельзя удалить собственный аккаунт")
+    con=db()
+    try:
+        row=con.execute("SELECT 1 FROM auth_accounts WHERE login=?",(login,)).fetchone()
+        if not row: raise HTTPException(404,"Пользователь не найден")
+        con.execute("DELETE FROM auth_accounts WHERE login=?",(login,))
+        con.execute("DELETE FROM auth_sessions WHERE login=?",(login,))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",
+                    (now_iso(),"WARNING","auth",f"Account {login} deleted by {session.get('login') or 'admin'!s}"))
+        con.commit()
+    finally:
+        con.close()
+    return {"deleted":True,"login":login}
+
 @app.patch("/api/admin/users/{user_id}/toggle")
-def toggle_user(user_id:int):
-    con=db(); row=con.execute("SELECT active,role FROM users WHERE id=?",(user_id,)).fetchone()
-    if not row: con.close(); raise HTTPException(404,"Пользователь не найден")
-    if row[1]=="admin" and row[0]:
-        admins=con.execute("SELECT COUNT(*) FROM users WHERE role='admin' AND active=1").fetchone()[0]
-        if admins<=1: con.close(); raise HTTPException(409,"Нельзя отключить последнего администратора")
-    active=0 if row[0] else 1; con.execute("UPDATE users SET active=? WHERE id=?",(active,user_id)); con.commit(); con.close(); return {"id":user_id,"active":bool(active)}
+def toggle_user(user_id:str,request:Request):
+    session=_auth_session(request)
+    login=_normalize_account_login(user_id)
+    if login==DEFAULT_AUTH_LOGIN:
+        raise HTTPException(422,"Встроенного администратора нельзя отключить")
+    if login==str(session.get("login")):
+        raise HTTPException(422,"Нельзя отключить собственный аккаунт")
+    con=db()
+    try:
+        row=con.execute("SELECT active,built_in FROM auth_accounts WHERE login=?",(login,)).fetchone()
+        if not row: raise HTTPException(404,"Пользователь не найден")
+        active=0 if row[0] else 1
+        con.execute("UPDATE auth_accounts SET active=? WHERE login=?",(active,login))
+        if not active: con.execute("DELETE FROM auth_sessions WHERE login=?",(login,))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",
+                    (now_iso(),"INFO","auth",f"Account {login} {'disabled' if not active else 'enabled'} by {session.get('login') or 'admin'!s}"))
+        con.commit()
+    finally:
+        con.close()
+    return {"id":login,"login":login,"active":bool(active)}
 
 @app.get("/api/logs")
 def logs(level:str|None=None,camera_id:str|None=None,limit:int=Query(100,ge=1,le=500)):
@@ -3724,7 +3965,7 @@ def cancel_training(job_id:int):
 
 @app.get("/api/admin/summary")
 def admin_summary():
-    con=db(); result={"users":con.execute("SELECT COUNT(*) FROM users WHERE active=1").fetchone()[0],"audit24h":con.execute("SELECT COUNT(*) FROM logs WHERE timestamp>=?",((datetime.now(TZ)-timedelta(days=1)).isoformat(),)).fetchone()[0],"errors24h":con.execute("SELECT COUNT(*) FROM logs WHERE level IN ('ERROR','CRITICAL') AND timestamp>=?",((datetime.now(TZ)-timedelta(days=1)).isoformat(),)).fetchone()[0],"training_running":con.execute("SELECT COUNT(*) FROM training_jobs WHERE status IN ('queued','running')").fetchone()[0]}; con.close(); return result
+    con=db(); result={"users":con.execute("SELECT COUNT(*) FROM auth_accounts WHERE active=1").fetchone()[0],"audit24h":con.execute("SELECT COUNT(*) FROM logs WHERE timestamp>=?",((datetime.now(TZ)-timedelta(days=1)).isoformat(),)).fetchone()[0],"errors24h":con.execute("SELECT COUNT(*) FROM logs WHERE level IN ('ERROR','CRITICAL') AND timestamp>=?",((datetime.now(TZ)-timedelta(days=1)).isoformat(),)).fetchone()[0],"training_running":con.execute("SELECT COUNT(*) FROM training_jobs WHERE status IN ('queued','running')").fetchone()[0]}; con.close(); return result
 @app.get("/api/reports/errors")
 def error_report(hours:int=Query(24,ge=1,le=720)):
     since=(datetime.now(TZ)-timedelta(hours=hours)).isoformat()

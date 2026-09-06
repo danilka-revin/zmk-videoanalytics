@@ -10,7 +10,11 @@ def test_production_starts_without_fake_entities(monkeypatch):
         assert c.get('/api/cameras').json() == []
         assert c.get('/api/events').json() == []
         assert c.get('/api/models').json() == []
-        assert c.get('/api/admin/users').json() == []
+        users = c.get('/api/admin/users').json()
+        assert 'accounts' in users and 'roles' in users
+        # Only the real login-capable accounts are present, never fake rows:
+        # the built-in administrator is always available for the first login.
+        assert any(a['login'] == 'admin' and a['built_in'] for a in users['accounts'])
         dashboard=c.get('/api/dashboard').json()
         assert dashboard['cameras']=={'total':0,'online':0}
         assert dashboard['active_model'] is None
