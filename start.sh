@@ -17,7 +17,10 @@
 #     ./start.sh --setup        — переоткрыть мастер настройки
 #     ./start.sh --check        — только проверка
 #     ./start.sh --no-update    — пропустить проверку обновлений
+#     ./start.sh --fast         — быстрый запуск без принудительной пересборки
+#                                 образов (использует уже собранные образы)
 #     NONINTERACTIVE=1 ./start.sh   — без вопросов (нужны env-переменные)
+#     ZMK_FAST=1 ./start.sh     — то же, что --fast, через переменную окружения
 # =====================================================================
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -278,9 +281,22 @@ print_launch_summary(){
   printf '%s\n\n' '================================================================'
 }
 
-echo "[start] Обновляю образы и запускаю сервисы ZMK Vision..."
+echo "[start] Запускаю сервисы ZMK Vision..."
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml или .env не прошли валидацию"
-start_stack || { "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose startup failed after BuildKit cache recovery"; }
+
+# --fast / ZMK_FAST=1 — быстрый запуск без принудительной полной пересборки.
+# Каждый обычный старт делает `up -d --build`, что снова прогоняет web-стадию
+# `npm ci` по сети. Если реестр npm недоступен/медленный, это виснет и
+# start.sh зацикливается на пересборке. --fast перезапускает уже собранный
+# стек (compose всё равно соберёт только те образы, которых ещё нет) и НЕ
+# трогает сеть для web. Используйте после обновления кода обычный ./start.sh.
+if [[ "${1:-}" == "--fast" || "${ZMK_FAST:-0}" == "1" ]]; then
+  echo "[start] Быстрый запуск: использую уже собранные образы (без --build)."
+  "${DC[@]}" "${PROFILE[@]}" up -d --remove-orphans || { "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose fast startup failed"; }
+else
+  echo "[start] Собираю/обновляю образы и запускаю сервисы..."
+  start_stack || { "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose startup failed after BuildKit cache recovery"; }
+fi
 if ! wait_http http://localhost:8000/api/health 120; then "${DC[@]}" logs --tail=100 api; fail "API health check failed"; fi
 if ! wait_http http://localhost:5173 120; then "${DC[@]}" logs --tail=100 web; fail "Web health check failed"; fi
 

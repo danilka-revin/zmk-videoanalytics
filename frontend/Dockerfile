@@ -1,7 +1,18 @@
 FROM node:24-alpine AS build
 WORKDIR /app
-COPY package.json package-lock.json ./
-RUN npm ci
+# .npmrc ships resilient fetch-retries/timeouts so `npm ci` below never hangs
+# silently against a slow or flaky registry. It is copied before package.json
+# so it is present for every install invocation.
+COPY .npmrc package.json package-lock.json ./
+# Allow overriding the npm registry (e.g. a regional mirror) for installations
+# where registry.npmjs.org is unreachable or throttled. Pass via docker-compose
+# build arg NPM_REGISTRY (mapped from ZMK_NPM_REGISTRY in .env).
+ARG NPM_REGISTRY
+RUN if [ -n "$NPM_REGISTRY" ]; then \
+      npm config set registry "$NPM_REGISTRY"; \
+    fi \
+ && npm ci --no-audit --no-fund \
+ && npm cache clean --force >/dev/null 2>&1 || true
 COPY . .
 RUN npm run build
 
