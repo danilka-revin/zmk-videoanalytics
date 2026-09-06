@@ -43,7 +43,7 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-APP_VERSION = "2.17.0"
+APP_VERSION = "2.19.0"
 TZ = timezone(timedelta(hours=7))
 CAMERA_TELEMETRY_STALE_SECONDS = 30
 HIGH_FPS_MODE = os.getenv("CAMERA_HIGH_FPS_MODE", "true").strip().lower() not in {"0","false","no","off"}
@@ -55,9 +55,30 @@ DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().paren
 STARTED = time.time()
 API_KEY = os.getenv("ZMK_API_KEY", "").strip()
 PASSWORD_AUTH_ENABLED=os.getenv("ZMK_PASSWORD_AUTH","false").strip().lower() not in {"0","false","no","off"}
-DEFAULT_INITIAL_APP_PASSWORD="1234"  # nosec B105 - operator-visible bootstrap default, changed on first login
+DEFAULT_INITIAL_APP_PASSWORD="admin"  # nosec B105 - operator-visible bootstrap default for the admin account
 LEGACY_INITIAL_APP_PASSWORD="1243"  # nosec B105 - legacy bootstrap default, corrected on upgrade
-AUTH_INITIAL_PASSWORD_VERSION="2"  # nosec B105 - version marker only, not a credential
+# Bootstrap passwords that were published in earlier releases. An *unchanged*
+# database that still uses one of them is migrated to the current default on
+# upgrade; a password the owner already chose is never touched.
+PUBLISHED_BOOTSTRAP_PASSWORDS={"1243","1234",DEFAULT_INITIAL_APP_PASSWORD}
+DEFAULT_INITIAL_DIRECTOR_PASSWORD="director"  # nosec B105 - read-only account bootstrap default
+AUTH_INITIAL_PASSWORD_VERSION="4"  # nosec B105 - version marker only, not a credential
+DEFAULT_AUTH_LOGIN="admin"
+# Local panel accounts live in the `auth_accounts` table: the administrator
+# creates as many of them as needed (аналитик, гость, мастер участка…) and picks
+# a role for each one. Roles are capability sets, not per-endpoint switches.
+AUTH_ROLES:dict[str,dict[str,str]]={
+    "admin":{"role":"admin","label":"Администратор","hint":"Полный доступ: камеры, модели, обучение, настройки, журнал и пользователи"},
+    "analyst":{"role":"analyst","label":"Аналитик","hint":"Камеры, аналитика и очередь событий: принимает и отклоняет детекции"},
+    "viewer":{"role":"viewer","label":"Гость","hint":"Только просмотр: инфографика, камеры и события без решений и настроек"},
+}
+DEFAULT_AUTH_ROLE="viewer"
+# Accounts created on a fresh database. `admin` is undeletable, `director` is a
+# ready-made read-only seat for management.
+BUILT_IN_ACCOUNTS:tuple[tuple[str,str,str],...]=(
+    ("admin","Администратор","admin"),
+    ("director","Директор","viewer"),
+)
 
 def _resolve_initial_app_password(value: str | None) -> str:
     """Keep the first-login default stable across older copied .env files."""
@@ -68,6 +89,20 @@ def _resolve_initial_app_password(value: str | None) -> str:
     return value
 
 INITIAL_APP_PASSWORD=_resolve_initial_app_password(os.getenv("ZMK_INITIAL_PASSWORD"))
+INITIAL_DIRECTOR_PASSWORD=(os.getenv("ZMK_DIRECTOR_PASSWORD","").strip() or DEFAULT_INITIAL_DIRECTOR_PASSWORD)
+# Legacy settings keys that held the two shipped passwords before accounts moved
+# to their own table. They are read once as a migration source.
+LEGACY_ACCOUNT_HASH_KEYS={"admin":"auth_password_hash","director":"auth_director_password_hash"}
+
+def _normalize_role(value: str | None) -> str:
+    role=str(value or DEFAULT_AUTH_ROLE).strip().lower()
+    # `director` was a role name in the first two-account release; it is the
+    # read-only seat and maps onto `viewer`.
+    return role if role in AUTH_ROLES else ("viewer" if role=="director" else DEFAULT_AUTH_ROLE)
+
+def _normalize_account_login(value: str | None) -> str:
+    return str(value or DEFAULT_AUTH_LOGIN).strip().lower()[:32] or DEFAULT_AUTH_LOGIN
+
 AUTH_COOKIE_NAME="zmk_session"
 try: AUTH_SESSION_HOURS=max(1,min(720,int(os.getenv("ZMK_AUTH_SESSION_HOURS","12") or 12)))
 except ValueError: AUTH_SESSION_HOURS=12
@@ -475,30 +510,90 @@ def _password_matches(password: str, encoded: str) -> bool:
 
 
 def _initialize_or_upgrade_auth_password(con: sqlite3.Connection) -> None:
-    """Create the initial password once and correct the previous 1243 default.
+    """Seed the local account table and correct previously published defaults.
 
-    The hash is normally immutable until the account owner changes or resets
-    it.  The sole migration path is an unversioned database that still has the
-    prior public setup password and is marked as requiring its first change.
-    This lets an upgrade fix an older copied `.env` without touching a password
-    the owner has already chosen.
+    Accounts live in `auth_accounts`; older releases kept one hash per account in
+    `settings`, and those values are migrated here exactly once.  A hash is
+    normally immutable until its owner changes or resets it.  The sole migration
+    path is an admin password that still equals a bootstrap password published in
+    an earlier release *and* was never changed by its owner, so an upgrade can fix
+    an older copied `.env` without touching a password the owner has chosen.
     """
-    password_row=con.execute("SELECT value FROM settings WHERE key='auth_password_hash'").fetchone()
-    if not password_row or not str(password_row[0]).strip():
-        con.execute("INSERT INTO settings(key,value) VALUES('auth_password_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(_hash_password(INITIAL_APP_PASSWORD),))
-        con.execute("INSERT INTO settings(key,value) VALUES('auth_initial_password_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(AUTH_INITIAL_PASSWORD_VERSION,))
-        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","auth","Initial local password initialized; change it after first login"))
-        return
+    def read(key: str) -> str:
+        row=con.execute("SELECT value FROM settings WHERE key=?",(key,)).fetchone()
+        return str(row[0]) if row else ""
 
-    version_row=con.execute("SELECT value FROM settings WHERE key='auth_initial_password_version'").fetchone()
-    if version_row and str(version_row[0]).strip():
-        return
-    must_change_row=con.execute("SELECT value FROM settings WHERE key='auth_password_must_change'").fetchone()
-    must_change=bool(must_change_row and str(must_change_row[0]).strip().lower()=="true")
-    if must_change and _password_matches(LEGACY_INITIAL_APP_PASSWORD,str(password_row[0])):
-        con.execute("UPDATE settings SET value=? WHERE key='auth_password_hash'",(_hash_password(INITIAL_APP_PASSWORD),))
-        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","auth","Legacy initial password corrected; change it after first login"))
-    con.execute("INSERT INTO settings(key,value) VALUES('auth_initial_password_version',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(AUTH_INITIAL_PASSWORD_VERSION,))
+    def write(key: str, value: str) -> None:
+        con.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(key,value))
+
+    admin_hash=read("auth_password_hash")
+    if not admin_hash.strip():
+        admin_hash=_hash_password(INITIAL_APP_PASSWORD)
+        write("auth_password_hash",admin_hash)
+        write("auth_initial_password_version",AUTH_INITIAL_PASSWORD_VERSION)
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","auth","Initial admin password initialized"))
+    elif not read("auth_initial_password_version").strip():
+        must_change=read("auth_password_must_change").strip().lower()=="true"
+        if must_change and any(_password_matches(published,admin_hash) for published in PUBLISHED_BOOTSTRAP_PASSWORDS):
+            admin_hash=_hash_password(INITIAL_APP_PASSWORD)
+            write("auth_password_hash",admin_hash)
+            con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","auth","Bootstrap admin password updated to the current default"))
+        write("auth_initial_password_version",AUTH_INITIAL_PASSWORD_VERSION)
+
+    director_hash=read(LEGACY_ACCOUNT_HASH_KEYS["director"])
+    if not director_hash.strip():
+        director_hash=_hash_password(INITIAL_DIRECTOR_PASSWORD)
+        write(LEGACY_ACCOUNT_HASH_KEYS["director"],director_hash)
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","auth","Read-only director account initialized"))
+
+    # Move the two shipped accounts into the account table without touching a
+    # password the owner already changed there.
+    legacy_hashes={"admin":admin_hash,"director":director_hash}
+    for login,label,role in BUILT_IN_ACCOUNTS:
+        row=con.execute("SELECT password_hash FROM auth_accounts WHERE login=?",(login,)).fetchone()
+        if row:
+            if not str(row[0]).strip():
+                con.execute("UPDATE auth_accounts SET password_hash=? WHERE login=?",(legacy_hashes[login],login))
+            continue
+        con.execute("INSERT INTO auth_accounts(login,label,role,password_hash,active,built_in,created_at) VALUES(?,?,?,?,1,1,?)",(login,label,role,legacy_hashes[login],now_iso()))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth",f"Built-in account {login} registered"))
+
+
+def _account_row(login: str) -> dict[str,Any] | None:
+    con=db()
+    try:
+        row=con.execute("SELECT login,label,role,active,built_in FROM auth_accounts WHERE login=?",(_normalize_account_login(login),)).fetchone()
+        if not row: return None
+        return {"login":str(row[0]),"label":str(row[1]),"role":_normalize_role(row[2]),"active":bool(row[3]),"built_in":bool(row[4])}
+    finally:
+        con.close()
+
+
+def _account_role(login: str) -> str:
+    row=_account_row(login)
+    return row["role"] if row else DEFAULT_AUTH_ROLE
+
+
+def _account_password_hash(login: str) -> str:
+    con=db()
+    try:
+        row=con.execute("SELECT password_hash FROM auth_accounts WHERE login=?",(_normalize_account_login(login),)).fetchone()
+        return str(row[0]) if row else ""
+    finally:
+        con.close()
+
+
+def _active_accounts() -> list[dict[str,Any]]:
+    con=db()
+    try:
+        rows=con.execute("SELECT login,label,role,built_in FROM auth_accounts WHERE active=1 ORDER BY built_in DESC,login ASC").fetchall()
+        result=[]
+        for row in rows:
+            role=_normalize_role(row[2])
+            result.append({"login":str(row[0]),"label":str(row[1]),"role":role,"built_in":bool(row[3]),"hint":AUTH_ROLES[role]["hint"],"role_label":AUTH_ROLES[role]["label"]})
+        return result
+    finally:
+        con.close()
 
 
 def _auth_setting(key: str, default: str = "") -> str:
@@ -530,10 +625,12 @@ def _auth_session(request: Request) -> dict[str,Any] | None:
         return None
     con=db()
     try:
-        row=con.execute("SELECT id,expires_at,last_seen_at FROM auth_sessions WHERE token_hash=?",(_auth_token_digest(token),)).fetchone()
+        # The role is read from the account row on every request, so disabling an
+        # account or changing its role takes effect immediately.
+        row=con.execute("SELECT s.id,s.expires_at,s.last_seen_at,s.login,a.label,a.role,a.active FROM auth_sessions s LEFT JOIN auth_accounts a ON a.login=s.login WHERE s.token_hash=?",(_auth_token_digest(token),)).fetchone()
         if not row:
             return None
-        if str(row[1])<=now_iso():
+        if str(row[1])<=now_iso() or not row[6]:
             con.execute("DELETE FROM auth_sessions WHERE id=?",(row[0],)); con.commit()
             return None
         last_seen=str(row[2] or "")
@@ -541,29 +638,31 @@ def _auth_session(request: Request) -> dict[str,Any] | None:
         # read-only dashboard poll.
         if timestamp_age_seconds(last_seen) is None or timestamp_age_seconds(last_seen)>300:
             last_seen=now_iso(); con.execute("UPDATE auth_sessions SET last_seen_at=? WHERE id=?",(last_seen,row[0])); con.commit()
-        return {"id":str(row[0]),"expires_at":str(row[1]),"last_seen_at":last_seen}
+        login=_normalize_account_login(row[3])
+        return {"id":str(row[0]),"expires_at":str(row[1]),"last_seen_at":last_seen,"login":login,"label":str(row[4] or login),"role":_normalize_role(row[5])}
     finally:
         con.close()
 
 
-def _create_auth_session() -> tuple[str,str]:
+def _create_auth_session(login: str = DEFAULT_AUTH_LOGIN) -> tuple[str,str]:
     token=secrets.token_urlsafe(36)
     session_id=uuid.uuid4().hex
     expires=(datetime.now(TZ)+timedelta(hours=AUTH_SESSION_HOURS)).isoformat(timespec="seconds")
     con=db()
     try:
         con.execute("DELETE FROM auth_sessions WHERE expires_at<=?",(now_iso(),))
-        con.execute("INSERT INTO auth_sessions(id,token_hash,created_at,expires_at,last_seen_at) VALUES(?,?,?,?,?)",(session_id,_auth_token_digest(token),now_iso(),expires,now_iso()))
+        con.execute("INSERT INTO auth_sessions(id,token_hash,created_at,expires_at,last_seen_at,login) VALUES(?,?,?,?,?,?)",(session_id,_auth_token_digest(token),now_iso(),expires,now_iso(),_normalize_account_login(login)))
         con.commit()
     finally:
         con.close()
     return token,expires
 
 
-def _revoke_auth_sessions(except_id: str = "") -> None:
+def _revoke_auth_sessions(except_id: str = "", login: str = "") -> None:
     con=db()
     try:
-        if except_id: con.execute("DELETE FROM auth_sessions WHERE id!=?",(except_id,))
+        if login: con.execute("DELETE FROM auth_sessions WHERE login=?",(_normalize_account_login(login),))
+        elif except_id: con.execute("DELETE FROM auth_sessions WHERE id!=?",(except_id,))
         else: con.execute("DELETE FROM auth_sessions")
         con.commit()
     finally:
@@ -573,6 +672,23 @@ def _revoke_auth_sessions(except_id: str = "") -> None:
 def _set_auth_cookie(response: Response, token: str, request: Request) -> None:
     secure=AUTH_COOKIE_SECURE or request.headers.get("X-Forwarded-Proto","").lower()=="https"
     response.set_cookie(AUTH_COOKIE_NAME,token,max_age=AUTH_SESSION_HOURS*3600,httponly=True,secure=secure,samesite="lax",path="/")
+
+
+# Non-administrator accounts work from an explicit allowlist, so a new
+# administrative endpoint is never exposed to them by accident.
+PANEL_READ_PREFIXES=("/api/dashboard","/api/cameras","/api/events","/api/analytics","/api/reports","/api/search","/api/session","/api/health","/api/auth/")
+PANEL_WRITE_PATHS={"/api/auth/logout","/api/auth/password"}
+# «Аналитик» works the review queue: accepting and rejecting detections is the
+# whole job, everything that configures the platform stays closed.
+EVENT_REVIEW_PATHS={"/api/events/ack-bulk","/api/events/reject-bulk"}
+EVENT_REVIEW_SUFFIXES=("/ack","/reject")
+
+def _role_request_allowed(role: str, method: str, path: str) -> bool:
+    if role=="admin": return True
+    if path in PANEL_WRITE_PATHS: return True
+    if role=="analyst" and method=="POST" and (path in EVENT_REVIEW_PATHS or (path.startswith("/api/events/") and path.endswith(EVENT_REVIEW_SUFFIXES))): return True
+    if method!="GET": return False
+    return path.startswith(PANEL_READ_PREFIXES)
 
 
 def _allow_auth_attempt(request: Request) -> bool:
@@ -656,7 +772,8 @@ def init_db():
     CREATE TABLE IF NOT EXISTS model_registry(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT UNIQUE NOT NULL, format TEXT NOT NULL, status TEXT NOT NULL, precision REAL, recall REAL, trained_at TEXT NOT NULL, source TEXT NOT NULL DEFAULT 'external', artifact_uri TEXT NOT NULL DEFAULT '', checksum TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS training_jobs(id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, camera_id TEXT NOT NULL, base_model TEXT NOT NULL, target_name TEXT NOT NULL, image_count INTEGER NOT NULL, epochs INTEGER NOT NULL, status TEXT NOT NULL, progress INTEGER NOT NULL DEFAULT 0, stage TEXT NOT NULL, error TEXT, batch INTEGER NOT NULL DEFAULT 8, imgsz INTEGER NOT NULL DEFAULT 640, patience INTEGER NOT NULL DEFAULT 20, confidence REAL NOT NULL DEFAULT .35, val_split REAL NOT NULL DEFAULT .2, capture_fps REAL NOT NULL DEFAULT 2, FOREIGN KEY(camera_id) REFERENCES cameras(id));
     CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, login TEXT UNIQUE NOT NULL, role TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL);
-    CREATE TABLE IF NOT EXISTS auth_sessions(id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, last_seen_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS auth_sessions(id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, last_seen_at TEXT NOT NULL, login TEXT NOT NULL DEFAULT 'admin');
+    CREATE TABLE IF NOT EXISTS auth_accounts(login TEXT PRIMARY KEY, label TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'viewer', password_hash TEXT NOT NULL DEFAULT '', active INTEGER NOT NULL DEFAULT 1, built_in INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS auth_recovery_codes(id TEXT PRIMARY KEY, email TEXT NOT NULL, code_hash TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, used_at TEXT NOT NULL DEFAULT '');
     """)
     camera_columns={r[1] for r in con.execute("PRAGMA table_info(cameras)").fetchall()}
@@ -702,6 +819,9 @@ def init_db():
     con.execute("CREATE INDEX IF NOT EXISTS ix_logs_service_timestamp ON logs(service,timestamp DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_training_status ON training_jobs(status,created_at DESC)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_capture_jobs_status ON dataset_capture_jobs(status,created_at DESC)")
+    # Sessions created before the two-account login existed belong to the admin.
+    session_columns={r[1] for r in con.execute("PRAGMA table_info(auth_sessions)").fetchall()}
+    if "login" not in session_columns: con.execute("ALTER TABLE auth_sessions ADD COLUMN login TEXT NOT NULL DEFAULT 'admin'")
     con.execute("CREATE INDEX IF NOT EXISTS ix_auth_sessions_expires ON auth_sessions(expires_at)")
     con.execute("CREATE INDEX IF NOT EXISTS ix_auth_recovery_email_expires ON auth_recovery_codes(email,expires_at)")
     con.execute("CREATE TABLE IF NOT EXISTS bot_runtime(provider TEXT PRIMARY KEY, status TEXT NOT NULL DEFAULT 'absent', detail TEXT NOT NULL DEFAULT '', enabled INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT '')")
@@ -714,7 +834,10 @@ def init_db():
     legacy_telegram_enabled=bool(legacy_telegram_enabled_row and legacy_telegram_enabled_row[0]=='true')
     legacy_critical_alerts=bool(legacy_critical_alerts_row and legacy_critical_alerts_row[0]=='true')
     config_defaults={
-        "active_model":"", "active_model_slots":"{}", "active_model_disabled":"false", "ppe_trial_previous_model":"", "model_test_mode":"false", "auth_email":"", "auth_password_must_change":str(True).lower(), "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
+        # The panel ships with ready-to-use local accounts (admin / директор), so
+        # a first login is not blocked by a forced password change any more. The
+        # gate itself is still enforced for databases that have the flag set.
+        "active_model":"", "active_model_slots":"{}", "active_model_disabled":"false", "ppe_trial_previous_model":"", "model_test_mode":"false", "auth_email":"", "auth_password_must_change":str(False).lower(), "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
         "retention_days":"90", "archive_quality":"90", "archive_clip_seconds":"10",
         "inference_fps":"8", "inference_device":"cuda:0", "batch_size":"4", "nms_iou":"0.45", "model_test_conf":str(MODEL_TEST_CONF_DEFAULT),
         "helmet_conf":"0.85", "vest_conf":"0.80", "phone_conf":"0.78", "smoking_conf":"0.80", "restricted_zone_conf":"0.82", "immobility_conf":"0.80", "min_model_precision":"90", "min_model_recall":"85",
@@ -764,9 +887,72 @@ def init_db():
 
 class AuthLoginIn(BaseModel):
     password:str=Field(min_length=1,max_length=128)
+    # The console shows an account picker first; older clients omit the field
+    # and keep signing in as the administrator. Whether the login exists is
+    # checked against the account table, never here: an unknown account must
+    # answer exactly like a wrong password.
+    login:str=Field(default=DEFAULT_AUTH_LOGIN,max_length=32)
+    @field_validator("login")
+    @classmethod
+    def validate_login(cls,value:str)->str:
+        login=str(value or DEFAULT_AUTH_LOGIN).strip().lower()
+        if not re.fullmatch(r"[a-z0-9._-]{1,32}",login): raise ValueError("Некорректный логин")
+        return login
 class AuthPasswordIn(BaseModel):
     current_password:str=Field(min_length=1,max_length=128)
     new_password:str=Field(min_length=4,max_length=128)
+    # Empty means "the account of the current session". An administrator may
+    # reset the password of any account from the same form.
+    login:str=Field(default="",max_length=32)
+    @field_validator("login")
+    @classmethod
+    def validate_login(cls,value:str)->str:
+        login=str(value or "").strip().lower()
+        if login and not re.fullmatch(r"[a-z0-9._-]{1,32}",login): raise ValueError("Некорректный логин")
+        return login
+class AuthAccountCreateIn(BaseModel):
+    """A new panel account created by the administrator."""
+    login:str=Field(min_length=2,max_length=32)
+    label:str=Field(min_length=2,max_length=60)
+    role:str=Field(default=DEFAULT_AUTH_ROLE,max_length=20)
+    password:str=Field(min_length=4,max_length=128)
+    @field_validator("login")
+    @classmethod
+    def validate_login(cls,value:str)->str:
+        login=str(value or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9._-]{2,32}",login): raise ValueError("Логин: 2–32 символа, латиница, цифры, точка, дефис")
+        return login
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls,value:str)->str:
+        role=_normalize_role(value)
+        if role not in AUTH_ROLES: raise ValueError("Неизвестная роль")
+        return role
+    @field_validator("label")
+    @classmethod
+    def validate_label(cls,value:str)->str:
+        label=str(value or "").strip()
+        if len(label)<2: raise ValueError("Имя пользователя слишком короткое")
+        return label[:60]
+class AuthAccountUpdateIn(BaseModel):
+    label:str|None=Field(default=None,max_length=60)
+    role:str|None=Field(default=None,max_length=20)
+    password:str|None=Field(default=None,min_length=4,max_length=128)
+    active:bool|None=None
+    @field_validator("role")
+    @classmethod
+    def validate_role(cls,value:str|None)->str|None:
+        if value is None: return None
+        role=_normalize_role(value)
+        if role not in AUTH_ROLES: raise ValueError("Неизвестная роль")
+        return role
+    @field_validator("label")
+    @classmethod
+    def validate_label(cls,value:str|None)->str|None:
+        if value is None: return None
+        label=str(value).strip()
+        if len(label)<2: raise ValueError("Имя пользователя слишком короткое")
+        return label[:60]
 class AuthEmailIn(BaseModel):
     email:str=Field(min_length=5,max_length=254)
     password:str=Field(min_length=1,max_length=128)
@@ -861,7 +1047,9 @@ def session_info(request: Request):
             user={"id":int(raw.get("id",0)),"name":str(raw.get("first_name") or raw.get("username") or "Telegram")[:80]}
         except (TypeError,ValueError,json.JSONDecodeError):
             user={}
-    return {"telegram":bool(role),"authenticated":bool(role or api_key_ok or password_session or not PASSWORD_AUTH_ENABLED),"role":role or ("api_key" if api_key_ok else "password" if password_session else "local"),"user":user}
+    elif password_session:
+        user={"name":str(password_session.get("label") or password_session.get("login") or DEFAULT_AUTH_LOGIN)}
+    return {"telegram":bool(role),"authenticated":bool(role or api_key_ok or password_session or not PASSWORD_AUTH_ENABLED),"role":role or ("api_key" if api_key_ok else str(password_session.get("role")) if password_session else "local"),"user":user}
 
 @app.middleware("http")
 async def security_middleware(request: Request, call_next):
@@ -893,6 +1081,11 @@ async def security_middleware(request: Request, call_next):
         return _json_deny(request,401,"Password authentication required",{"WWW-Authenticate":"Session"})
     if PASSWORD_AUTH_ENABLED and session_ok and not (api_key_ok or telegram_role or bot_service_ok) and _auth_setting("auth_password_must_change","false")=="true" and path.startswith("/api/") and path not in {"/api/auth/status","/api/auth/password","/api/auth/logout"}:
         return _json_deny(request,403,"Change the initial password before using the system")
+    # Non-admin accounts get an explicit capability set: «Аналитик» reviews
+    # events, «Гость» only looks. Hiding tabs in the browser is not enough, so the
+    # same rule is enforced here for every request.
+    if PASSWORD_AUTH_ENABLED and session_ok and not (api_key_ok or telegram_role or bot_service_ok) and not _role_request_allowed(str(password_session.get("role")),request.method,path):
+        return _json_deny(request,403,f"Роль «{AUTH_ROLES[_normalize_role(password_session.get('role'))]['label']}»: нет доступа к этому действию")
     if telegram_role and not api_key_ok and not bot_service_ok:
         admin_write=path.startswith(("/api/admin/","/api/bots/","/api/training/","/api/settings","/api/models/")) and request.method!="GET"
         admin_read=path.startswith(("/api/admin/","/api/bots/","/api/logs","/api/settings"))
@@ -940,7 +1133,16 @@ def auth_status(request: Request):
     session=_auth_session(request) if PASSWORD_AUTH_ENABLED else None
     api_key_ok=bool(API_KEY and hmac.compare_digest(request.headers.get("X-API-Key",""),API_KEY))
     email=_auth_setting("auth_email","") if PASSWORD_AUTH_ENABLED else ""
-    return {"enabled":PASSWORD_AUTH_ENABLED,"authenticated":bool(session or api_key_ok or not PASSWORD_AUTH_ENABLED),"must_change":_auth_setting("auth_password_must_change","false")=="true" if PASSWORD_AUTH_ENABLED and not api_key_ok else False,"email_bound":bool(email),"email":_masked_email(email),"recovery_available":_smtp_ready(),"expires_at":session.get("expires_at","") if session else ""}
+    login=_normalize_account_login(session.get("login") if session else DEFAULT_AUTH_LOGIN)
+    identified=bool(session or api_key_ok or not PASSWORD_AUTH_ENABLED)
+    role=str(session.get("role") or "admin") if identified else ""
+    label=str(session.get("label") or login) if session else (AUTH_ROLES["admin"]["label"] if identified else login)
+    # The picker shows every active account; the current one is marked so the
+    # console can highlight it the way an account switcher does.
+    accounts=_active_accounts() if PASSWORD_AUTH_ENABLED else []
+    for account in accounts:
+        account["current"]=bool(session) and account["login"]==login
+    return {"enabled":PASSWORD_AUTH_ENABLED,"authenticated":identified,"must_change":_auth_setting("auth_password_must_change","false")=="true" if PASSWORD_AUTH_ENABLED and not api_key_ok and login==DEFAULT_AUTH_LOGIN else False,"email_bound":bool(email),"email":_masked_email(email),"recovery_available":_smtp_ready(),"expires_at":session.get("expires_at","") if session else "","login":login,"label":label,"role":role,"accounts":accounts,"roles":[dict(role) for role in AUTH_ROLES.values()]}
 
 
 @app.post("/api/auth/login")
@@ -949,14 +1151,29 @@ def auth_login(payload: AuthLoginIn, request: Request, response: Response):
         raise HTTPException(409,"Парольный вход отключён администратором")
     if not _allow_auth_attempt(request):
         raise HTTPException(429,"Слишком много попыток. Повторите через 10 минут.")
-    encoded=_auth_setting("auth_password_hash","")
-    if not _password_matches(payload.password,encoded):
-        con=db(); con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","auth","Failed password login")); con.commit(); con.close()
-        raise HTTPException(401,"Неверный пароль")
-    token,expires=_create_auth_session()
+    login=_normalize_account_login(payload.login)
+    account=_account_row(login)
+    encoded=_account_password_hash(login)
+    if not account or not account["active"] or not _password_matches(payload.password,encoded):
+        con=db(); con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","auth",f"Failed password login for {login}")); con.commit(); con.close()
+        raise HTTPException(401,"Неверный логин или пароль")
+    # Switching accounts in the same browser hands the cookie over: the session
+    # that was active before this login is closed here, server-side. The client
+    # cannot do it itself, because the freshly signed-in account may have no
+    # permission to touch another account's sessions.
+    previous=_auth_session(request)
+    token,expires=_create_auth_session(login)
     _set_auth_cookie(response,token,request)
-    con=db(); con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth","Password login succeeded")); con.commit(); con.close()
-    return {"authenticated":True,"must_change":_auth_setting("auth_password_must_change","false")=="true","expires_at":expires}
+    con=db()
+    # Only a switch to somebody else ends the old session; signing in again as
+    # the same account simply adds another valid browser session.
+    if previous and previous["id"]!=token and previous["login"]!=login:
+        con.execute("DELETE FROM auth_sessions WHERE id=?",(previous["id"],))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth",f"Session of {previous['login']} closed by account switch to {login}"))
+    con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth",f"Password login succeeded for {login}"))
+    con.commit(); con.close()
+    must_change=_auth_setting("auth_password_must_change","false")=="true" and login==DEFAULT_AUTH_LOGIN
+    return {"authenticated":True,"must_change":must_change,"expires_at":expires,"login":login,"label":account["label"],"role":account["role"]}
 
 
 @app.post("/api/auth/logout")
@@ -983,8 +1200,9 @@ def auth_sessions(request: Request):
     con=db()
     try:
         data=[]
-        for row in con.execute("SELECT id,created_at,expires_at,last_seen_at FROM auth_sessions WHERE expires_at>? ORDER BY last_seen_at DESC,created_at DESC",(now_iso(),)).fetchall():
-            data.append({"id":str(row[0]),"created_at":str(row[1]),"expires_at":str(row[2]),"last_seen_at":str(row[3]),"current":hmac.compare_digest(str(row[0]),current["id"])})
+        for row in con.execute("SELECT s.id,s.created_at,s.expires_at,s.last_seen_at,s.login,a.label,a.role FROM auth_sessions s LEFT JOIN auth_accounts a ON a.login=s.login WHERE s.expires_at>? ORDER BY s.last_seen_at DESC,s.created_at DESC",(now_iso(),)).fetchall():
+            login=_normalize_account_login(row[4])
+            data.append({"id":str(row[0]),"created_at":str(row[1]),"expires_at":str(row[2]),"last_seen_at":str(row[3]),"login":login,"label":str(row[5] or login),"role":_normalize_role(row[6]),"current":hmac.compare_digest(str(row[0]),current["id"])})
         return {"sessions":data}
     finally:
         con.close()
@@ -1025,23 +1243,126 @@ def auth_revoke_session(session_id: str, request: Request, response: Response):
 
 @app.put("/api/auth/password")
 def auth_change_password(payload: AuthPasswordIn, request: Request, response: Response):
-    _require_password_session(request)
-    encoded=_auth_setting("auth_password_hash","")
-    if not _password_matches(payload.current_password,encoded):
+    session=_require_password_session(request)
+    own=str(session.get("login") or DEFAULT_AUTH_LOGIN)
+    target=_normalize_account_login(payload.login or own)
+    if target!=own and str(session.get("role"))!="admin":
+        raise HTTPException(403,"Пароль другого пользователя меняет только администратор")
+    if not _account_row(target):
+        raise HTTPException(404,"Пользователь не найден")
+    if not _password_matches(payload.current_password,_account_password_hash(own)):
         raise HTTPException(401,"Текущий пароль неверный")
-    if hmac.compare_digest(payload.current_password,payload.new_password):
+    if target==own and hmac.compare_digest(payload.current_password,payload.new_password):
         raise HTTPException(422,"Новый пароль должен отличаться от текущего")
-    con=db(); con.execute("INSERT INTO settings(key,value) VALUES('auth_password_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(_hash_password(payload.new_password),)); con.execute("INSERT INTO settings(key,value) VALUES('auth_password_must_change','false') ON CONFLICT(key) DO UPDATE SET value=excluded.value"); con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth","Password changed")); con.commit(); con.close()
-    _revoke_auth_sessions()
-    token,expires=_create_auth_session()
+    con=db()
+    con.execute("UPDATE auth_accounts SET password_hash=? WHERE login=?",(_hash_password(payload.new_password),target))
+    if target==DEFAULT_AUTH_LOGIN: con.execute("INSERT INTO settings(key,value) VALUES('auth_password_must_change','false') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
+    label=str(con.execute("SELECT label FROM auth_accounts WHERE login=?",(target,)).fetchone()[0])
+    con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth",f"Password changed for {target}"))
+    con.commit(); con.close()
+    # Changing your own password ends every session of that account; resetting
+    # somebody else's password ends only their sessions.
+    _revoke_auth_sessions(login=target)
+    token,expires=_create_auth_session(own)
     _set_auth_cookie(response,token,request)
-    return {"changed":True,"expires_at":expires}
+    return {"changed":True,"expires_at":expires,"login":target,"label":label,"role":_account_role(target)}
+
+
+def _require_admin_session(request: Request) -> dict[str,Any]:
+    session=_require_password_session(request)
+    if str(session.get("role"))!="admin":
+        raise HTTPException(403,"Раздел доступен только администратору")
+    return session
+
+
+@app.get("/api/auth/accounts")
+def auth_accounts_list(request: Request):
+    """Every panel account, for the administrator's user manager."""
+    _require_admin_session(request)
+    con=db()
+    try:
+        rows=con.execute("SELECT login,label,role,active,built_in,created_at FROM auth_accounts ORDER BY built_in DESC,login ASC").fetchall()
+        accounts=[{"login":str(r[0]),"label":str(r[1]),"role":_normalize_role(r[2]),"active":bool(r[3]),"built_in":bool(r[4]),"created_at":str(r[5]),"role_label":AUTH_ROLES[_normalize_role(r[2])]["label"]} for r in rows]
+        return {"accounts":accounts,"roles":[dict(role) for role in AUTH_ROLES.values()]}
+    finally:
+        con.close()
+
+
+@app.post("/api/auth/accounts")
+def auth_account_create(payload: AuthAccountCreateIn, request: Request):
+    session=_require_admin_session(request)
+    login=payload.login
+    con=db()
+    try:
+        if con.execute("SELECT 1 FROM auth_accounts WHERE login=?",(login,)).fetchone():
+            raise HTTPException(409,"Пользователь с таким логином уже есть")
+        con.execute("INSERT INTO auth_accounts(login,label,role,password_hash,active,built_in,created_at) VALUES(?,?,?,?,1,0,?)",(login,payload.label,payload.role,_hash_password(payload.password),now_iso()))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth",f"Account {login} ({payload.role}) created by {session.get('login')}"))
+        con.commit()
+        row=con.execute("SELECT login,label,role,active,built_in,created_at FROM auth_accounts WHERE login=?",(login,)).fetchone()
+    finally:
+        con.close()
+    return {"created":True,"account":{"login":str(row[0]),"label":str(row[1]),"role":_normalize_role(row[2]),"active":bool(row[3]),"built_in":bool(row[4]),"created_at":str(row[5]),"role_label":AUTH_ROLES[_normalize_role(row[2])]["label"]}}
+
+
+@app.put("/api/auth/accounts/{login}")
+def auth_account_update(login: str, payload: AuthAccountUpdateIn, request: Request):
+    session=_require_admin_session(request)
+    login=_normalize_account_login(login)
+    con=db()
+    try:
+        row=con.execute("SELECT login,label,role,active,built_in FROM auth_accounts WHERE login=?",(login,)).fetchone()
+        if not row: raise HTTPException(404,"Пользователь не найден")
+        built_in=bool(row[4])
+        role=_normalize_role(payload.role if payload.role is not None else row[2])
+        # The platform must never end up without an administrator.
+        if built_in and login==DEFAULT_AUTH_LOGIN and (role!="admin" or payload.active is False):
+            raise HTTPException(422,"Встроенного администратора нельзя разжаловать или отключить")
+        if payload.active is False and login==str(session.get("login")):
+            raise HTTPException(422,"Нельзя отключить собственный аккаунт")
+        label=str(payload.label).strip() if payload.label is not None else str(row[1])
+        con.execute("UPDATE auth_accounts SET label=?,role=?,active=? WHERE login=?",(label,role,1 if (payload.active is None or payload.active) else 0,login))
+        if payload.password:
+            con.execute("UPDATE auth_accounts SET password_hash=? WHERE login=?",(_hash_password(payload.password),login))
+            # A reset password invalidates the sessions of that account only.
+            con.execute("DELETE FROM auth_sessions WHERE login=? AND id!=?",(login,str(session.get("id"))))
+        if payload.active is False:
+            con.execute("DELETE FROM auth_sessions WHERE login=?",(login,))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth",f"Account {login} updated by {session.get('login')}"))
+        con.commit()
+        updated=con.execute("SELECT login,label,role,active,built_in,created_at FROM auth_accounts WHERE login=?",(login,)).fetchone()
+    finally:
+        con.close()
+    return {"updated":True,"account":{"login":str(updated[0]),"label":str(updated[1]),"role":_normalize_role(updated[2]),"active":bool(updated[3]),"built_in":bool(updated[4]),"created_at":str(updated[5]),"role_label":AUTH_ROLES[_normalize_role(updated[2])]["label"]}}
+
+
+@app.delete("/api/auth/accounts/{login}")
+def auth_account_delete(login: str, request: Request):
+    session=_require_admin_session(request)
+    login=_normalize_account_login(login)
+    if login==DEFAULT_AUTH_LOGIN:
+        raise HTTPException(422,"Встроенного администратора нельзя удалить")
+    if login==str(session.get("login")):
+        raise HTTPException(422,"Нельзя удалить собственный аккаунт")
+    con=db()
+    try:
+        row=con.execute("SELECT 1 FROM auth_accounts WHERE login=?",(login,)).fetchone()
+        if not row: raise HTTPException(404,"Пользователь не найден")
+        con.execute("DELETE FROM auth_accounts WHERE login=?",(login,))
+        con.execute("DELETE FROM auth_sessions WHERE login=?",(login,))
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","auth",f"Account {login} deleted by {session.get('login')}"))
+        con.commit()
+    finally:
+        con.close()
+    return {"deleted":True,"login":login}
 
 
 @app.put("/api/auth/email")
 def auth_bind_email(payload: AuthEmailIn, request: Request):
-    _require_password_session(request)
-    if not _password_matches(payload.password,_auth_setting("auth_password_hash","") ):
+    session=_require_password_session(request)
+    if _account_role(str(session.get("login") or DEFAULT_AUTH_LOGIN))!="admin":
+        raise HTTPException(403,"Почту для восстановления привязывает только администратор")
+    if not _password_matches(payload.password,_account_password_hash(DEFAULT_AUTH_LOGIN)):
         raise HTTPException(401,"Пароль неверный")
     con=db(); con.execute("INSERT INTO settings(key,value) VALUES('auth_email',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(payload.email,)); con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth","Recovery email bound")); con.commit(); con.close()
     return {"email":_masked_email(payload.email),"recovery_available":_smtp_ready()}
@@ -1095,7 +1416,11 @@ def auth_recovery_verify(payload: AuthRecoveryVerifyIn, request: Request, respon
             con.execute("UPDATE auth_recovery_codes SET attempts=attempts+1 WHERE id=?",(row[0],)); con.commit()
             raise HTTPException(400,"Код недействителен или истёк")
         con.execute("UPDATE auth_recovery_codes SET used_at=? WHERE id=?",(now_iso(),row[0]))
-        con.execute("INSERT INTO settings(key,value) VALUES('auth_password_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(_hash_password(payload.new_password),))
+        # Recovery is bound to the administrator account; the hash lives in the
+        # account table now and the settings key is kept in sync for upgrades.
+        new_hash=_hash_password(payload.new_password)
+        con.execute("UPDATE auth_accounts SET password_hash=? WHERE login=?",(new_hash,DEFAULT_AUTH_LOGIN))
+        con.execute("INSERT INTO settings(key,value) VALUES('auth_password_hash',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(new_hash,))
         con.execute("INSERT INTO settings(key,value) VALUES('auth_password_must_change','false') ON CONFLICT(key) DO UPDATE SET value=excluded.value")
         con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","auth","Password reset by recovery code"))
         con.commit()
