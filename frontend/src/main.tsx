@@ -241,6 +241,37 @@ function canDecodeH264(){
  try{const v=document.createElement('video');if(v&&typeof v.canPlayType==='function')return v.canPlayType('video/mp4; codecs="avc1.42E01E"')!==''}catch{}
  return false;
 }
+// go2rtc negotiates the MSE/HLS codec from the list the client sends in the
+// `{"type":"mse"}` request. Sending an unknown value (or none at all) makes it
+// answer with an error instead of media, so the card stays black. These are the
+// video codecs go2rtc's own web client advertises, plus VP8/VP9 for browsers
+// whose H.264 decoder is missing (Firefox on Ubuntu/Wayland).
+const GO2RTC_VIDEO_CODECS=['avc1.640029','avc1.64002A','avc1.640033','hvc1.1.6.L153.B0','vp9','vp8'];
+function mseCodecs(){
+ const list=GO2RTC_VIDEO_CODECS.filter(c=>{
+  try{
+   if(typeof MediaSource!=='undefined'&&typeof MediaSource.isTypeSupported==='function')return MediaSource.isTypeSupported(`video/mp4; codecs="${c}"`);
+   const v=document.createElement('video');return typeof v.canPlayType==='function'&&v.canPlayType(`video/mp4; codecs="${c}"`)!=='';
+  }catch{return false}
+ });
+ return list.length?list.join(','):'avc1.640029,avc1.42E01E';
+}
+// Restrict the WebRTC offer to codecs the browser can actually decode. When the
+// browser has no H.264 decoder we keep only VP8/VP9 so go2rtc picks the VP8
+// producer the API registers for every camera stream, instead of answering with
+// an H.264 track the browser just drops (black card).
+function applyVideoCodecPreference(transceiver:RTCRtpTransceiver,withoutH264:boolean){
+ try{
+  const caps=(RTCRtpReceiver as any)?.getCapabilities?.('video');
+  if(!caps||!Array.isArray(caps.codecs))return;
+  const preferred=(caps.codecs as any[]).filter(c=>{
+   const mime=String(c?.mimeType||'').toLowerCase();
+   if(!mime.startsWith('video/'))return false;
+   return withoutH264?!mime.includes('h264'):true;
+  });
+  if(preferred.length&&typeof (transceiver as any).setCodecPreferences==='function')(transceiver as any).setCodecPreferences(preferred);
+ }catch{}
+}
 function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto'}:{id:string;status:string;age:number|null;telemetryStale?:boolean;lastError?:string;previewMode?:'auto'|'mse'|'webrtc'|'mjpeg'}){
  const videoRef=useRef<HTMLVideoElement|null>(null);
  const hlsRef=useRef<any>(null);
@@ -263,6 +294,14 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
  const mjpegRetryRef=useRef<number>(0);
  const mjpegAbortRef=useRef<AbortController|null>(null);
  const mjpegTimeoutRef=useRef<number>(0);
+ // `live` captured inside the long-lived effect below is frozen at its first
+ // render value. The periodic health check therefore used to see `false` for
+ // good and restarted the transport every 10s — even while MJPEG was already
+ // delivering frames, which looked like an endlessly reloading card. Keep the
+ // current value in a ref and only re-arm after a real grace period.
+ const liveRef=useRef<boolean>(false);
+ const lastAttemptRef=useRef<number>(0);
+ useEffect(()=>{liveRef.current=live},[live]);
 
  useEffect(()=>{
   let cancelled=false;
@@ -333,6 +372,9 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
   };
   const beginHls=async(srcNames?:string[])=>{
    if(cancelled)return;
+   // HLS carries H.264 only: a browser without that decoder (Firefox on
+   // Ubuntu/Wayland) can never paint a frame, so go straight to MJPEG.
+   if(!canDecodeH264()){beginMjpeg();return}
    cleanupMSE();
    if(hlsRetryRef.current)clearTimeout(hlsRetryRef.current);
    if(mseRetryRef.current)clearTimeout(mseRetryRef.current);
@@ -400,7 +442,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
    const names=srcNames||[`zmk-${id}`,id];
    // Prefer MediaSource
    if(!window.MediaSource||typeof MediaSource.isTypeSupported!=='function'){
-    void beginHls(names);return;
+    if(canDecodeH264())void beginHls(names);else beginMjpeg();return;
    }
    let started=false;
    for(const streamName of names){
@@ -416,6 +458,19 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
      let queue:Uint8Array[]=[];
      let liveFlag=false;
      let codecTried=false;
+     // go2rtc answers the MSE request with the negotiated MIME type
+     // (video/mp4; codecs="..."). Use it first, then fall back to the usual
+     // H.264 profiles and finally to a bare 'video/mp4' probe.
+     let mseMime='';
+     const mimeCandidates=():string[]=>[mseMime,
+      'video/mp4; codecs="avc1.64001f"',
+      'video/mp4; codecs="avc1.640029"',
+      'video/mp4; codecs="avc1.64002A"',
+      'video/mp4; codecs="avc1.4D401F"',
+      'video/mp4; codecs="avc1.42E01E"',
+      'video/mp4; codecs="avc1.640028"',
+      'video/mp4'
+     ].filter(Boolean) as string[];
 
      const tryAddBuffer=(mime:string)=>{
       if(!ms||ms.readyState!=='open'||sb)return false;
@@ -451,15 +506,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
        if(queue.length<120)queue.push(data);
        if(!codecTried){
         codecTried=true;
-        const candidates=[
-         'video/mp4; codecs="avc1.64001f"',
-         'video/mp4; codecs="avc1.640029"',
-         'video/mp4; codecs="avc1.64002A"',
-         'video/mp4; codecs="avc1.4D401F"',
-         'video/mp4; codecs="avc1.42E01E"',
-         'video/mp4; codecs="avc1.640028"',
-         'video/mp4'
-        ];
+        const candidates=mimeCandidates();
         for(const c of candidates){
          if(tryAddBuffer(c))break;
         }
@@ -480,14 +527,24 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
 
      ws.onopen=()=>{
       if(cancelled)return;
-      try{ws.send(JSON.stringify({type:'mse',value:'mp4'}))}catch{}
+      try{ws.send(JSON.stringify({type:'mse',value:mseCodecs()}))}catch{}
      };
      ws.onmessage=(ev)=>{
       if(cancelled)return;
       if(typeof ev.data==='string'){
        try{
         const msg=JSON.parse(ev.data);
-        if(msg.type==='mse'&&msg.value){
+                if(msg.type==='error'){
+         // go2rtc refused the request (no stream, no matching codec).
+         try{ws.close()}catch{}
+         return;
+        }
+        if(msg.type==='mse'&&typeof msg.value==='string'&&/^(video|audio)\//.test(msg.value)){
+         // Negotiated MIME from go2rtc; the segments follow as binary frames.
+         mseMime=msg.value;
+         return;
+        }
+if(msg.type==='mse'&&msg.value){
          const bin=Uint8Array.from(atob(msg.value),c=>c.charCodeAt(0));
          if(!liveFlag){
           // first segment = init
@@ -501,15 +558,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
              if(!ms||ms.readyState!=='open')return;
              // try create buffer now
              if(!sb){
-              const cands=[
-               'video/mp4; codecs="avc1.64001f"',
-               'video/mp4; codecs="avc1.640029"',
-               'video/mp4; codecs="avc1.64002A"',
-               'video/mp4; codecs="avc1.4D401F"',
-               'video/mp4; codecs="avc1.42E01E"',
-               'video/mp4'
-              ];
-              for(const cand of cands){
+              for(const cand of mimeCandidates()){
                if(tryAddBuffer(cand))break;
               }
              }
@@ -550,15 +599,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
          ms.addEventListener('sourceopen',()=>{
           if(!ms||ms.readyState!=='open')return;
           if(!sb){
-           const cands=[
-            'video/mp4; codecs="avc1.64001f"',
-            'video/mp4; codecs="avc1.640029"',
-            'video/mp4; codecs="avc1.64002A"',
-            'video/mp4; codecs="avc1.4D401F"',
-            'video/mp4; codecs="avc1.42E01E"',
-            'video/mp4'
-           ];
-           for(const cand of cands){if(tryAddBuffer(cand))break}
+           for(const cand of mimeCandidates()){if(tryAddBuffer(cand))break}
           }
           pushSegment(seg);
           if(videoRef.current)void videoRef.current.play().catch(()=>{});
@@ -578,7 +619,8 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
       if(cancelled)return;
       mseRef.current.ws=null;
       if(!liveFlag&&streamName===names[names.length-1]){
-       mseRetryRef.current=window.setTimeout(()=>{if(!cancelled)void beginHls(names)},600) as unknown as number;
+       if(canDecodeH264())mseRetryRef.current=window.setTimeout(()=>{if(!cancelled)void beginHls(names)},600) as unknown as number;
+       else mseRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginMjpeg()},600) as unknown as number;
       }else if(liveFlag&&!cancelled){
        // reconnect if was live
        mseRetryRef.current=window.setTimeout(()=>{if(!cancelled){cleanupMSE();void beginMSE(names);setRetry(r=>r+1)}},1200) as unknown as number;
@@ -627,25 +669,54 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
      const pc=new RTCPeerConnection({
       iceServers:[{urls:['stun:stun.cloudflare.com:3478','stun:stun.l.google.com:19302']}],
       bundlePolicy:'max-bundle',
-     });
+      sdpSemantics:'unified-plan',
+     } as RTCConfiguration);
+     // go2rtc can only answer an offer that actually asks for media. An offer
+     // created without a transceiver has no m-lines, so the answer comes back
+     // empty, no track ever arrives and the card stays black — that was the
+     // reason WebRTC never worked and every camera fell back to MJPEG.
+     const videoTransceiver=pc.addTransceiver('video',{direction:'recvonly'});
+     // Browsers without an H.264 decoder must receive the VP8 producer the API
+     // registers for every stream, so restrict the offer accordingly.
+     applyVideoCodecPreference(videoTransceiver,!canDecodeH264());
      const wsProto=location.protocol==='https:'?'wss':'ws';
      const ws=new WebSocket(`${wsProto}://${location.host}/rtc/api/ws?src=${encodeURIComponent(streamName)}`);
      const stream=new MediaStream();
      webrtcRef.current={pc,ws,stream};
      let connected=false;
+     const attachTracks=()=>{
+      if(cancelled||!videoRef.current)return;
+      // Build the stream from the transceivers: ontrack alone is not fired by
+      // every browser when the answer reuses the transceiver we created.
+      let tracks:MediaStreamTrack[]=[];
+      try{
+       tracks=pc.getTransceivers()
+        .filter(tr=>tr.receiver&&tr.receiver.track&&(tr.currentDirection==='recvonly'||tr.direction==='recvonly'))
+        .map(tr=>tr.receiver.track);
+      }catch{}
+      if(!tracks.length&&stream.getVideoTracks().length)tracks=stream.getVideoTracks();
+      if(!tracks.length)return;
+      const next=new MediaStream(tracks);
+      try{
+       if(videoRef.current.srcObject!==next)videoRef.current.srcObject=next;
+       videoRef.current.muted=true;
+       void videoRef.current.play().catch(()=>{});
+      }catch{}
+      if(!connected){connected=true;setLive(true);setTransport('webrtc')}
+     };
      pc.onicecandidate=(ev)=>{
       if(ev.candidate&&ws.readyState===WebSocket.OPEN){try{ws.send(JSON.stringify({type:'webrtc/candidate',value:ev.candidate.candidate}))}catch{}}
      };
      pc.ontrack=(ev)=>{
       if(cancelled)return;
-      stream.addTrack(ev.track);
-      if(videoRef.current){try{videoRef.current.srcObject=stream}catch{}}
-      if(!connected){connected=true;setLive(true);setTransport('webrtc')}
+      if(ev.track)stream.addTrack(ev.track);
+      attachTracks();
      };
      pc.onconnectionstatechange=()=>{
       if(cancelled)return;
       const st=pc.connectionState;
-      if(st==='failed'||st==='disconnected'){
+      if(st==='connected')attachTracks();
+      else if(st==='failed'||st==='disconnected'||st==='closed'){
        try{ws.close()}catch{}
        if(!connected&&streamName===names[names.length-1]){
         webrtcRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginMjpeg()},600) as unknown as number;
@@ -663,8 +734,19 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
       if(cancelled)return;
       try{
        const msg=JSON.parse(ev.data);
-       if(msg.type==='webrtc/candidate'){try{pc.addIceCandidate({candidate:msg.value,sdpMid:'0'})}catch{}}
-       else if(msg.type==='webrtc/answer'){try{pc.setRemoteDescription({type:'answer',sdp:msg.value})}catch{}}
+       if(msg.type==='webrtc/candidate'){
+        // Some builds reject an explicit sdpMid, so fall back to a bare
+        // candidate before giving up on ICE.
+        try{pc.addIceCandidate({candidate:msg.value,sdpMid:'0'})}catch{try{pc.addIceCandidate({candidate:msg.value})}catch{}}
+       }
+       else if(msg.type==='webrtc/answer'){
+        pc.setRemoteDescription({type:'answer',sdp:msg.value}).then(()=>{if(!cancelled)setTimeout(attachTracks,150)}).catch(()=>{});
+       }
+       else if(msg.type==='error'){
+        // go2rtc could not build the track (no stream / no codec match).
+        try{ws.close()}catch{}
+        if(!connected&&streamName===names[names.length-1])beginMjpeg();
+       }
       }catch{}
      };
      ws.onerror=()=>{try{ws.close()}catch{}};
@@ -681,7 +763,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
      // watchdog: if no track after 7s, fall back to MJPEG so the card is never empty
      webrtcRetryRef.current=window.setTimeout(()=>{
       if(cancelled)return;
-      if(!connected){try{ws.close()}catch{};if(streamName===names[names.length-1])void beginMjpeg()}
+      if(!connected){try{ws.close()}catch{};if(streamName===names[names.length-1])beginMjpeg()}
      },7000) as unknown as number;
      started=true;
      break;
@@ -778,9 +860,17 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
   // - 'auto' / legacy 'mse': if the browser cannot decode H.264 (Firefox on
   //   Ubuntu) use WebRTC/VP8, otherwise keep the fast H.264 MSE/HLS path.
   const startPreferred=()=>{
+   // Remember when a transport was last armed: the health check below must not
+   // tear down a stream that is still negotiating (or already showing frames).
+   lastAttemptRef.current=Date.now();
    if(previewMode==='mjpeg'){beginMjpeg();return}
    if(previewMode==='webrtc'){void beginWebRTC();return}
-   if(!canDecodeH264()){void beginWebRTC();return}
+   if(!canDecodeH264()){
+    // Firefox on Ubuntu/Wayland has no H.264 decoder, and MSE/HLS can only
+    // carry H.264, so VP8 over WebRTC is the only smooth option; MJPEG is the
+    // safety net when go2rtc is unreachable (port 8555 blocked, etc.).
+    void beginWebRTC();return;
+   }
    void beginMSE();
   };
   if(['online','connecting','recovering'].includes(status)){
@@ -789,13 +879,17 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
    setLive(false);setTransport('waiting');
   }
 
-  // periodic health check - if not live and status online, retry transport
+  // periodic health check - if not live and status online, retry transport.
+  // `live` would be stale here (captured on first render), so use the ref, and
+  // respect a cooldown: restarting every tick is what made a working MJPEG
+  // preview reload endlessly.
   retryRef.current=window.setInterval(()=>{
    if(cancelled)return;
-   if(!live&&['online','connecting','recovering'].includes(status)){
-    startPreferred();
-    setRetry(r=>r+1);
-   }
+   if(liveRef.current)return;
+   if(!['online','connecting','recovering'].includes(status))return;
+   if(Date.now()-lastAttemptRef.current<15000)return;
+   startPreferred();
+   setRetry(r=>r+1);
   },10000) as unknown as number;
 
   return()=>{
@@ -815,7 +909,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
 
  const renderOverlay=()=>{if(!boxes.length||!shape)return null;const [h,w]=shape;if(!h||!w)return null;return <div className="camera-overlay">{boxes.map((b,i)=>{const [x1,y1,x2,y2]=b.bbox;const left=(x1/w)*100;const top=(y1/h)*100;const width=Math.max(1,((x2-x1)/w)*100);const height=Math.max(1,((y2-y1)/h)*100);const isNoHelmet=b.semantic==='no_helmet';const isNoVest=b.semantic==='no_vest';const isPerson=b.semantic==='person';const color=isNoHelmet||isNoVest?'#ff3b30':isPerson?'#007aff':b.semantic==='helmet'?'#34c759':b.semantic==='vest'?'#af52de':'#ff9500';const label=b.semantic==='no_helmet'?'NO HELMET':b.semantic==='no_vest'?'NO VEST':b.semantic.toUpperCase();return <div key={i} className="camera-box" style={{left:`${left}%`,top:`${top}%`,width:`${width}%`,height:`${height}%`,borderColor:color}}><span style={{background:color}}>{label} {Math.round(b.confidence*100)}%</span></div>})}</div>};
 
- const label=transport==='webrtc'?(live?'● WebRTC VP8':'● WebRTC…'):transport==='mse'?(live?'● MSE H264 25-60 FPS':'● MSE connecting…'):transport==='hls'?(live?'● HLS H264':'● HLS…'):transport==='mjpeg'?(live?'● MJPEG':'● MJPEG…'):`retry ${retry}`;
+ const label=transport==='webrtc'?(live?(canDecodeH264()?'● WebRTC':'● WebRTC VP8'):'● WebRTC…'):transport==='mse'?(live?'● MSE H264 25-60 FPS':'● MSE connecting…'):transport==='hls'?(live?'● HLS H264':'● HLS…'):transport==='mjpeg'?(live?'● MJPEG':'● MJPEG…'):`retry ${retry}`;
 
  if(transport==='mjpeg'&&mjpegSrc){
   return <div className="camera-feed-wrap"><img className="camera-snapshot" src={mjpegSrc} alt={`Поток ${id}`} />{renderOverlay()}<em className="frame-age">{live?label:'● MJPEG…'}</em></div>;

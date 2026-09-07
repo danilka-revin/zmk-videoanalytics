@@ -19,14 +19,38 @@
 #     ./start.sh --no-update    — пропустить проверку обновлений
 #     ./start.sh --fast         — быстрый запуск без принудительной пересборки
 #                                 образов (использует уже собранные образы)
+#     ./start.sh --rebuild      — принудительно пересобрать образы
+#     ./start.sh --no-open      — не открывать браузер (Wayland/X11)
 #     NONINTERACTIVE=1 ./start.sh   — без вопросов (нужны env-переменные)
 #     ZMK_FAST=1 ./start.sh     — то же, что --fast, через переменную окружения
+#     ZMK_REBUILD=1 ./start.sh  — то же, что --rebuild
+#     ZMK_NO_OPEN=1 ./start.sh  — то же, что --no-open
 # =====================================================================
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }
+
+# Flags may be passed in any order: scan the whole argument list instead of
+# looking only at $1/$2 (`./start.sh --no-open --rebuild` used to ignore
+# --rebuild silently). Branch selection stays positional (see below).
+zmk_has_flag(){
+  local needle="$1"; shift
+  local arg
+  for arg in "$@"; do [[ "$arg" == "$needle" ]] && return 0; done
+  return 1
+}
+
+# Every remote git operation is capped: a stalled fetch used to hang the whole
+# launcher with no output, which looks exactly like an endless download.
+zmk_git(){
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --signal=TERM --kill-after=15s "${ZMK_GIT_TIMEOUT:-120}" git "$@"
+  else
+    git "$@"
+  fi
+}
 
 # Select the Git branch before Docker starts. This is intentionally handled by
 # the launcher (not inside a container), so it also works while the old stack
@@ -45,7 +69,7 @@ select_install_branch(){
   [[ -d .git ]] || { [[ -z "$requested" ]] || fail "Для выбора ветки нужен Git-клон проекта"; return 0; }
   if [[ -z "$requested" && ( "$choose" == "1" || "${ZMK_CHOOSE_BRANCH:-0}" == "1" ) ]]; then
     echo "Доступные ветки проекта:"
-    mapfile -t branches < <(git ls-remote --heads origin 2>/dev/null | sed -E 's#.*refs/heads/##' | sort -V)
+    mapfile -t branches < <(zmk_git ls-remote --heads origin 2>/dev/null | sed -E 's#.*refs/heads/##' | sort -V)
     ((${#branches[@]})) || fail "Не удалось получить список веток origin"
     local i=1; for branch in "${branches[@]}"; do echo "  $i) $branch"; ((i++)); done
     read -r -p "Выберите номер или введите имя ветки [main]: " choice
@@ -53,7 +77,7 @@ select_install_branch(){
     elif [[ -n "$choice" ]]; then requested="$choice"; else requested="main"; fi
   fi
   [[ -z "$requested" ]] && return 0
-  git fetch --quiet origin "$requested" || fail "Ветка '$requested' не найдена в origin"
+  zmk_git fetch --quiet origin "$requested" || fail "Ветка '$requested' не найдена в origin"
   if ! git diff --quiet || ! git diff --cached --quiet; then fail "Есть незакоммиченные изменения. Сохраните их перед сменой ветки."; fi
   git checkout -q -B "$requested" "origin/$requested" || fail "Не удалось переключиться на ветку '$requested'"
   echo "[start] Установлена ветка: $requested"
@@ -75,7 +99,7 @@ if [[ -d .git ]]; then
   git config pull.ff only >/dev/null 2>&1 || true
 fi
 # Upgrade the selected branch itself. Release archives are used only on main.
-if [[ "${1:-}" != "--no-update" && -z "${ZMK_NO_AUTO_UPDATE:-}" && -f installers/auto-update.sh ]]; then
+if ! zmk_has_flag --no-update "$@" && [[ -z "${ZMK_NO_AUTO_UPDATE:-}" && -f installers/auto-update.sh ]]; then
   if [[ -d .git ]]; then git config --global --add safe.directory "$(pwd)" >/dev/null 2>&1 || true; fi
   ZMK_UPDATE_BRANCH="${ZMK_UPDATE_BRANCH:-$(git branch --show-current 2>/dev/null || true)}" \
     bash installers/auto-update.sh start.sh || echo "[start] auto-update check skipped."
@@ -93,7 +117,7 @@ chmod 600 .env 2>/dev/null || true
 # FIRST-RUN CONFIGURATION WIZARD  (before the docker check so it always runs)
 # =====================================================================
 wizard_needed=false
-if [[ "${1:-}" == "--setup" ]]; then
+if zmk_has_flag --setup "$@"; then
   wizard_needed=true
 elif [[ ! -f .zmk-profiles ]]; then
   # No saved profile -> this is a first run -> ask how to configure.
@@ -129,6 +153,21 @@ if ! docker info >/dev/null 2>&1; then
 fi
 "${DC[@]}" version >/dev/null 2>&1 || fail "Docker Compose plugin is unavailable."
 
+# Shared stack helpers: build fingerprinting (no rebuild when nothing changed),
+# parallel base-image pre-pull, hard timeouts and visible progress. Without
+# them every single start re-ran `npm ci`/`apt-get`/`pip` in every image, which
+# is what made the launcher look stuck on an endless download.
+if [[ -f installers/lib-stack.sh ]]; then
+  # shellcheck disable=SC1091
+  source installers/lib-stack.sh
+fi
+
+# Desktop helpers (Wayland/X11 aware browser launch).
+if [[ -f installers/lib-desktop.sh ]]; then
+  # shellcheck disable=SC1091
+  source installers/lib-desktop.sh
+fi
+
 if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -qi nvidia; then
   export COMPOSE_FILE="docker-compose.yml:docker-compose.gpu.yml"
   COMPUTE_MODE="GPU / NVIDIA"
@@ -159,74 +198,55 @@ repair_build_cache(){
     git config pull.rebase false >/dev/null 2>&1 || true
     git config pull.ff only >/dev/null 2>&1 || true
     # Don't auto-reset here, just fetch to fix divergent state
-    git fetch --prune --tags --force origin 2>&1 | tail -3 || true
+    zmk_git fetch --prune --tags --force origin 2>&1 | tail -3 || true
   fi
 }
 
 start_stack(){
-  # Always disable Bake to avoid WARN when buildx isn't installed - use classic builder path
-  export COMPOSE_BAKE=false
-  export COMPOSE_DOCKER_CLI_BUILD=0
-  # First attempt with Bake disabled to avoid warning and use reliable path
-  if COMPOSE_BAKE=false COMPOSE_DOCKER_CLI_BUILD=0 "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
-    return 0
+  # Timeouts + plain progress: a stalled layer pull must fail with a message
+  # instead of showing a frozen installer for an hour.
+  stack_prepare_build_env
+  # Rebuild ONLY when the sources changed or an image is missing. Previously
+  # every start ran `up -d --build`, re-running npm ci / apt-get / pip in every
+  # image: on a slow or flaky link that is an endless download.
+  if command -v stack_needs_build >/dev/null 2>&1 && ! stack_needs_build; then
+    echo "[start] Образы уже собраны для этой версии исходников — пропускаю пересборку (принудительно: ./start.sh --rebuild)"
+    if stack_watchdog "$ZMK_BUILD_TIMEOUT" "${DC[@]}" "${PROFILE[@]}" up -d --remove-orphans; then
+      stack_save_fingerprint; return 0
+    fi
   fi
-  # Fallback to default (with Bake) in case user has buildx
-  if "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
-    return 0
+  # Base images are fetched once, in parallel, instead of one-by-one per service.
+  if command -v stack_prepull >/dev/null 2>&1; then stack_prepull; fi
+  if stack_watchdog "$ZMK_BUILD_TIMEOUT" "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
+    stack_save_fingerprint; return 0
   fi
+  # Known BuildKit failure: a corrupted parent snapshot. Clear ONLY the
+  # disposable build cache (never volumes, data or bot tokens) and retry once
+  # with serial builds so two services cannot race on the same snapshot.
   repair_build_cache
-  # Serial service builds avoid a second concurrent snapshot/export race.
   echo "[start] Повторная сборка с лимитом параллелизма..."
-  if COMPOSE_PARALLEL_LIMIT=1 COMPOSE_BAKE=false COMPOSE_DOCKER_CLI_BUILD=0 "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
-    return 0
+  if ( export COMPOSE_PARALLEL_LIMIT=1; stack_watchdog "$ZMK_BUILD_TIMEOUT" "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans ); then
+    stack_save_fingerprint; return 0
   fi
-  echo "[start] BuildKit всё ещё падает, пробую без BuildKit и без Bake..."
-  # Fallback 1: disable Bake (the warning about buildx not installed)
-  if COMPOSE_BAKE=false COMPOSE_DOCKER_CLI_BUILD=0 "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
-    return 0
-  fi
-  echo "[start] Пробую сборку без кэша для inference-worker..."
-  # Fallback 2: no-cache for the failing worker images
-  if DOCKER_BUILDKIT=0 COMPOSE_BAKE=false "${DC[@]}" "${PROFILE[@]}" build --no-cache inference-worker training-worker 2>&1 | tail -20; then
-    if DOCKER_BUILDKIT=0 COMPOSE_BAKE=false "${DC[@]}" "${PROFILE[@]}" up -d --remove-orphans; then
-      return 0
+  echo "[start] BuildKit всё ещё падает — собираю классическим builder без кэша BuildKit..."
+  if ( export DOCKER_BUILDKIT=0 COMPOSE_BAKE=false COMPOSE_PARALLEL_LIMIT=1
+       stack_watchdog "$ZMK_BUILD_TIMEOUT" "${DC[@]}" "${PROFILE[@]}" build ); then
+    if "${DC[@]}" "${PROFILE[@]}" up -d --remove-orphans; then
+      stack_save_fingerprint; return 0
     fi
   fi
-  echo "[start] Последняя попытка: полная очистка builder и no-cache..."
-  "${DOCKER[@]}" builder prune --all -f >/dev/null 2>&1 || true
-  if DOCKER_BUILDKIT=0 COMPOSE_BAKE=false COMPOSE_PARALLEL_LIMIT=1 "${DC[@]}" "${PROFILE[@]}" up -d --build --no-cache --remove-orphans; then
-    return 0
-  fi
-  echo "[start] Пробую slim Dockerfiles (python:3.12-slim + pip) как fallback для ultralytics base..."
-  # Build workers with slim Dockerfile if ultralytics base keeps failing (parent snapshot corruption or slow pip)
+  # ultralytics base image unavailable/corrupted: fall back to the slim
+  # Dockerfiles (python:3.12-slim + pip) instead of downloading it again.
   if [[ -f services/inference_worker/Dockerfile.slim && -f services/training_worker/Dockerfile.slim ]]; then
-    echo "[start] Собираю inference-worker с Dockerfile.slim..."
-    if DOCKER_BUILDKIT=0 "${DOCKER[@]}" build -f services/inference_worker/Dockerfile.slim -t zmk-vision-inference-worker:latest services/inference_worker 2>&1 | tail -30; then
-      echo "[start] inference-worker slim собран, собираю training-worker..."
-      DOCKER_BUILDKIT=0 "${DOCKER[@]}" build -f services/training_worker/Dockerfile.slim -t zmk-vision-training-worker:latest services/training_worker 2>&1 | tail -20 || true
-      # Now up with --no-build to use the manually built images
+    echo "[start] Пробую slim Dockerfiles (python:3.12-slim + pip)..."
+    if DOCKER_BUILDKIT=0 "${DOCKER[@]}" build -f services/inference_worker/Dockerfile.slim -t zmk-vision-inference-worker:latest services/inference_worker 2>&1 | tail -20; then
+      DOCKER_BUILDKIT=0 "${DOCKER[@]}" build -f services/training_worker/Dockerfile.slim -t zmk-vision-training-worker:latest services/training_worker 2>&1 | tail -10 || true
       if "${DC[@]}" "${PROFILE[@]}" up -d --remove-orphans --no-build; then
-        return 0
+        stack_save_fingerprint; return 0
       fi
-      # Fallback: try compose up with build but using slim via override
-      echo "[start] Пробую compose с slim через временный Dockerfile..."
-      cp services/inference_worker/Dockerfile services/inference_worker/Dockerfile.bak 2>/dev/null || true
-      cp services/training_worker/Dockerfile services/training_worker/Dockerfile.bak 2>/dev/null || true
-      cp services/inference_worker/Dockerfile.slim services/inference_worker/Dockerfile
-      cp services/training_worker/Dockerfile.slim services/training_worker/Dockerfile
-      if DOCKER_BUILDKIT=0 COMPOSE_BAKE=false "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
-        # Restore original Dockerfiles
-        mv services/inference_worker/Dockerfile.bak services/inference_worker/Dockerfile 2>/dev/null || true
-        mv services/training_worker/Dockerfile.bak services/training_worker/Dockerfile 2>/dev/null || true
-        return 0
-      fi
-      mv services/inference_worker/Dockerfile.bak services/inference_worker/Dockerfile 2>/dev/null || true
-      mv services/training_worker/Dockerfile.bak services/training_worker/Dockerfile 2>/dev/null || true
     fi
   fi
-  # Final attempt: try with parallel limit 1 and no cache, classic builder
-  DOCKER_BUILDKIT=0 COMPOSE_BAKE=false COMPOSE_PARALLEL_LIMIT=1 "${DC[@]}" "${PROFILE[@]}" up -d --build --no-cache --remove-orphans
+  return 1
 }
 
 print_zmk_logo(){
@@ -284,20 +304,47 @@ print_launch_summary(){
 echo "[start] Запускаю сервисы ZMK Vision..."
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml или .env не прошли валидацию"
 
-# --fast / ZMK_FAST=1 — быстрый запуск без принудительной полной пересборки.
-# Каждый обычный старт делает `up -d --build`, что снова прогоняет web-стадию
-# `npm ci` по сети. Если реестр npm недоступен/медленный, это виснет и
-# start.sh зацикливается на пересборке. --fast перезапускает уже собранный
-# стек (compose всё равно соберёт только те образы, которых ещё нет) и НЕ
-# трогает сеть для web. Используйте после обновления кода обычный ./start.sh.
-if [[ "${1:-}" == "--fast" || "${ZMK_FAST:-0}" == "1" ]]; then
+# --rebuild / ZMK_REBUILD=1 — принудительная пересборка образов.
+# Обычный старт больше не пересобирает стек: installers/lib-stack.sh хранит
+# fingerprint исходников, поэтому `npm ci` / `apt-get` / `pip` выполняются
+# только когда код действительно изменился. Раньше каждый запуск заново
+# скачивал зависимости и установщик «зависал на бесконечной загрузке»;
+# теперь повторный запуск занимает секунды, а скачивание ограничено
+# ZMK_BUILD_TIMEOUT (по умолчанию 40 минут) и всегда видно в прогрессe.
+if zmk_has_flag --rebuild "$@" || [[ "${ZMK_REBUILD:-0}" == "1" ]]; then
+  export ZMK_REBUILD=1
+  echo "[start] Принудительная пересборка образов (--rebuild)."
+fi
+
+if zmk_has_flag --fast "$@" || [[ "${ZMK_FAST:-0}" == "1" ]]; then
   echo "[start] Быстрый запуск: использую уже собранные образы (без --build)."
-  "${DC[@]}" "${PROFILE[@]}" up -d --remove-orphans || { "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose fast startup failed"; }
+  if command -v stack_watchdog >/dev/null 2>&1; then
+    stack_watchdog "${ZMK_BUILD_TIMEOUT:-600}" "${DC[@]}" "${PROFILE[@]}" up -d --remove-orphans || { "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose fast startup failed"; }
+  else
+    "${DC[@]}" "${PROFILE[@]}" up -d --remove-orphans || { "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose fast startup failed"; }
+  fi
 else
   echo "[start] Собираю/обновляю образы и запускаю сервисы..."
-  start_stack || { "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose startup failed after BuildKit cache recovery"; }
+  start_stack || {
+    echo ""
+    echo "[start] Не удалось собрать образы. Частые причины:"
+    echo "  • медленный/недоступный реестр npm — укажите зеркало в .env: NPM_REGISTRY=https://registry.npmmirror.com"
+    echo "  • медленный Docker Hub — повторите запуск, предзагрузка базовых образов идёт параллельно"
+    echo "  • нет сети — запустите офлайн: ./start.sh --fast"
+    "${DC[@]}" "${PROFILE[@]}" logs --tail=60
+    fail "Docker Compose startup failed after BuildKit cache recovery"
+  }
 fi
 if ! wait_http http://localhost:8000/api/health 120; then "${DC[@]}" logs --tail=100 api; fail "API health check failed"; fi
 if ! wait_http http://localhost:5173 120; then "${DC[@]}" logs --tail=100 web; fail "Web health check failed"; fi
+
+# Open the panel in the desktop session. On Wayland this has to run with the
+# logged-in user's WAYLAND_DISPLAY/XDG_RUNTIME_DIR/DBUS bus, otherwise
+# xdg-open (called through sudo for Docker) silently does nothing.
+if ! zmk_has_flag --no-open "$@"; then
+  # Guarded: an older release archive may not ship lib-desktop.sh yet.
+  if command -v zmk_wayland_hint >/dev/null 2>&1; then zmk_wayland_hint; fi
+  if command -v zmk_open_url >/dev/null 2>&1; then zmk_open_url "http://localhost:5173"; fi
+fi
 
 print_launch_summary

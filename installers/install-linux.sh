@@ -15,15 +15,23 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }
+# Flags may be passed in any order (see start.sh): scan the whole list.
+zmk_has_flag(){
+  local needle="$1"; shift
+  local arg
+  for arg in "$@"; do [[ "$arg" == "$needle" ]] && return 0; done
+  return 1
+}
+
 run_privileged(){
   if [[ "${EUID}" -eq 0 ]]; then "$@"; else command -v sudo >/dev/null 2>&1 || fail "sudo is required to install Docker"; sudo "$@"; fi
 }
 required=(docker-compose.yml .env.example backend/Dockerfile frontend/Dockerfile services/telegram_bot/Dockerfile services/max_bot/Dockerfile services/training_worker/Dockerfile services/inference_worker/Dockerfile)
 for file in "${required[@]}"; do [[ -f "$file" ]] || fail "Missing $file. Download and extract the complete release archive, not only the installer."; done
 
-if [[ "${1:-}" == "--check" ]]; then
+if zmk_has_flag --check "$@"; then
   echo "Project files: OK"
-  bash -n installers/install-linux.sh installers/uninstall-linux.sh installers/auto-update.sh installers/wizard.sh start.sh
+  bash -n installers/install-linux.sh installers/uninstall-linux.sh installers/auto-update.sh installers/wizard.sh installers/lib-stack.sh installers/lib-desktop.sh start.sh
   if command -v docker >/dev/null 2>&1; then docker compose version && docker compose config --quiet || fail "Docker Compose validation failed"; else echo "WARNING: Docker is not installed; project file validation only."; fi
   echo "Installer validation: OK"
   exit 0
@@ -58,10 +66,14 @@ esac
 echo -e "\n=== ZMK Vision installer for Ubuntu/Debian ==="
 if [[ "$(uname -s)" != "Linux" ]]; then fail "This installer supports Linux only"; fi
 if ! command -v apt-get >/dev/null 2>&1; then fail "Automatic installation supports Ubuntu/Debian (apt). Install Docker manually on this distribution."; fi
-if ! command -v curl >/dev/null 2>&1; then run_privileged apt-get update && run_privileged apt-get install -y ca-certificates curl; fi
+# A mirror that answers slowly must not hang the installer: cap every apt
+# network operation instead of waiting on a stalled TCP connection forever.
+APT_OPTS=(-o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20 -o Acquire::Retries=2)
+export DEBIAN_FRONTEND=noninteractive
+if ! command -v curl >/dev/null 2>&1; then run_privileged apt-get update "${APT_OPTS[@]}" && run_privileged apt-get install -y ca-certificates curl; fi
 if ! command -v docker >/dev/null 2>&1; then
   echo "Installing Docker Engine and Compose plugin..."
-  run_privileged apt-get update
+  run_privileged apt-get update "${APT_OPTS[@]}"
   run_privileged apt-get install -y ca-certificates curl docker.io
   run_privileged apt-get install -y docker-compose-v2 || run_privileged apt-get install -y docker-compose-plugin
   run_privileged systemctl enable --now docker
@@ -83,6 +95,18 @@ if ! docker info >/dev/null 2>&1; then
 fi
 "${DC[@]}" version >/dev/null || fail "Docker Compose plugin is unavailable"
 
+# Shared stack helpers (build fingerprinting, parallel pre-pull, timeouts).
+if [[ -f installers/lib-stack.sh ]]; then
+  # shellcheck disable=SC1091
+  source installers/lib-stack.sh
+fi
+
+# Desktop helpers (Wayland/X11 aware browser launch).
+if [[ -f installers/lib-desktop.sh ]]; then
+  # shellcheck disable=SC1091
+  source installers/lib-desktop.sh
+fi
+
 PROFILE=()
 if [[ -f .zmk-profiles ]]; then mapfile -t PROFILE < .zmk-profiles; fi
 if docker info --format '{{json .Runtimes}}' 2>/dev/null | grep -qi nvidia; then
@@ -102,11 +126,41 @@ repair_build_cache(){
 }
 
 start_stack(){
-  if "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
-    return 0
+  stack_prepare_build_env
+  # Rebuild only when sources changed or an image is missing, so a restart is
+  # a restart and not another full npm/apt/pip download.
+  if command -v stack_needs_build >/dev/null 2>&1 && ! stack_needs_build; then
+    echo "[install] Образы уже собраны для этой версии исходников — пропускаю пересборку (принудительно: ZMK_REBUILD=1)"
+    if stack_watchdog "$ZMK_BUILD_TIMEOUT" "${DC[@]}" "${PROFILE[@]}" up -d --remove-orphans; then
+      stack_save_fingerprint; return 0
+    fi
+  fi
+  if command -v stack_prepull >/dev/null 2>&1; then stack_prepull; fi
+  if stack_watchdog "$ZMK_BUILD_TIMEOUT" "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans; then
+    stack_save_fingerprint; return 0
   fi
   repair_build_cache
-  COMPOSE_PARALLEL_LIMIT=1 "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans
+  echo "[install] Повторная сборка с лимитом параллелизма..."
+  if ( export COMPOSE_PARALLEL_LIMIT=1; stack_watchdog "$ZMK_BUILD_TIMEOUT" "${DC[@]}" "${PROFILE[@]}" up -d --build --remove-orphans ); then
+    stack_save_fingerprint; return 0
+  fi
+  echo "[install] BuildKit всё ещё падает — собираю классическим builder..."
+  if ( export DOCKER_BUILDKIT=0 COMPOSE_BAKE=false COMPOSE_PARALLEL_LIMIT=1
+       stack_watchdog "$ZMK_BUILD_TIMEOUT" "${DC[@]}" "${PROFILE[@]}" build ); then
+    if "${DC[@]}" "${PROFILE[@]}" up -d --remove-orphans; then
+      stack_save_fingerprint; return 0
+    fi
+  fi
+  if [[ -f services/inference_worker/Dockerfile.slim && -f services/training_worker/Dockerfile.slim ]]; then
+    echo "[install] Пробую slim Dockerfiles (python:3.12-slim + pip)..."
+    if DOCKER_BUILDKIT=0 "${DOCKER[@]}" build -f services/inference_worker/Dockerfile.slim -t zmk-vision-inference-worker:latest services/inference_worker 2>&1 | tail -20; then
+      DOCKER_BUILDKIT=0 "${DOCKER[@]}" build -f services/training_worker/Dockerfile.slim -t zmk-vision-training-worker:latest services/training_worker 2>&1 | tail -10 || true
+      if "${DC[@]}" "${PROFILE[@]}" up -d --remove-orphans --no-build; then
+        stack_save_fingerprint; return 0
+      fi
+    fi
+  fi
+  return 1
 }
 
 print_zmk_logo(){
@@ -162,8 +216,20 @@ print_install_summary(){
 }
 
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml or .env validation failed"
-start_stack || { "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose startup failed after BuildKit cache recovery"; }
+start_stack || {
+  echo ""
+  echo "[install] Не удалось собрать образы. Частые причины:"
+  echo "  • медленный/недоступный реестр npm — укажите зеркало в .env: NPM_REGISTRY=https://registry.npmmirror.com"
+  echo "  • медленный Docker Hub — просто повторите запуск: предзагрузка базовых образов идёт параллельно"
+  "${DC[@]}" "${PROFILE[@]}" logs --tail=60
+  fail "Docker Compose startup failed after BuildKit cache recovery"
+}
 if ! wait_http http://localhost:8000/api/health 120; then "${DC[@]}" logs --tail=100 api; fail "API health check failed"; fi
 if ! wait_http http://localhost:5173 120; then "${DC[@]}" logs --tail=100 web; fail "Web health check failed"; fi
+
+# Wayland/X11: open the panel inside the desktop session (see lib-desktop.sh).
+# Guarded: an older release archive may not ship lib-desktop.sh yet.
+if command -v zmk_wayland_hint >/dev/null 2>&1; then zmk_wayland_hint; fi
+if command -v zmk_open_url >/dev/null 2>&1; then zmk_open_url "http://localhost:5173"; fi
 
 print_install_summary
