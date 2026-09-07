@@ -32,6 +32,16 @@ cd "$ROOT"
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }
 
+# Flags may be passed in any order: scan the whole argument list instead of
+# looking only at $1/$2 (`./start.sh --no-open --rebuild` used to ignore
+# --rebuild silently). Branch selection stays positional (see below).
+zmk_has_flag(){
+  local needle="$1"; shift
+  local arg
+  for arg in "$@"; do [[ "$arg" == "$needle" ]] && return 0; done
+  return 1
+}
+
 # Every remote git operation is capped: a stalled fetch used to hang the whole
 # launcher with no output, which looks exactly like an endless download.
 zmk_git(){
@@ -89,7 +99,7 @@ if [[ -d .git ]]; then
   git config pull.ff only >/dev/null 2>&1 || true
 fi
 # Upgrade the selected branch itself. Release archives are used only on main.
-if [[ "${1:-}" != "--no-update" && -z "${ZMK_NO_AUTO_UPDATE:-}" && -f installers/auto-update.sh ]]; then
+if ! zmk_has_flag --no-update "$@" && [[ -z "${ZMK_NO_AUTO_UPDATE:-}" && -f installers/auto-update.sh ]]; then
   if [[ -d .git ]]; then git config --global --add safe.directory "$(pwd)" >/dev/null 2>&1 || true; fi
   ZMK_UPDATE_BRANCH="${ZMK_UPDATE_BRANCH:-$(git branch --show-current 2>/dev/null || true)}" \
     bash installers/auto-update.sh start.sh || echo "[start] auto-update check skipped."
@@ -107,7 +117,7 @@ chmod 600 .env 2>/dev/null || true
 # FIRST-RUN CONFIGURATION WIZARD  (before the docker check so it always runs)
 # =====================================================================
 wizard_needed=false
-if [[ "${1:-}" == "--setup" ]]; then
+if zmk_has_flag --setup "$@"; then
   wizard_needed=true
 elif [[ ! -f .zmk-profiles ]]; then
   # No saved profile -> this is a first run -> ask how to configure.
@@ -301,14 +311,18 @@ echo "[start] Запускаю сервисы ZMK Vision..."
 # скачивал зависимости и установщик «зависал на бесконечной загрузке»;
 # теперь повторный запуск занимает секунды, а скачивание ограничено
 # ZMK_BUILD_TIMEOUT (по умолчанию 40 минут) и всегда видно в прогрессe.
-if [[ "${1:-}" == "--rebuild" || "${ZMK_REBUILD:-0}" == "1" ]]; then
+if zmk_has_flag --rebuild "$@" || [[ "${ZMK_REBUILD:-0}" == "1" ]]; then
   export ZMK_REBUILD=1
   echo "[start] Принудительная пересборка образов (--rebuild)."
 fi
 
-if [[ "${1:-}" == "--fast" || "${ZMK_FAST:-0}" == "1" ]]; then
+if zmk_has_flag --fast "$@" || [[ "${ZMK_FAST:-0}" == "1" ]]; then
   echo "[start] Быстрый запуск: использую уже собранные образы (без --build)."
-  stack_watchdog "${ZMK_BUILD_TIMEOUT:-600}" "${DC[@]}" "${PROFILE[@]}" up -d --remove-orphans || { "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose fast startup failed"; }
+  if command -v stack_watchdog >/dev/null 2>&1; then
+    stack_watchdog "${ZMK_BUILD_TIMEOUT:-600}" "${DC[@]}" "${PROFILE[@]}" up -d --remove-orphans || { "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose fast startup failed"; }
+  else
+    "${DC[@]}" "${PROFILE[@]}" up -d --remove-orphans || { "${DC[@]}" "${PROFILE[@]}" logs --tail=100; fail "Docker Compose fast startup failed"; }
+  fi
 else
   echo "[start] Собираю/обновляю образы и запускаю сервисы..."
   start_stack || {
@@ -327,9 +341,10 @@ if ! wait_http http://localhost:5173 120; then "${DC[@]}" logs --tail=100 web; f
 # Open the panel in the desktop session. On Wayland this has to run with the
 # logged-in user's WAYLAND_DISPLAY/XDG_RUNTIME_DIR/DBUS bus, otherwise
 # xdg-open (called through sudo for Docker) silently does nothing.
-if [[ "${1:-}" != "--no-open" && "${2:-}" != "--no-open" ]]; then
-  zmk_wayland_hint
-  zmk_open_url "http://localhost:5173"
+if ! zmk_has_flag --no-open "$@"; then
+  # Guarded: an older release archive may not ship lib-desktop.sh yet.
+  if command -v zmk_wayland_hint >/dev/null 2>&1; then zmk_wayland_hint; fi
+  if command -v zmk_open_url >/dev/null 2>&1; then zmk_open_url "http://localhost:5173"; fi
 fi
 
 print_launch_summary

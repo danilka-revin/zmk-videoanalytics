@@ -15,13 +15,21 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 fail(){ echo "ERROR: $*" >&2; exit 1; }
+# Flags may be passed in any order (see start.sh): scan the whole list.
+zmk_has_flag(){
+  local needle="$1"; shift
+  local arg
+  for arg in "$@"; do [[ "$arg" == "$needle" ]] && return 0; done
+  return 1
+}
+
 run_privileged(){
   if [[ "${EUID}" -eq 0 ]]; then "$@"; else command -v sudo >/dev/null 2>&1 || fail "sudo is required to install Docker"; sudo "$@"; fi
 }
 required=(docker-compose.yml .env.example backend/Dockerfile frontend/Dockerfile services/telegram_bot/Dockerfile services/max_bot/Dockerfile services/training_worker/Dockerfile services/inference_worker/Dockerfile)
 for file in "${required[@]}"; do [[ -f "$file" ]] || fail "Missing $file. Download and extract the complete release archive, not only the installer."; done
 
-if [[ "${1:-}" == "--check" ]]; then
+if zmk_has_flag --check "$@"; then
   echo "Project files: OK"
   bash -n installers/install-linux.sh installers/uninstall-linux.sh installers/auto-update.sh installers/wizard.sh installers/lib-stack.sh installers/lib-desktop.sh start.sh
   if command -v docker >/dev/null 2>&1; then docker compose version && docker compose config --quiet || fail "Docker Compose validation failed"; else echo "WARNING: Docker is not installed; project file validation only."; fi
@@ -220,7 +228,8 @@ if ! wait_http http://localhost:8000/api/health 120; then "${DC[@]}" logs --tail
 if ! wait_http http://localhost:5173 120; then "${DC[@]}" logs --tail=100 web; fail "Web health check failed"; fi
 
 # Wayland/X11: open the panel inside the desktop session (see lib-desktop.sh).
-zmk_wayland_hint
-zmk_open_url "http://localhost:5173"
+# Guarded: an older release archive may not ship lib-desktop.sh yet.
+if command -v zmk_wayland_hint >/dev/null 2>&1; then zmk_wayland_hint; fi
+if command -v zmk_open_url >/dev/null 2>&1; then zmk_open_url "http://localhost:5173"; fi
 
 print_install_summary
