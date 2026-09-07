@@ -44,6 +44,16 @@ zmk_ensure_safe_git(){
   fi
 }
 
+# Remote git operations are capped: a stalled fetch used to hang the launcher
+# with no output, which is indistinguishable from an endless download.
+zmk_git(){
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --signal=TERM --kill-after=15s "${ZMK_GIT_TIMEOUT:-120}" git "$@"
+  else
+    git "$@"
+  fi
+}
+
 zmk_err(){ echo "ERROR: $*" >&2; }
 
 zmk_current_version(){
@@ -127,7 +137,7 @@ zmk_check_and_update(){
   # consulting GitHub releases (which always represent main).
   if [[ -n "$branch" && "$branch" != "main" && "$branch" != "master" ]]; then
     echo "[auto-update] Branch channel: ${branch}"
-    if ! git -C "$root" fetch --quiet origin "$branch"; then
+    if ! zmk_git -C "$root" fetch --quiet origin "$branch"; then
       echo "[auto-update] Could not fetch branch ${branch}; skipping update."
       return 0
     fi
@@ -200,9 +210,9 @@ zmk_check_and_update(){
     # Stash or discard local changes that would block checkout (VERSION, RELEASE_NOTES, Dockerfiles)
     git -C "$root" reset --hard HEAD >/dev/null 2>&1 || true
     git -C "$root" clean -fd >/dev/null 2>&1 || true
-    git -C "$root" fetch --prune --tags --force origin 2>&1 | tail -5 || true
+    zmk_git -C "$root" fetch --prune --tags --force origin 2>&1 | tail -5 || true
     # Try to checkout the tag directly, then main if tag checkout fails
-    if git -C "$root" fetch --depth=1 origin "$latest" 2>&1 || git -C "$root" fetch origin "$latest" --prune --tags 2>&1 | tail -5; then
+    if zmk_git -C "$root" fetch --depth=1 origin "$latest" 2>&1 || zmk_git -C "$root" fetch origin "$latest" --prune --tags 2>&1 | tail -5; then
       # Ensure clean state again before checkout
       git -C "$root" reset --hard HEAD >/dev/null 2>&1 || true
       git -C "$root" clean -fd >/dev/null 2>&1 || true
@@ -216,7 +226,7 @@ zmk_check_and_update(){
     zmk_ensure_safe_git "$root"
     git -C "$root" reset --hard HEAD >/dev/null 2>&1 || true
     git -C "$root" clean -fd >/dev/null 2>&1 || true
-    if git -C "$root" fetch --depth=1 origin main 2>&1 || git -C "$root" fetch origin main --prune --tags 2>&1 | tail -5; then
+    if zmk_git -C "$root" fetch --depth=1 origin main 2>&1 || zmk_git -C "$root" fetch origin main --prune --tags 2>&1 | tail -5; then
       git -C "$root" reset --hard HEAD >/dev/null 2>&1 || true
       git -C "$root" clean -fd >/dev/null 2>&1 || true
       if git -C "$root" checkout -B main FETCH_HEAD 2>&1 || git -C "$root" checkout -B main origin/main 2>&1; then

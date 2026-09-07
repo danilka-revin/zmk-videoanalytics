@@ -286,3 +286,70 @@ def test_max_wizard_allows_safe_waiting_mode_without_token(tmp_path):
     config = (tmp_path / '.env').read_text()
     assert 'MESSENGER_PROVIDER=max' in config and 'MAX_BOT_TOKEN=' in config
     assert 'безопасном режиме ожидания' in result.stdout
+
+
+def test_stack_helpers_skip_rebuild_when_sources_are_unchanged(tmp_path):
+    """A restart must not re-run npm ci / apt-get / pip again.
+
+    The launcher used to call `up -d --build` on every start, which re-entered
+    every image build and looked like an endless download on a slow link.
+    """
+    fake = tmp_path / 'fakecompose'
+    fake.write_text(
+        '#!/usr/bin/env bash\n'
+        'if [[ "$*" == *"--images"* ]]; then echo zmk-vision-api; echo zmk-vision-web; exit 0; fi\n'
+        'exit 0\n'
+    )
+    fake.chmod(0o755)
+    fingerprint = tmp_path / 'fingerprint'
+    script = f"""
+set -uo pipefail
+cd {ROOT}
+DC=({fake})
+DOCKER=(true)
+PROFILE=()
+export ZMK_NO_PREPULL=1 ZMK_QUIET=1 ZMK_FINGERPRINT_FILE={fingerprint}
+source installers/lib-stack.sh
+stack_needs_build && echo NEEDS_BUILD || echo SKIP_BUILD
+stack_save_fingerprint
+stack_needs_build && echo NEEDS_BUILD || echo SKIP_BUILD
+ZMK_REBUILD=1 stack_needs_build && echo NEEDS_BUILD || echo SKIP_BUILD
+"""
+    result = subprocess.run(['bash', '-c', script], text=True, capture_output=True, check=True)
+    assert result.stdout.split() == ['NEEDS_BUILD', 'SKIP_BUILD', 'NEEDS_BUILD'], result.stdout
+
+
+def test_launchers_use_shared_stack_and_desktop_helpers():
+    lib_stack = (ROOT / 'installers' / 'lib-stack.sh').read_text()
+    for needle in ['stack_needs_build', 'stack_fingerprint', 'stack_prepull', 'stack_watchdog', 'ZMK_BUILD_TIMEOUT']:
+        assert needle in lib_stack
+    start = (ROOT / 'start.sh').read_text()
+    installer = (ROOT / 'installers' / 'install-linux.sh').read_text()
+    for script in (start, installer):
+        assert 'installers/lib-stack.sh' in script
+        assert 'stack_needs_build' in script
+        assert 'installers/lib-desktop.sh' in script
+    # Forcing a rebuild has to stay possible.
+    assert '--rebuild' in start or 'ZMK_REBUILD' in start
+
+
+def test_wayland_desktop_helper_opens_panel_in_user_session():
+    """On Wayland `xdg-open` must run inside the session that owns the display.
+
+    Under sudo (Docker needs it) the compositor variables are missing, so the
+    URL has to be opened as the logged-in user with its own XDG runtime dir and
+    DBus address; otherwise the "one click" launcher silently opens nothing.
+    """
+    desktop = (ROOT / 'installers' / 'lib-desktop.sh').read_text()
+    for needle in ['WAYLAND_DISPLAY', 'XDG_RUNTIME_DIR', 'DBUS_SESSION_BUS_ADDRESS', 'SUDO_USER', 'xdg-open']:
+        assert needle in desktop
+    # A headless server must never try to open a browser.
+    script = f"""
+source {ROOT}/installers/lib-desktop.sh
+echo "session=$(zmk_session_type)"
+zmk_open_url http://localhost:5173 && echo OPEN_SKIPPED_OK
+"""
+    env = {'PATH': '/usr/bin:/bin'}
+    result = subprocess.run(['bash', '-c', script], text=True, capture_output=True, check=True, env=env)
+    assert 'session=headless' in result.stdout
+    assert 'OPEN_SKIPPED_OK' in result.stdout

@@ -15,6 +15,7 @@ htmlcov/
 *.log
 .zmk-profiles
 .zmk-ref
+.zmk-build-fingerprint
 .live-data/
 .worker-token
 

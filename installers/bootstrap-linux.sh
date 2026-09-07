@@ -34,6 +34,16 @@ run_privileged(){
   if [[ "${EUID}" -eq 0 ]]; then "$@"; else command -v sudo >/dev/null 2>&1 || fail "sudo is required to install missing dependencies"; sudo "$@"; fi
 }
 
+# Remote git operations are capped so a stalled network cannot hang the
+# one-command launcher (it used to sit on "Downloading..." indefinitely).
+zmk_git(){
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --signal=TERM --kill-after=15s "${ZMK_GIT_TIMEOUT:-180}" git "$@"
+  else
+    git "$@"
+  fi
+}
+
 ensure_command(){
   local command_name="$1" package_name="$2"
   command -v "$command_name" >/dev/null 2>&1 && return 0
@@ -101,7 +111,7 @@ if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
   # been merged and deleted. Fall back to the public release channel so the
   # one-command launcher keeps working without manual maintenance.
   if [[ "$ZMK_REF" != "main" ]]; then
-    if ! git ls-remote --heads "$ZMK_GIT_URL" "$ZMK_REF" >/dev/null 2>&1; then
+    if ! zmk_git ls-remote --heads "$ZMK_GIT_URL" "$ZMK_REF" >/dev/null 2>&1; then
       info "Pinned ref ${ZMK_REF} is gone (probably merged); switching to main."
       ZMK_REF="main"
     fi
@@ -115,14 +125,14 @@ if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
   git -C "$ZMK_INSTALL_DIR" config pull.ff only >/dev/null 2>&1 || true
   git -C "$ZMK_INSTALL_DIR" reset --hard HEAD >/dev/null 2>&1 || true
   git -C "$ZMK_INSTALL_DIR" clean -fd >/dev/null 2>&1 || true
-  git -C "$ZMK_INSTALL_DIR" fetch --prune --tags --force origin 2>&1 | tail -5 || true
+  zmk_git -C "$ZMK_INSTALL_DIR" fetch --prune --tags --force origin 2>&1 | tail -5 || true
   # An explicit `git fetch origin <branch>` records the commit in FETCH_HEAD
   # but does not necessarily create origin/<branch> in shallow checkouts.
   # Checking out the fetched commit works for main as well as slash-containing
   # feature branches (e.g. arena/...) and keeps the one-command launcher
   # repeatable. Use --depth=1 for speed, fallback to full fetch if shallow fails
-  if ! git -C "$ZMK_INSTALL_DIR" fetch --depth=1 origin "$ZMK_REF" 2>&1; then
-    git -C "$ZMK_INSTALL_DIR" fetch origin "$ZMK_REF" --prune --tags 2>&1 | tail -5 || true
+  if ! zmk_git -C "$ZMK_INSTALL_DIR" fetch --depth=1 origin "$ZMK_REF" 2>&1; then
+    zmk_git -C "$ZMK_INSTALL_DIR" fetch origin "$ZMK_REF" --prune --tags 2>&1 | tail -5 || true
   fi
   checkout_target="$(git -C "$ZMK_INSTALL_DIR" rev-parse FETCH_HEAD 2>/dev/null || true)"
 
@@ -134,9 +144,9 @@ if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
     # A shallow checkout hides the merge commit's second parent, so unshallow
     # main once to compare ancestry exactly; later runs use a plain fetch.
     if [[ -f "$ZMK_INSTALL_DIR/.git/shallow" ]]; then
-      git -C "$ZMK_INSTALL_DIR" fetch --unshallow origin main >/dev/null 2>&1 || true
+      zmk_git -C "$ZMK_INSTALL_DIR" fetch --unshallow origin main >/dev/null 2>&1 || true
     else
-      git -C "$ZMK_INSTALL_DIR" fetch origin main >/dev/null 2>&1 || true
+      zmk_git -C "$ZMK_INSTALL_DIR" fetch origin main >/dev/null 2>&1 || true
     fi
     main_tip="$(git -C "$ZMK_INSTALL_DIR" rev-parse FETCH_HEAD 2>/dev/null || true)"
     if [[ -n "$main_tip" ]] && git -C "$ZMK_INSTALL_DIR" merge-base --is-ancestor "$checkout_target" "$main_tip" 2>/dev/null; then
@@ -154,7 +164,7 @@ if [[ -d "$ZMK_INSTALL_DIR/.git" ]]; then
 else
   [[ ! -e "$ZMK_INSTALL_DIR" ]] || fail "Target exists but is not a git checkout: $ZMK_INSTALL_DIR"
   info "Downloading a fresh copy of ${ZMK_REF} from GitHub..."
-  git clone --depth=1 --branch "$ZMK_REF" --single-branch "$ZMK_GIT_URL" "$ZMK_INSTALL_DIR"
+  zmk_git clone --depth=1 --branch "$ZMK_REF" --single-branch "$ZMK_GIT_URL" "$ZMK_INSTALL_DIR"
 fi
 
 cd "$ZMK_INSTALL_DIR"
