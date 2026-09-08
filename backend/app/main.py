@@ -2511,7 +2511,10 @@ def camera_mjpeg(camera_id:str):
                                             yield chunk
                             except (httpx.HTTPError, OSError, RuntimeError, ValueError):
                                 return
-                        return StreamingResponse(go2rtc_generate(), media_type="multipart/x-mixed-replace; boundary=--go2rtc", headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
+                        # The boundary token itself must not contain the leading
+                        # "--" (RFC 2046); the browser-side parser scans JPEG
+                        # markers, but keep the header spec-compliant anyway.
+                        return StreamingResponse(go2rtc_generate(), media_type="multipart/x-mixed-replace; boundary=go2rtc", headers={"Cache-Control":"no-store","X-Accel-Buffering":"no"})
             except (httpx.HTTPError, OSError, RuntimeError, ValueError):
                 continue
 
