@@ -267,12 +267,18 @@ function applyVideoCodecPreference(transceiver:RTCRtpTransceiver,withoutH264:boo
   const preferred=(caps.codecs as any[]).filter(c=>{
    const mime=String(c?.mimeType||'').toLowerCase();
    if(!mime.startsWith('video/'))return false;
+   // rtx/red/fec are not real media codecs: some go2rtc builds pick them
+   // from the offer and answer with a track that never carries frames.
+   if(mime.includes('rtx')||mime.includes('red')||mime.includes('ulpfec')||mime.includes('flexfec'))return false;
    return withoutH264?!mime.includes('h264'):true;
   });
   if(preferred.length&&typeof (transceiver as any).setCodecPreferences==='function')(transceiver as any).setCodecPreferences(preferred);
  }catch{}
 }
-function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto'}:{id:string;status:string;age:number|null;telemetryStale?:boolean;lastError?:string;previewMode?:'auto'|'mse'|'webrtc'|'mjpeg'}){
+// Exported for the transport-cascade integration test (jsdom): the camera
+// card must always reach a visible picture even when WebRTC/MSE signalling
+// fails, exactly like Firefox on Ubuntu without go2rtc.
+export function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto'}:{id:string;status:string;age:number|null;telemetryStale?:boolean;lastError?:string;previewMode?:'auto'|'mse'|'webrtc'|'mjpeg'}){
  const videoRef=useRef<HTMLVideoElement|null>(null);
  const hlsRef=useRef<any>(null);
  const mseRef=useRef<{ws:WebSocket|null,ms:MediaSource|null,sb:SourceBuffer|null,queue:Uint8Array[],closing:boolean,objectUrl:string}>({ws:null,ms:null,sb:null,queue:[],closing:false,objectUrl:''});
@@ -302,6 +308,35 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
  const liveRef=useRef<boolean>(false);
  const lastAttemptRef=useRef<number>(0);
  useEffect(()=>{liveRef.current=live},[live]);
+ // v2.22.1 safety net: while no live transport has painted a frame yet, show
+ // the last worker snapshot (same source as the «Снимок» button) instead of a
+ // dark card. The worker publishes a snapshot every few seconds whenever it
+ // really decodes the camera, so "detects, but no picture" is no longer
+ // possible: worst case the card shows a few-seconds-old still image.
+ const [stillSrc,setStillSrc]=useState('');
+ useEffect(()=>{
+  if(live){setStillSrc(old=>{if(old)try{URL.revokeObjectURL(old)}catch{};return ''});return}
+  let stop=false;
+  const controller=new AbortController();
+  const pull=async()=>{
+   try{
+    const headers:Record<string,string>={};
+    if(apiKey)headers['X-API-Key']=apiKey;
+    const r=await fetch(`/api/cameras/${id}/snapshot?t=${Date.now()}`,{headers,signal:controller.signal,cache:'no-store'});
+    if(!r.ok)return;
+    const blob=await r.blob();
+    if(stop||!blob.size)return;
+    const url=URL.createObjectURL(blob);
+    setStillSrc(old=>{if(old&&old!==url)try{URL.revokeObjectURL(old)}catch{};return url});
+   }catch{}
+  };
+  void pull();
+  const timer=window.setInterval(()=>{if(!stop&&!liveRef.current)void pull()},4000) as unknown as number;
+  return()=>{
+   stop=true;controller.abort();clearInterval(timer);
+   setStillSrc(old=>{if(old)try{URL.revokeObjectURL(old)}catch{};return ''});
+  };
+ },[id,apiKey,live]);
 
  useEffect(()=>{
   let cancelled=false;
@@ -380,7 +415,8 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
    if(mseRetryRef.current)clearTimeout(mseRetryRef.current);
    setTransport('hls');
    const names=srcNames||[`zmk-${id}`,id];
-   for(const streamName of names){
+   for(let nameIdx=0;nameIdx<names.length;nameIdx++){
+    const streamName=names[nameIdx];
     if(cancelled)break;
     try{
      const {default:Hls}=await import('hls.js');
@@ -398,6 +434,27 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
        maxLiveSyncPlaybackRate:1.2,
       });
       hlsRef.current=hls;
+      // v2.22.1: a failed HLS attempt must never dead-end the card. Before
+      // this fix a fatal hls.js error or a missing manifest just kept the
+      // (black) <video> mounted forever — the operator saw detection boxes
+      // floating over an empty card. Now every failure moves on: next stream
+      // name, and after the last one the always-working MJPEG transport.
+      let advanced=false;
+      const fail=(force=false)=>{
+       if(cancelled||advanced)return;
+       if(!force&&liveRef.current)return;
+       advanced=true;
+       setLive(false);
+       if(hlsRetryRef.current)clearTimeout(hlsRetryRef.current);
+       try{hls.destroy()}catch{}
+       if(hlsRef.current===hls)hlsRef.current=null;
+       const rest=names.slice(nameIdx+1);
+       hlsRetryRef.current=window.setTimeout(()=>{
+        if(cancelled)return;
+        if(rest.length)void beginHls(rest);
+        else beginMjpeg();
+       },500) as unknown as number;
+      };
       hls.loadSource(hlsUrl);
       hls.attachMedia(videoRef.current);
       hls.on(Hls.Events.MANIFEST_PARSED,()=>{
@@ -407,20 +464,14 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
       });
       hls.on(Hls.Events.ERROR,(_:any,data:any)=>{
        if(cancelled)return;
-       if(data&&data.fatal){
-        try{hls.destroy()}catch{};hlsRef.current=null;
-        if(streamName===names[names.length-1]){
-         hlsRetryRef.current=window.setTimeout(()=>{if(!cancelled){setLive(false);setTransport('hls')}},800) as unknown as number;
-        }
-       }
+       // A fatal error after the stream was already live must also move on
+       // (force), otherwise the card would hang dark until the 15s health
+       // check restarts the transport.
+       if(data&&data.fatal)fail(liveRef.current);
       });
-      // timeout fallback if no manifest
-      hlsRetryRef.current=window.setTimeout(()=>{
-       if(cancelled)return;
-       if(!live&&streamName===names[names.length-1]){
-        try{hls.destroy()}catch{};hlsRef.current=null;setLive(false);setTransport('hls');
-       }
-      },5000) as unknown as number;
+      // timeout fallback if no manifest. `liveRef` (not the stale `live`
+      // closure) is authoritative — see the health-check note below.
+      hlsRetryRef.current=window.setTimeout(()=>{if(!cancelled&&!liveRef.current)fail()},5000) as unknown as number;
       return;
      }else if(videoRef.current.canPlayType('application/vnd.apple.mpegurl')){
       videoRef.current.src=hlsUrl;
@@ -431,7 +482,8 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
      continue;
     }
    }
-   setLive(false);setTransport('hls');
+   // No HLS engine available for any name: MJPEG is the guaranteed picture.
+   beginMjpeg();
   };
   const beginMSE=async(srcNames?:string[])=>{
    if(cancelled)return;
@@ -445,7 +497,8 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
     if(canDecodeH264())void beginHls(names);else beginMjpeg();return;
    }
    let started=false;
-   for(const streamName of names){
+   for(let nameIdx=0;nameIdx<names.length;nameIdx++){
+    const streamName=names[nameIdx];
     if(cancelled||started)break;
     try{
      const wsProto=location.protocol==='https:'?'wss':'ws';
@@ -462,6 +515,25 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
      // (video/mp4; codecs="..."). Use it first, then fall back to the usual
      // H.264 profiles and finally to a bare 'video/mp4' probe.
      let mseMime='';
+     // v2.22.1: every failure path funnels through fail() exactly once — it
+     // moves to the next go2rtc stream name, then to HLS, then to MJPEG.
+     // Previously only a failure of the LAST name could leave the transport,
+     // so an error on the primary "zmk-{id}" name left a permanently dark
+     // card with detection boxes over it ("detects, but no picture").
+     let mseFailed=false;
+     const fail=()=>{
+      if(cancelled||mseFailed||liveFlag)return;
+      mseFailed=true;
+      if(mseRetryRef.current)clearTimeout(mseRetryRef.current);
+      try{ws.close()}catch{}
+      const rest=names.slice(nameIdx+1);
+      mseRetryRef.current=window.setTimeout(()=>{
+       if(cancelled)return;
+       if(rest.length)void beginMSE(rest);
+       else if(canDecodeH264())void beginHls(names);
+       else beginMjpeg();
+      },500) as unknown as number;
+     };
      const mimeCandidates=():string[]=>[mseMime,
       'video/mp4; codecs="avc1.64001f"',
       'video/mp4; codecs="avc1.640029"',
@@ -536,7 +608,7 @@ function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto
         const msg=JSON.parse(ev.data);
                 if(msg.type==='error'){
          // go2rtc refused the request (no stream, no matching codec).
-         try{ws.close()}catch{}
+         fail();
          return;
         }
         if(msg.type==='mse'&&typeof msg.value==='string'&&/^(video|audio)\//.test(msg.value)){
@@ -618,23 +690,15 @@ if(msg.type==='mse'&&msg.value){
      ws.onclose=()=>{
       if(cancelled)return;
       mseRef.current.ws=null;
-      if(!liveFlag&&streamName===names[names.length-1]){
-       if(canDecodeH264())mseRetryRef.current=window.setTimeout(()=>{if(!cancelled)void beginHls(names)},600) as unknown as number;
-       else mseRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginMjpeg()},600) as unknown as number;
-      }else if(liveFlag&&!cancelled){
+      if(liveFlag){
        // reconnect if was live
        mseRetryRef.current=window.setTimeout(()=>{if(!cancelled){cleanupMSE();void beginMSE(names);setRetry(r=>r+1)}},1200) as unknown as number;
-      }
+      }else fail();
      };
-     // watchdog: if not live in 4s, try next name or HLS
+     // watchdog: if not live in 4s, advance to the next name / HLS / MJPEG
      mseRetryRef.current=window.setTimeout(()=>{
       if(cancelled)return;
-      if(!liveFlag){
-       try{ws.close()}catch{}
-       if(streamName===names[names.length-1]){
-        void beginHls(names);
-       }
-      }
+      if(!liveFlag)fail();
      },4000) as unknown as number;
      started=true;
      break;
@@ -662,7 +726,8 @@ if(msg.type==='mse'&&msg.value){
    setTransport('webrtc');
    const names=srcNames||[`zmk-${id}`,id];
    let started=false;
-   for(const streamName of names){
+   for(let nameIdx=0;nameIdx<names.length;nameIdx++){
+    const streamName=names[nameIdx];
     if(cancelled||started)break;
     try{
      if(!window.RTCPeerConnection)continue;
@@ -684,6 +749,25 @@ if(msg.type==='mse'&&msg.value){
      const stream=new MediaStream();
      webrtcRef.current={pc,ws,stream};
      let connected=false;
+     // v2.22.1: funnel every failure (ICE failed, signalling closed, go2rtc
+     // error, watchdog) through one idempotent fail(). It tries the next
+     // stream name and, once the list is exhausted, always lands on MJPEG —
+     // before this fix only the LAST name was allowed to fall back, so any
+     // error on the primary "zmk-{id}" name left a black card forever.
+     let webrtcFailed=false;
+     const fail=()=>{
+      if(cancelled||webrtcFailed||connected)return;
+      webrtcFailed=true;
+      if(webrtcRetryRef.current)clearTimeout(webrtcRetryRef.current);
+      try{ws.close()}catch{}
+      try{pc.close()}catch{}
+      const rest=names.slice(nameIdx+1);
+      webrtcRetryRef.current=window.setTimeout(()=>{
+       if(cancelled)return;
+       if(rest.length)void beginWebRTC(rest);
+       else beginMjpeg();
+      },500) as unknown as number;
+     };
      const attachTracks=()=>{
       if(cancelled||!videoRef.current)return;
       // Build the stream from the transceivers: ontrack alone is not fired by
@@ -717,10 +801,10 @@ if(msg.type==='mse'&&msg.value){
       const st=pc.connectionState;
       if(st==='connected')attachTracks();
       else if(st==='failed'||st==='disconnected'||st==='closed'){
-       try{ws.close()}catch{}
-       if(!connected&&streamName===names[names.length-1]){
-        webrtcRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginMjpeg()},600) as unknown as number;
-       }
+       if(connected){
+        // media dropped after being live: ws.onclose re-establishes WebRTC
+        try{ws.close()}catch{}
+       }else fail();
       }
      };
      ws.onopen=()=>{
@@ -744,8 +828,7 @@ if(msg.type==='mse'&&msg.value){
        }
        else if(msg.type==='error'){
         // go2rtc could not build the track (no stream / no codec match).
-        try{ws.close()}catch{}
-        if(!connected&&streamName===names[names.length-1])beginMjpeg();
+        fail();
        }
       }catch{}
      };
@@ -753,17 +836,15 @@ if(msg.type==='mse'&&msg.value){
      ws.onclose=()=>{
       if(cancelled)return;
       webrtcRef.current.ws=null;
-      if(!connected&&streamName===names[names.length-1]){
-       webrtcRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginMjpeg()},900) as unknown as number;
-      }else if(connected&&!cancelled){
+      if(connected){
        // live then dropped -> re-establish WebRTC
        webrtcRetryRef.current=window.setTimeout(()=>{if(!cancelled){cleanupWebRTC();void beginWebRTC(names);setRetry(r=>r+1)}},1200) as unknown as number;
-      }
+      }else fail();
      };
-     // watchdog: if no track after 7s, fall back to MJPEG so the card is never empty
+     // watchdog: if no track after 7s, cascade to the next name / MJPEG
      webrtcRetryRef.current=window.setTimeout(()=>{
       if(cancelled)return;
-      if(!connected){try{ws.close()}catch{};if(streamName===names[names.length-1])beginMjpeg()}
+      if(!connected)fail();
      },7000) as unknown as number;
      started=true;
      break;
@@ -916,9 +997,15 @@ if(msg.type==='mse'&&msg.value){
  }
  if(transport==='webrtc'||transport==='mse'||transport==='hls'){
   return <div className="camera-feed-wrap">
+    {stillSrc&&<img className="camera-snapshot" src={stillSrc} alt="" aria-hidden="true" style={{position:'absolute',inset:0,zIndex:0}}/>}
     <video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline preload="auto" aria-label={`Поток камеры ${id}`} style={{position:'relative',zIndex:1,background: live?'transparent':'transparent', opacity: live?1:0.01}} />
     {renderOverlay()}<em className="frame-age" style={{zIndex:2}}>{label}</em>
   </div>;
+ }
+ if(stillSrc){
+  // No live transport has frames (yet), but the worker does decode the
+  // camera: show its latest snapshot instead of an empty dark card.
+  return <div className="camera-feed-wrap"><img className="camera-snapshot" src={stillSrc} alt={`Последний кадр ${id}`}/>{renderOverlay()}<em className="frame-age">нет живого потока · показан последний кадр</em></div>;
  }
  return <div className="feed-empty">{telemetryStale?<><WifiOff size={20}/><span>Нет телеметрии</span><small>worker давно не подтверждал поток</small></>:status==='connecting'?<><RefreshCw className="spin" size={20}/><span>Подключение</span><small>{lastError||'go2rtc открывает RTSP'}</small></>:status==='offline'||status==='error'||status==='unknown'?<><WifiOff size={20}/><span>Поток не подключён</span><small>{lastError||'RTSP недоступен'}</small></>:<><Camera size={20}/><span>Кадр не получен</span><small>{lastError||'Нет снимка от worker'}</small></>}</div>;
 }

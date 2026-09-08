@@ -51,9 +51,11 @@ def test_analyst_summary_counts_reviews_and_work_time(monkeypatch):
         assert anna["accepted"] == 2
         assert anna["rejected"] == 1
         assert anna["total"] == 3
-        # Время работы — промежуток между первой и последней проверкой за период.
-        assert anna["work_seconds"] >= 0
-        assert anna["first_at"] and anna["last_at"] and anna["first_at"] == anna["last_at"]
+        # Время работы — сумма промежутков между соседними проверками. Все три
+        # проверки сделаны одним пакетом, поэтому окно работы крошечное; точное
+        # равенство first_at == last_at гоняло тест по таймингу секунд.
+        assert anna["work_seconds"] >= 0 and anna["work_seconds"] <= 5
+        assert anna["first_at"] and anna["last_at"] and anna["first_at"] <= anna["last_at"]
         assert body["totals"]["accepted"] >= 2 and body["totals"]["rejected"] >= 1
         assert body["totals"]["active_analysts"] >= 1
 
