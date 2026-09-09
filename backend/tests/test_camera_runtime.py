@@ -301,3 +301,158 @@ def test_event_review_columns_migrate_legacy_rows(tmp_path, monkeypatch):
     con.close()
     assert {"review_status", "reviewed_at"} <= columns
     assert migrated[0] == "accepted" and migrated[1] == "" and migrated[2] == "old review"
+
+
+def test_preview_quality_source_is_passthrough_for_source_quality():
+    """"source" quality must never spawn an ffmpeg transcode.
+
+    Passthrough is the default and the cheapest, lowest-latency path; building
+    a variant for it would burn CPU per camera for no visual gain.
+    """
+    assert main._preview_quality_source("zmk-cam01", "source", "source", "motion") is None
+
+
+def test_preview_quality_source_scales_and_limits_frame_rate():
+    """The Vesktop resolution/FPS ladder maps onto go2rtc ffmpeg params."""
+    source = main._preview_quality_source("zmk-cam01", "720", "30", "motion")
+    assert source is not None
+    # Input is the already-open native stream, so the camera is still dialled once.
+    assert source.startswith("ffmpeg:zmk-cam01#")
+    assert "video=zmk_motion" in source
+    # 16:9 width derived from the requested height, like Vesktop does.
+    assert "width=1280" in source
+    assert "height=720" in source
+    assert "raw=-r 30" in source
+    # The "detail" hint selects the clarity-oriented encoder template.
+    detail = main._preview_quality_source("zmk-cam01", "1080", "source", "detail")
+    assert detail is not None and "video=zmk_detail" in detail
+    # FPS-only limiting must still work without any scaling.
+    fps_only = main._preview_quality_source("zmk-cam01", "source", "15", "motion")
+    assert fps_only is not None and "width=" not in fps_only and "raw=-r 15" in fps_only
+
+
+def test_go2rtc_sync_registers_quality_variant_without_touching_native_stream(tmp_path, monkeypatch):
+    """The scaled preview is an EXTRA stream, never a replacement.
+
+    The inference worker keeps pulling `zmk-{id}` at full resolution; only the
+    browser card subscribes to `zmk-{id}-q`.
+    """
+    monkeypatch.setattr(main, "GO2RTC_API_URL", "http://go2rtc:1984/rtc")
+    monkeypatch.setattr(main, "GO2RTC_ENABLED", True)
+    monkeypatch.setattr(main, "GO2RTC_WEBRTC_VP8", False)
+    monkeypatch.setattr(main, "SEED_TEST_DATA", False)
+    db = tmp_path / "quality.db"
+    monkeypatch.setattr(main, "DB_PATH", db)
+    main.init_db()
+    con = main.sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,preview_mode,preview_resolution,preview_fps,preview_content_hint)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "cam03", "Quality Cam", "Test", "", "rtsp://user:pass@camera/stream", 30,
+            "online", 25, 80, 1, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
+            "auto", "720", "30", "motion",
+        ),
+    )
+    con.commit()
+    con.close()
+
+    fake = _FakeClient()
+    monkeypatch.setattr(main.httpx, "Client", lambda **kwargs: fake)
+
+    assert main.sync_go2rtc_cameras()["ok"] is True
+    by_name = {}
+    for req in fake.puts:
+        for key, value in req["params"]:
+            if key == "name":
+                current = value
+                by_name.setdefault(current, [])
+        srcs = [v for k, v in req["params"] if k == "src"]
+        names = [v for k, v in req["params"] if k == "name"]
+        by_name[names[0]] = srcs
+
+    # Native stream stays an untouched direct RTSP pull for the analytics worker.
+    assert by_name["zmk-cam03"] == [main._go2rtc_source_url("rtsp://user:pass@camera/stream")]
+    # The browser variant is scaled off that same feed (single camera connection).
+    assert by_name["zmk-cam03-q"] == ["ffmpeg:zmk-cam03#video=zmk_motion#width=1280#height=720#raw=-r 30"]
+
+
+def test_go2rtc_sync_keeps_quality_variants_out_of_the_cleanup_sweep(tmp_path, monkeypatch):
+    """A freshly written `zmk-{id}-q` must not be deleted by the same sync.
+
+    The cleanup pass removes app-owned streams that are no longer desired. The
+    quality variants start with the "zmk-" prefix, so forgetting to exclude
+    them would delete the preview stream right after creating it — a black card
+    on every reload.
+    """
+    monkeypatch.setattr(main, "GO2RTC_API_URL", "http://go2rtc:1984/rtc")
+    monkeypatch.setattr(main, "GO2RTC_ENABLED", True)
+    monkeypatch.setattr(main, "GO2RTC_WEBRTC_VP8", False)
+    monkeypatch.setattr(main, "SEED_TEST_DATA", False)
+    db = tmp_path / "cleanup.db"
+    monkeypatch.setattr(main, "DB_PATH", db)
+    main.init_db()
+    con = main.sqlite3.connect(db)
+    con.execute(
+        "INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,preview_mode,preview_resolution,preview_fps,preview_content_hint)"
+        " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            "cam04", "Cleanup Cam", "Test", "", "rtsp://user:pass@camera/stream", 30,
+            "online", 25, 80, 1, "2026-01-01T00:00:00Z", "2026-01-01T00:00:00Z",
+            "auto", "1080", "source", "detail",
+        ),
+    )
+    con.commit()
+    con.close()
+
+    class _ExistingClient(_FakeClient):
+        def __init__(self):
+            super().__init__()
+            self.deleted = []
+
+        def get(self, url, **kwargs):
+            # go2rtc already knows about the variant plus a stale camera stream.
+            return _FakeResp({"zmk-cam04": {}, "zmk-cam04-q": {}, "zmk-gone": {}})
+
+        def delete(self, url, params=None, **kwargs):
+            self.deleted.extend(v for k, v in (params or []) if k == "name")
+            return _FakeResp({})
+
+    fake = _ExistingClient()
+    monkeypatch.setattr(main.httpx, "Client", lambda **kwargs: fake)
+
+    assert main.sync_go2rtc_cameras()["ok"] is True
+    assert "zmk-cam04-q" not in fake.deleted
+    assert "zmk-gone" in fake.deleted
+
+
+def test_camera_update_preserves_quality_when_client_omits_it(monkeypatch):
+    """Older clients that only send preview_mode must not reset the ladder."""
+    monkeypatch.setattr(main, "SEED_TEST_DATA", False)
+    with TestClient(main.app) as client:
+        camera_id = _camera(client)
+        saved = client.put(
+            f"/api/cameras/{camera_id}",
+            json={
+                "name": "Runtime Cam", "zone": "Test", "fps_limit": 8, "enabled": True,
+                "preview_resolution": "720", "preview_fps": "30", "preview_content_hint": "detail",
+            },
+        )
+        assert saved.status_code == 200, saved.text
+        assert saved.json()["preview_resolution"] == "720"
+
+        # A legacy payload without any quality fields keeps the stored values.
+        legacy = client.put(
+            f"/api/cameras/{camera_id}",
+            json={"name": "Runtime Cam", "zone": "Test", "fps_limit": 8, "enabled": True},
+        )
+        assert legacy.status_code == 200, legacy.text
+        body = legacy.json()
+        assert body["preview_resolution"] == "720"
+        assert body["preview_fps"] == "30"
+        assert body["preview_content_hint"] == "detail"
+        assert body["quality_changed"] is False
+
+        camera = client.get(f"/api/cameras/{camera_id}").json()
+        assert camera["preview_resolution"] == "720"
+        assert camera["preview_content_hint"] == "detail"

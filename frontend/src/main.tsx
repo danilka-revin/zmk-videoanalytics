@@ -1,7 +1,7 @@
 import React,{useEffect,useRef,useState} from 'react';import{createRoot}from'react-dom/client';import{Activity,AlertTriangle,BarChart3,Bell,Camera,Check,ChevronRight,Clock3,Cpu,Download,Upload,Copy,Eye,LayoutDashboard,Radio,RefreshCw,Search,Settings,ShieldAlert,SlidersHorizontal,Video,Wifi,WifiOff,X,Users,BrainCircuit,Play,FileWarning,Database,Palette,Sun,Moon,Monitor,PanelLeft,KeyRound,Stethoscope,Plus,Trash2,Pencil,Save,Sparkles,GlassWater,Droplets,ScrollText,ShieldCheck,UserRound,LogOut}from'lucide-react';import'./styles.css';import'./camera-logs.css';import'./project-logs.css';
 
 type Dashboard={cameras:{total:number,online:number},events24h:number,critical_unacked:number,avg_fps:number,avg_latency_ms:number,gpu_load:number|null,gpu_temp:number|null,messenger_provider:string,active_model:string|null,precision:number|null,recall:number|null,log_errors_24h?:number,trend:{label:string,value:number}[]};
-type Cam={id:string,name:string,zone:string,description:string,status:string,fps:number,latency_ms:number,fps_limit:number,enabled:number,configured:number,preview_mode?:'auto'|'mse'|'webrtc'|'mjpeg',snapshot_age_seconds?:number|null,telemetry_stale?:boolean,last_error?:string,restart_requested_at?:string};
+type Cam={id:string,name:string,zone:string,description:string,status:string,fps:number,latency_ms:number,fps_limit:number,enabled:number,configured:number,preview_mode?:'auto'|'mse'|'webrtc'|'mjpeg',preview_resolution?:'source'|'480'|'720'|'1080'|'1440'|'2160',preview_fps?:'source'|'15'|'30'|'60',preview_content_hint?:'motion'|'detail',snapshot_age_seconds?:number|null,telemetry_stale?:boolean,last_error?:string,restart_requested_at?:string};
 type Event={id:number,timestamp:string,camera_id:string,camera_name:string,zone:string,type:string,severity:string,confidence:number,person_id:string,acknowledged:number,has_frame?:boolean,note?:string,review_status?:'pending'|'accepted'|'rejected',reviewed_at?:string};
 type ModelRuntime={status:'inactive'|'worker_offline'|'waiting'|'none'|'loading'|'ready'|'error',detail:string,worker_connected:boolean,worker_updated_at?:string,worker_age_seconds?:number|null};
 type Model={name:string,format:string,status:string,precision:number|null,recall:number|null,trained_at:string,source:string,active:boolean,slot_roles?:string[],pipeline_active?:boolean,trial_eligible?:boolean,trial_mode?:boolean,test_mode?:boolean,runtime?:ModelRuntime};
@@ -275,10 +275,33 @@ function applyVideoCodecPreference(transceiver:RTCRtpTransceiver,withoutH264:boo
   if(preferred.length&&typeof (transceiver as any).setCodecPreferences==='function')(transceiver as any).setCodecPreferences(preferred);
  }catch{}
 }
+// ---------------------------------------------------------------------------
+// Vesktop-style stream quality ladder.
+//
+// Ported from Vencord/Vesktop's ScreenSharePicker: the operator picks a
+// resolution and frame rate from a fixed ladder plus a "content hint" that
+// says whether smoothness or clarity matters. Vesktop applies this to an
+// outgoing screen share via track constraints; here the browser is a pure
+// receiver, so the same choice is applied server-side — the API registers a
+// scaled `zmk-{id}-q` variant in go2rtc and the card subscribes to that
+// instead of the full-resolution feed. A wall of 1080p tiles no longer forces
+// every browser to decode native-resolution H.264.
+const PREVIEW_RESOLUTIONS=['source','480','720','1080','1440','2160'] as const;
+const PREVIEW_FPS_OPTIONS=['source','15','30','60'] as const;
+type PreviewResolution=typeof PREVIEW_RESOLUTIONS[number];
+type PreviewFps=typeof PREVIEW_FPS_OPTIONS[number];
+type PreviewContentHint='motion'|'detail';
+// Stream names to try, most specific first. The scaled variant is only
+// attempted when the operator actually asked for one; the native feed always
+// stays in the list so a missing/failed transcode still shows a picture
+// instead of a black card.
+const previewStreamNames=(id:string,resolution:PreviewResolution,fps:PreviewFps):string[]=>
+ (resolution!=='source'||fps!=='source')?[`zmk-${id}-q`,`zmk-${id}`,id]:[`zmk-${id}`,id];
+
 // Exported for the transport-cascade integration test (jsdom): the camera
 // card must always reach a visible picture even when WebRTC/MSE signalling
 // fails, exactly like Firefox on Ubuntu without go2rtc.
-export function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto'}:{id:string;status:string;age:number|null;telemetryStale?:boolean;lastError?:string;previewMode?:'auto'|'mse'|'webrtc'|'mjpeg'}){
+export function CameraPreview({id,status,age,telemetryStale,lastError,previewMode='auto',previewResolution='source',previewFps='source',previewContentHint='motion'}:{id:string;status:string;age:number|null;telemetryStale?:boolean;lastError?:string;previewMode?:'auto'|'mse'|'webrtc'|'mjpeg';previewResolution?:PreviewResolution;previewFps?:PreviewFps;previewContentHint?:PreviewContentHint}){
  const videoRef=useRef<HTMLVideoElement|null>(null);
  const hlsRef=useRef<any>(null);
  const mseRef=useRef<{ws:WebSocket|null,ms:MediaSource|null,sb:SourceBuffer|null,queue:Uint8Array[],closing:boolean,objectUrl:string}>({ws:null,ms:null,sb:null,queue:[],closing:false,objectUrl:''});
@@ -308,6 +331,89 @@ export function CameraPreview({id,status,age,telemetryStale,lastError,previewMod
  const liveRef=useRef<boolean>(false);
  const lastAttemptRef=useRef<number>(0);
  useEffect(()=>{liveRef.current=live},[live]);
+ // v2.23.0 — the real cause of "system detects violations but the card is black".
+ //
+ // Every transport used to declare itself live as soon as *signalling* worked:
+ // WebRTC on the first track, MSE on the first appended segment. But a track
+ // that carries a codec the browser cannot decode, or an fMP4 segment the
+ // decoder rejects, produces exactly that — a connected transport that never
+ // paints a pixel. `live` was true, the health check saw `liveRef.current` and
+ // deliberately refused to re-arm, so the card stayed black forever with
+ // detection boxes floating on top.
+ //
+ // Vesktop hits the same class of problem from the sending side and solves it
+ // by trusting the decoder rather than the negotiation. Here we do the
+ // receiver-side equivalent: a transport is only "live" once the <video>
+ // element reports decoded frames (readyState + advancing currentTime, plus
+ // getVideoPlaybackQuality when available). Until then the transport is merely
+ // "connected" and the cascade is still allowed to move on.
+ const paintedRef=useRef<boolean>(false);
+ const paintCheckRef=useRef<number>(0);
+ // Consecutive "connected but decoded nothing" outcomes in the current cascade.
+ // Walking the whole stream-name list costs seconds per name, and a silent
+ // transport almost always means the browser cannot decode what go2rtc sends —
+ // trying the same codec under another name rarely helps. After the second
+ // failure we jump straight to MJPEG, which is decoded by <img> and always works.
+ const paintFailuresRef=useRef<number>(0);
+ // Deadline for showing *something*, regardless of how far the cascade got.
+ const firstPictureRef=useRef<number>(0);
+ // Generation counter for transport attempts. Tearing a transport down fires
+ // its own ws.onclose / watchdogs, whose handlers would then "recover" the
+ // transport we just deliberately abandoned — the card flapped
+ // MSE -> MJPEG -> MSE and could end up back on a stream that shows nothing.
+ // Every begin* call takes the next epoch; stale callbacks compare against it
+ // and return instead of resurrecting themselves.
+ const epochRef=useRef<number>(0);
+ const [painted,setPainted]=useState(false);
+ // Called by a transport when signalling succeeded. Confirms real decoding
+ // before the card is treated as live; otherwise invokes onDead so the cascade
+ // advances to the next stream name / transport.
+ const verifyPaintingRef=useRef<(onDead:()=>void)=>void>(()=>{});
+ useEffect(()=>{
+  verifyPaintingRef.current=(onDead:()=>void)=>{
+   // Only one verification may be in flight. Without this, each cascade step
+   // left its interval running: several timers raced, every one of them fired
+   // onDead, and the transports advanced multiple steps at once.
+   if(paintCheckRef.current){clearInterval(paintCheckRef.current);paintCheckRef.current=0}
+   const started=Date.now();
+   let lastTime=-1;
+   const timer=window.setInterval(()=>{
+    const v=videoRef.current;
+    if(!v){clearInterval(timer);return}
+    let frames=0;
+    try{frames=(v as any).getVideoPlaybackQuality?.().totalVideoFrames??0}catch{}
+    const moving=v.currentTime>0&&v.currentTime!==lastTime;
+    lastTime=v.currentTime;
+    // HAVE_CURRENT_DATA or better + either advancing time or decoded frames.
+    const decoding=v.readyState>=2&&(moving||frames>0);
+    if(decoding){
+     clearInterval(timer);
+     if(paintCheckRef.current===timer)paintCheckRef.current=0;
+     paintFailuresRef.current=0;
+     // A real picture arrived in time: the emergency MJPEG deadline must not
+     // fire afterwards and tear down a perfectly good video transport.
+     if(firstPictureRef.current){clearTimeout(firstPictureRef.current);firstPictureRef.current=0}
+     paintedRef.current=true;setPainted(true);
+     return;
+    }
+    // Two-tier deadline, so a hopeless transport is abandoned quickly while a
+    // merely slow one still gets a fair chance:
+    //  - readyState 0 means not a single byte reached the decoder. Nothing is
+    //    buffering, so waiting longer cannot help — give up after 2.5s.
+    //  - anything above that is decoding-in-progress; allow the full 6s before
+    //    declaring the picture dead.
+    const elapsed=Date.now()-started;
+    if((elapsed>2500&&v.readyState===0)||elapsed>6000){
+     clearInterval(timer);
+     if(paintCheckRef.current===timer)paintCheckRef.current=0;
+     if(paintedRef.current)return;
+     paintFailuresRef.current+=1;
+     onDead();
+    }
+   },300) as unknown as number;
+   paintCheckRef.current=timer;
+  };
+ },[]);
  // v2.22.1 safety net: while no live transport has painted a frame yet, show
  // the last worker snapshot (same source as the «Снимок» button) instead of a
  // dark card. The worker publishes a snapshot every few seconds whenever it
@@ -315,7 +421,10 @@ export function CameraPreview({id,status,age,telemetryStale,lastError,previewMod
  // possible: worst case the card shows a few-seconds-old still image.
  const [stillSrc,setStillSrc]=useState('');
  useEffect(()=>{
-  if(live){setStillSrc(old=>{if(old)try{URL.revokeObjectURL(old)}catch{};return ''});return}
+  // Keyed on `painted`, not `live`: a transport that connected but decodes
+  // nothing must KEEP the snapshot underlay, otherwise dropping it is exactly
+  // what turns the card black while detection keeps running.
+  if(live&&painted){setStillSrc(old=>{if(old)try{URL.revokeObjectURL(old)}catch{};return ''});return}
   let stop=false;
   const controller=new AbortController();
   const pull=async()=>{
@@ -331,12 +440,12 @@ export function CameraPreview({id,status,age,telemetryStale,lastError,previewMod
    }catch{}
   };
   void pull();
-  const timer=window.setInterval(()=>{if(!stop&&!liveRef.current)void pull()},4000) as unknown as number;
+  const timer=window.setInterval(()=>{if(!stop&&!(liveRef.current&&paintedRef.current))void pull()},4000) as unknown as number;
   return()=>{
    stop=true;controller.abort();clearInterval(timer);
    setStillSrc(old=>{if(old)try{URL.revokeObjectURL(old)}catch{};return ''});
   };
- },[id,apiKey,live]);
+ },[id,apiKey,live,painted]);
 
  useEffect(()=>{
   let cancelled=false;
@@ -407,6 +516,7 @@ export function CameraPreview({id,status,age,telemetryStale,lastError,previewMod
   };
   const beginHls=async(srcNames?:string[])=>{
    if(cancelled)return;
+   const epoch=++epochRef.current;
    // HLS carries H.264 only: a browser without that decoder (Firefox on
    // Ubuntu/Wayland) can never paint a frame, so go straight to MJPEG.
    if(!canDecodeH264()){beginMjpeg();return}
@@ -414,7 +524,7 @@ export function CameraPreview({id,status,age,telemetryStale,lastError,previewMod
    if(hlsRetryRef.current)clearTimeout(hlsRetryRef.current);
    if(mseRetryRef.current)clearTimeout(mseRetryRef.current);
    setTransport('hls');
-   const names=srcNames||[`zmk-${id}`,id];
+   const names=srcNames||previewStreamNames(id,previewResolution,previewFps);
    for(let nameIdx=0;nameIdx<names.length;nameIdx++){
     const streamName=names[nameIdx];
     if(cancelled)break;
@@ -461,6 +571,8 @@ export function CameraPreview({id,status,age,telemetryStale,lastError,previewMod
        if(cancelled)return;
        void videoRef.current?.play().catch(()=>{});
        setLive(true);setTransport('hls');
+       // A parsed manifest is not a decoded frame — verify before trusting it.
+       verifyPaintingRef.current(()=>{if(!cancelled&&!paintedRef.current)fail(true)});
       });
       hls.on(Hls.Events.ERROR,(_:any,data:any)=>{
        if(cancelled)return;
@@ -487,11 +599,12 @@ export function CameraPreview({id,status,age,telemetryStale,lastError,previewMod
   };
   const beginMSE=async(srcNames?:string[])=>{
    if(cancelled)return;
+   const epoch=++epochRef.current;
    cleanupHLS();
    if(mseRetryRef.current)clearTimeout(mseRetryRef.current);
    if(hlsRetryRef.current)clearTimeout(hlsRetryRef.current);
    setTransport('mse');
-   const names=srcNames||[`zmk-${id}`,id];
+   const names=srcNames||previewStreamNames(id,previewResolution,previewFps);
    // Prefer MediaSource
    if(!window.MediaSource||typeof MediaSource.isTypeSupported!=='function'){
     if(canDecodeH264())void beginHls(names);else beginMjpeg();return;
@@ -522,7 +635,7 @@ export function CameraPreview({id,status,age,telemetryStale,lastError,previewMod
      // card with detection boxes over it ("detects, but no picture").
      let mseFailed=false;
      const fail=()=>{
-      if(cancelled||mseFailed||liveFlag)return;
+      if(cancelled||mseFailed||liveFlag||epoch!==epochRef.current)return;
       mseFailed=true;
       if(mseRetryRef.current)clearTimeout(mseRetryRef.current);
       try{ws.close()}catch{}
@@ -533,6 +646,27 @@ export function CameraPreview({id,status,age,telemetryStale,lastError,previewMod
        else if(canDecodeH264())void beginHls(names);
        else beginMjpeg();
       },500) as unknown as number;
+     };
+     // Declaring MSE live means "segments are flowing". Confirm the decoder
+     // actually paints them before trusting that (see paintedRef notes above):
+     // an fMP4 segment the browser cannot decode used to leave a black card
+     // that the health check refused to retry.
+     const markMseLive=()=>{
+      if(liveFlag||epoch!==epochRef.current)return;
+      setLive(true);liveFlag=true;setTransport('mse');
+      verifyPaintingRef.current(()=>{
+       if(cancelled||paintedRef.current)return;
+       setLive(false);liveFlag=false;
+       try{ws.close()}catch{}
+       const rest=names.slice(nameIdx+1);
+       // Same reasoning as WebRTC: segments that never decode will not decode
+       // under a different stream name either. HLS carries the very same H.264,
+       // so after repeated silence go straight to MJPEG.
+       if(paintFailuresRef.current>=2)beginMjpeg();
+       else if(rest.length)void beginMSE(rest);
+       else if(canDecodeH264())void beginHls(names);
+       else beginMjpeg();
+      });
      };
      const mimeCandidates=():string[]=>[mseMime,
       'video/mp4; codecs="avc1.64001f"',
@@ -637,7 +771,7 @@ if(msg.type==='mse'&&msg.value){
              if(sb){
               pushSegment(bin);
               if(videoRef.current)void videoRef.current.play().catch(()=>{});
-              setLive(true);liveFlag=true;setTransport('mse');
+              markMseLive();
              }else{
               queue.push(bin);
              }
@@ -646,11 +780,11 @@ if(msg.type==='mse'&&msg.value){
           }else{
            pushSegment(bin);
            if(videoRef.current)void videoRef.current.play().catch(()=>{});
-           setLive(true);liveFlag=true;setTransport('mse');
+           markMseLive();
           }
          }else{
           pushSegment(bin);
-          if(!liveFlag){setLive(true);liveFlag=true;setTransport('mse');if(videoRef.current)void videoRef.current.play().catch(()=>{})}
+          if(!liveFlag){if(videoRef.current)void videoRef.current.play().catch(()=>{});markMseLive()}
          }
         }else if(msg.type==='error'){
          // go2rtc says no stream
@@ -675,12 +809,12 @@ if(msg.type==='mse'&&msg.value){
           }
           pushSegment(seg);
           if(videoRef.current)void videoRef.current.play().catch(()=>{});
-          setLive(true);liveFlag=true;setTransport('mse');
+          markMseLive();
          });
         }
        }else{
         pushSegment(seg);
-        if(!liveFlag){setLive(true);liveFlag=true;setTransport('mse');if(videoRef.current)void videoRef.current.play().catch(()=>{})}
+        if(!liveFlag){if(videoRef.current)void videoRef.current.play().catch(()=>{});markMseLive()}
        }
       }
      };
@@ -690,6 +824,8 @@ if(msg.type==='mse'&&msg.value){
      ws.onclose=()=>{
       if(cancelled)return;
       mseRef.current.ws=null;
+      // This transport was superseded (or torn down on purpose): let it die.
+      if(epoch!==epochRef.current)return;
       if(liveFlag){
        // reconnect if was live
        mseRetryRef.current=window.setTimeout(()=>{if(!cancelled){cleanupMSE();void beginMSE(names);setRetry(r=>r+1)}},1200) as unknown as number;
@@ -697,7 +833,7 @@ if(msg.type==='mse'&&msg.value){
      };
      // watchdog: if not live in 4s, advance to the next name / HLS / MJPEG
      mseRetryRef.current=window.setTimeout(()=>{
-      if(cancelled)return;
+      if(cancelled||epoch!==epochRef.current)return;
       if(!liveFlag)fail();
      },4000) as unknown as number;
      started=true;
@@ -716,6 +852,7 @@ if(msg.type==='mse'&&msg.value){
   // (NAT/firewall, no port 8555) we fall back to MJPEG which goes through nginx.
   const beginWebRTC=async(srcNames?:string[])=>{
    if(cancelled)return;
+   const epoch=++epochRef.current;
    cleanupMSE();cleanupHLS();cleanupWebRTC();
    if(webrtcRetryRef.current)clearTimeout(webrtcRetryRef.current);
    if(mseRetryRef.current)clearTimeout(mseRetryRef.current);
@@ -724,7 +861,7 @@ if(msg.type==='mse'&&msg.value){
    if(mjpegTimeoutRef.current)clearTimeout(mjpegTimeoutRef.current);
    if(mjpegAbortRef.current){try{mjpegAbortRef.current.abort()}catch{};mjpegAbortRef.current=null}
    setTransport('webrtc');
-   const names=srcNames||[`zmk-${id}`,id];
+   const names=srcNames||previewStreamNames(id,previewResolution,previewFps);
    let started=false;
    for(let nameIdx=0;nameIdx<names.length;nameIdx++){
     const streamName=names[nameIdx];
@@ -756,7 +893,7 @@ if(msg.type==='mse'&&msg.value){
      // error on the primary "zmk-{id}" name left a black card forever.
      let webrtcFailed=false;
      const fail=()=>{
-      if(cancelled||webrtcFailed||connected)return;
+      if(cancelled||webrtcFailed||connected||epoch!==epochRef.current)return;
       webrtcFailed=true;
       if(webrtcRetryRef.current)clearTimeout(webrtcRetryRef.current);
       try{ws.close()}catch{}
@@ -786,7 +923,23 @@ if(msg.type==='mse'&&msg.value){
        videoRef.current.muted=true;
        void videoRef.current.play().catch(()=>{});
       }catch{}
-      if(!connected){connected=true;setLive(true);setTransport('webrtc')}
+      if(!connected){
+       connected=true;setLive(true);setTransport('webrtc');
+       // A track is not a picture. Confirm the browser really decodes it —
+       // otherwise fall through to the next name / MJPEG instead of leaving a
+       // black card that claims to be live.
+       verifyPaintingRef.current(()=>{
+        if(cancelled||paintedRef.current)return;
+        setLive(false);
+        const rest=names.slice(nameIdx+1);
+        try{ws.close()}catch{}
+        try{pc.close()}catch{}
+        // Repeated silence means the codec itself is undecodable here, not that
+        // this particular stream name is bad: stop burning seconds and take the
+        // transport that cannot fail.
+        if(rest.length&&paintFailuresRef.current<2)void beginWebRTC(rest);else beginMjpeg();
+       });
+      }
      };
      pc.onicecandidate=(ev)=>{
       if(ev.candidate&&ws.readyState===WebSocket.OPEN){try{ws.send(JSON.stringify({type:'webrtc/candidate',value:ev.candidate.candidate}))}catch{}}
@@ -836,6 +989,7 @@ if(msg.type==='mse'&&msg.value){
      ws.onclose=()=>{
       if(cancelled)return;
       webrtcRef.current.ws=null;
+      if(epoch!==epochRef.current)return;
       if(connected){
        // live then dropped -> re-establish WebRTC
        webrtcRetryRef.current=window.setTimeout(()=>{if(!cancelled){cleanupWebRTC();void beginWebRTC(names);setRetry(r=>r+1)}},1200) as unknown as number;
@@ -843,7 +997,7 @@ if(msg.type==='mse'&&msg.value){
      };
      // watchdog: if no track after 7s, cascade to the next name / MJPEG
      webrtcRetryRef.current=window.setTimeout(()=>{
-      if(cancelled)return;
+      if(cancelled||epoch!==epochRef.current)return;
       if(!connected)fail();
      },7000) as unknown as number;
      started=true;
@@ -857,6 +1011,7 @@ if(msg.type==='mse'&&msg.value){
   // it works under both auth modes without exposing a key in a query string.
   const beginMjpeg=()=>{
    if(cancelled)return;
+   const epoch=++epochRef.current;
    cleanupMSE();cleanupHLS();cleanupWebRTC();
    if(mseRetryRef.current)clearTimeout(mseRetryRef.current);
    if(hlsRetryRef.current)clearTimeout(hlsRetryRef.current);
@@ -882,7 +1037,7 @@ if(msg.type==='mse'&&msg.value){
     return{start:soi,end:-1};
    };
    const emit=(jpeg:Uint8Array)=>{
-    if(cancelled||!jpeg.length)return;
+    if(cancelled||!jpeg.length||epoch!==epochRef.current)return;
     const now=Date.now();
     if(now-lastEmit<40)return; // cap at 25 FPS; avoid excessive blob-URL churn
     lastEmit=now;
@@ -891,7 +1046,16 @@ if(msg.type==='mse'&&msg.value){
      if(old&&old!==url&&old.startsWith('blob:'))try{URL.revokeObjectURL(old)}catch{};
      return url;
     });
-    if(!gotFrame){gotFrame=true;setLive(true);if(mjpegTimeoutRef.current){clearTimeout(mjpegTimeoutRef.current);mjpegTimeoutRef.current=0}}
+    if(!gotFrame){
+     gotFrame=true;setLive(true);
+     // MJPEG frames are decoded by the <img> element itself, so a delivered
+     // frame IS a painted frame — no <video> verification needed (and the
+     // health check must not treat this working transport as unpainted).
+     if(paintCheckRef.current){clearInterval(paintCheckRef.current);paintCheckRef.current=0}
+     paintedRef.current=true;setPainted(true);
+     if(firstPictureRef.current){clearTimeout(firstPictureRef.current);firstPictureRef.current=0}
+     if(mjpegTimeoutRef.current){clearTimeout(mjpegTimeoutRef.current);mjpegTimeoutRef.current=0}
+    }
    };
    const pump=async()=>{
     let buf=new Uint8Array(0);let from=0;
@@ -899,7 +1063,7 @@ if(msg.type==='mse'&&msg.value){
      const r=await fetch(`/api/cameras/${id}/mjpeg?t=${Date.now()}`,{headers,signal:abort.signal,cache:'no-store'});
      if(!r.ok||!r.body)throw new Error(`HTTP ${r.status}`);
      const reader=r.body.getReader();
-     while(!cancelled){
+     while(!cancelled&&epoch===epochRef.current){
       const {done,value}=await reader.read();
       if(done)break;
       const chunk=value;
@@ -914,20 +1078,18 @@ if(msg.type==='mse'&&msg.value){
       if(buf.length>2_000_000){buf=buf.subarray(buf.length-500_000);from=0}
      }
     }catch{}
-    if(cancelled)return;
-    if(!gotFrame){
-     mjpegRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginMjpeg()},900) as unknown as number;
-     return;
-    }
-    mjpegRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginMjpeg()},900) as unknown as number;
+    // A superseded MJPEG pump must not restart itself, or it would drag the
+    // card back to MJPEG after another transport already took over.
+    if(cancelled||epoch!==epochRef.current)return;
+    mjpegRetryRef.current=window.setTimeout(()=>{if(!cancelled&&epoch===epochRef.current)beginMjpeg()},900) as unknown as number;
    };
    void pump();
    // If the endpoint is temporarily empty, retry the selected MJPEG stream
    // instead of replacing it with a still image.
    mjpegTimeoutRef.current=window.setTimeout(()=>{
-    if(cancelled||gotFrame)return;
+    if(cancelled||gotFrame||epoch!==epochRef.current)return;
     try{abort.abort()}catch{}
-    mjpegRetryRef.current=window.setTimeout(()=>{if(!cancelled)beginMjpeg()},900) as unknown as number;
+    mjpegRetryRef.current=window.setTimeout(()=>{if(!cancelled&&epoch===epochRef.current)beginMjpeg()},900) as unknown as number;
    },2500) as unknown as number;
   };
 
@@ -944,6 +1106,25 @@ if(msg.type==='mse'&&msg.value){
    // Remember when a transport was last armed: the health check below must not
    // tear down a stream that is still negotiating (or already showing frames).
    lastAttemptRef.current=Date.now();
+   // A new attempt has not painted anything yet.
+   if(paintCheckRef.current){clearInterval(paintCheckRef.current);paintCheckRef.current=0}
+   paintedRef.current=false;setPainted(false);paintFailuresRef.current=0;
+   // Hard ceiling on "time to first picture" for the case where signalling
+   // itself goes nowhere: no WebSocket, no answer, no track, nothing to verify.
+   // Walking every stream name and transport can otherwise leave the card dark
+   // for well over ten seconds — longer now that a scaled quality variant adds
+   // another name to try.
+   //
+   // It deliberately does NOT fire once a transport reported itself live: that
+   // case (connected but decoding nothing) belongs to the paint verifier, which
+   // has its own deadlines. Firing here too would race a slow-but-healthy
+   // handshake and downgrade a video stream that was about to work.
+   if(firstPictureRef.current)clearTimeout(firstPictureRef.current);
+   firstPictureRef.current=window.setTimeout(()=>{
+    if(cancelled||paintedRef.current||liveRef.current)return;
+    if(previewMode==='mjpeg'||previewMode==='webrtc')return; // operator forced a transport
+    beginMjpeg();
+   },5000) as unknown as number;
    if(previewMode==='mjpeg'){beginMjpeg();return}
    if(previewMode==='webrtc'){void beginWebRTC();return}
    if(!canDecodeH264()){
@@ -966,7 +1147,11 @@ if(msg.type==='mse'&&msg.value){
   // preview reload endlessly.
   retryRef.current=window.setInterval(()=>{
    if(cancelled)return;
-   if(liveRef.current)return;
+   // Only a transport that has actually PAINTED counts as healthy. A stream
+   // that reports itself live but never decodes a frame (wrong codec, broken
+   // variant) must still be retried — that combination is exactly what left
+   // operators with a black card under working detection boxes.
+   if(liveRef.current&&paintedRef.current)return;
    if(!['online','connecting','recovering'].includes(status))return;
    if(Date.now()-lastAttemptRef.current<15000)return;
    startPreferred();
@@ -984,13 +1169,22 @@ if(msg.type==='mse'&&msg.value){
    if(mjpegRetryRef.current)clearTimeout(mjpegRetryRef.current);
    if(mjpegTimeoutRef.current)clearTimeout(mjpegTimeoutRef.current);
    if(mjpegAbortRef.current){try{mjpegAbortRef.current.abort()}catch{}}
+   if(paintCheckRef.current)clearInterval(paintCheckRef.current);
+   if(firstPictureRef.current)clearTimeout(firstPictureRef.current);
    cleanupMSE();cleanupHLS();cleanupWebRTC();
   };
  },[id,status,apiKey,previewMode]);
 
  const renderOverlay=()=>{if(!boxes.length||!shape)return null;const [h,w]=shape;if(!h||!w)return null;return <div className="camera-overlay">{boxes.map((b,i)=>{const [x1,y1,x2,y2]=b.bbox;const left=(x1/w)*100;const top=(y1/h)*100;const width=Math.max(1,((x2-x1)/w)*100);const height=Math.max(1,((y2-y1)/h)*100);const isNoHelmet=b.semantic==='no_helmet';const isNoVest=b.semantic==='no_vest';const isPerson=b.semantic==='person';const color=isNoHelmet||isNoVest?'#ff3b30':isPerson?'#007aff':b.semantic==='helmet'?'#34c759':b.semantic==='vest'?'#af52de':'#ff9500';const label=b.semantic==='no_helmet'?'NO HELMET':b.semantic==='no_vest'?'NO VEST':b.semantic.toUpperCase();return <div key={i} className="camera-box" style={{left:`${left}%`,top:`${top}%`,width:`${width}%`,height:`${height}%`,borderColor:color}}><span style={{background:color}}>{label} {Math.round(b.confidence*100)}%</span></div>})}</div>};
 
- const label=transport==='webrtc'?(live?(canDecodeH264()?'● WebRTC':'● WebRTC VP8'):'● WebRTC…'):transport==='mse'?(live?'● MSE H264 25-60 FPS':'● MSE connecting…'):transport==='hls'?(live?'● HLS H264':'● HLS…'):transport==='mjpeg'?(live?'● MJPEG':'● MJPEG…'):`retry ${retry}`;
+ // The badge distinguishes "connected" from "actually decoding": a transport
+ // that negotiated but paints nothing now says so instead of claiming to be
+ // live, which is what made the black-card bug invisible in the UI.
+ const qualityTag=(previewResolution!=='source'||previewFps!=='source')
+  ?` · ${previewResolution==='source'?'ориг.':`${previewResolution}p`}${previewFps==='source'?'':` ${previewFps}fps`}`
+  :'';
+ const liveShown=live&&painted;
+ const label=transport==='webrtc'?(liveShown?`● WebRTC${canDecodeH264()?'':' VP8'}${qualityTag}`:live?'● WebRTC · жду кадр…':'● WebRTC…'):transport==='mse'?(liveShown?`● MSE H264${qualityTag}`:live?'● MSE · жду кадр…':'● MSE connecting…'):transport==='hls'?(liveShown?`● HLS H264${qualityTag}`:live?'● HLS · жду кадр…':'● HLS…'):transport==='mjpeg'?(liveShown?`● MJPEG${qualityTag}`:'● MJPEG…'):`retry ${retry}`;
 
  if(transport==='mjpeg'&&mjpegSrc){
   return <div className="camera-feed-wrap"><img className="camera-snapshot" src={mjpegSrc} alt={`Поток ${id}`} />{renderOverlay()}<em className="frame-age">{live?label:'● MJPEG…'}</em></div>;
@@ -998,7 +1192,7 @@ if(msg.type==='mse'&&msg.value){
  if(transport==='webrtc'||transport==='mse'||transport==='hls'){
   return <div className="camera-feed-wrap">
     {stillSrc&&<img className="camera-snapshot" src={stillSrc} alt="" aria-hidden="true" style={{position:'absolute',inset:0,zIndex:0}}/>}
-    <video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline preload="auto" aria-label={`Поток камеры ${id}`} style={{position:'relative',zIndex:1,background: live?'transparent':'transparent', opacity: live?1:0.01}} />
+    <video className="camera-snapshot" ref={videoRef} autoPlay muted playsInline preload="auto" aria-label={`Поток камеры ${id}`} style={{position:'relative',zIndex:1,background:'transparent', opacity: liveShown?1:0.01}} />
     {renderOverlay()}<em className="frame-age" style={{zIndex:2}}>{label}</em>
   </div>;
  }
@@ -1013,15 +1207,15 @@ if(msg.type==='mse'&&msg.value){
 
 function CameraLogs({camera,close}:{camera:Cam,close:()=>void}){const[items,setItems]=useState<any[]>([]);const[busy,setBusy]=useState(true);const[error,setError]=useState('');useEffect(()=>{api<any[]>(`/api/logs?camera_id=${encodeURIComponent(camera.id)}&limit=200`).then(setItems).catch(e=>setError(e instanceof Error?e.message:'Не удалось загрузить лог')).finally(()=>setBusy(false))},[camera.id]);const copy=()=>{void navigator.clipboard?.writeText(items.map(x=>`${x.timestamp} [${x.level}] ${x.service}: ${x.message}`).join('\\n'))};return <div className="modal-backdrop"><div className="camera-modal camera-logs-modal"><div className="modal-head"><div><h2>Лог камеры</h2><p>{camera.name} · {camera.id}</p></div><button onClick={close}><X/></button></div><div className="camera-log-toolbar"><span>{items.length} записей</span><button type="button" disabled={!items.length} onClick={copy}><Copy size={14}/> Скопировать</button></div>{busy?<div className="event-evidence-loading">Загружаю лог…</div>:error?<div className="capture-error">{error}</div>:<div className="camera-log-list">{items.length?items.map((item,index)=><div key={index}><time>{new Date(item.timestamp).toLocaleString('ru-RU')}</time><b className={String(item.level).toLowerCase()}>{item.level}</b><span>{item.message}</span></div>):<div className="empty">Записей по этой камере пока нет.</div>}</div>}<div className="modal-actions"><button className="primary" onClick={close}>Закрыть</button></div></div></div>}
 function Cameras({cams,changed,searchIntent,clearSearchIntent}:{cams:Cam[],changed:()=>Promise<void>,searchIntent?:SearchItem|null,clearSearchIntent?:()=>void}){
- const[editing,setEditing]=useState<Cam|null|undefined>(undefined);const[selectionMode,setSelectionMode]=useState(false);const[selectedIds,setSelectedIds]=useState<string[]>([]);const[bulkConfirm,setBulkConfirm]=useState(false);const[form,setForm]=useState({name:'',zone:'',description:'',rtsp_url:'',fps_limit:'30',enabled:true,preview_mode:'auto' as 'auto'|'mse'|'webrtc'|'mjpeg'});const[busy,setBusy]=useState(false);const[logCamera,setLogCamera]=useState<Cam|null>(null);const[diag,setDiag]=useState<Record<string,string>>({});const[editRtsp,setEditRtsp]=useState(false);const[cardSize,setCardSize]=useState<'compact'|'normal'|'large'>(()=>{const saved=localStorage.getItem('zmk_camera_card_size');return saved==='compact'||saved==='large'?'compact'===saved?'compact':'large':'normal'});
+ const[editing,setEditing]=useState<Cam|null|undefined>(undefined);const[selectionMode,setSelectionMode]=useState(false);const[selectedIds,setSelectedIds]=useState<string[]>([]);const[bulkConfirm,setBulkConfirm]=useState(false);const[form,setForm]=useState({name:'',zone:'',description:'',rtsp_url:'',fps_limit:'30',enabled:true,preview_mode:'auto' as 'auto'|'mse'|'webrtc'|'mjpeg',preview_resolution:'source' as PreviewResolution,preview_fps:'source' as PreviewFps,preview_content_hint:'motion' as PreviewContentHint});const[busy,setBusy]=useState(false);const[logCamera,setLogCamera]=useState<Cam|null>(null);const[diag,setDiag]=useState<Record<string,string>>({});const[editRtsp,setEditRtsp]=useState(false);const[cardSize,setCardSize]=useState<'compact'|'normal'|'large'>(()=>{const saved=localStorage.getItem('zmk_camera_card_size');return saved==='compact'||saved==='large'?'compact'===saved?'compact':'large':'normal'});
  const focusedCameraId=searchIntent?.kind==='camera'?String(searchIntent.id):'';useEffect(()=>{if(!focusedCameraId)return;const timer=window.setTimeout(()=>document.getElementById(`camera-card-${focusedCameraId}`)?.scrollIntoView({behavior:'smooth',block:'center'}),90);return()=>clearTimeout(timer)},[focusedCameraId]);
- const chooseCardSize=(size:'compact'|'normal'|'large')=>{setCardSize(size);localStorage.setItem('zmk_camera_card_size',size)};const open=(cam?:Cam)=>{setEditing(cam||null);setEditRtsp(false);setForm(cam?{name:cam.name,zone:cam.zone,description:cam.description,rtsp_url:'',fps_limit:String(cam.fps_limit),enabled:!!cam.enabled,preview_mode:cam.preview_mode==='webrtc'?'webrtc':cam.preview_mode==='mjpeg'?'mjpeg':'auto'}:{name:'',zone:'',description:'',rtsp_url:'',fps_limit:'30',enabled:true,preview_mode:'auto'})};
+ const chooseCardSize=(size:'compact'|'normal'|'large')=>{setCardSize(size);localStorage.setItem('zmk_camera_card_size',size)};const open=(cam?:Cam)=>{setEditing(cam||null);setEditRtsp(false);setForm(cam?{name:cam.name,zone:cam.zone,description:cam.description,rtsp_url:'',fps_limit:String(cam.fps_limit),enabled:!!cam.enabled,preview_mode:cam.preview_mode==='webrtc'?'webrtc':cam.preview_mode==='mjpeg'?'mjpeg':cam.preview_mode==='mse'?'mse':'auto',preview_resolution:cam.preview_resolution||'source',preview_fps:cam.preview_fps||'source',preview_content_hint:cam.preview_content_hint||'motion'}:{name:'',zone:'',description:'',rtsp_url:'',fps_limit:'30',enabled:true,preview_mode:'auto',preview_resolution:'source',preview_fps:'source',preview_content_hint:'motion'})};
  const save=async()=>{setBusy(true);try{const payload={...form,fps_limit:+form.fps_limit,rtsp_url:editing&&!editRtsp?null:form.rtsp_url};await api(editing?`/api/cameras/${editing.id}`:'/api/cameras',{method:editing?'PUT':'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)});setEditing(undefined);await changed()}catch(e){alert(e instanceof Error?e.message:'Ошибка сохранения камеры')}finally{setBusy(false)}};
  const diagnose=async(cam:Cam)=>{setDiag(v=>({...v,[cam.id]:'Проверка TCP-доступности…'}));try{const r=await api<any>(`/api/cameras/${cam.id}/diagnostics`,{method:'POST'});setDiag(v=>({...v,[cam.id]:r.reachable?`TCP доступен · ${r.latency_ms} мс${r.last_error?` · worker: ${r.last_error}`:''}`:r.last_error||r.message}))}catch(e){setDiag(v=>({...v,[cam.id]:'Ошибка диагностики'}))}};
  const restart=async(cam:Cam)=>{setDiag(v=>({...v,[cam.id]:'Запрошен перезапуск RTSP…'}));try{await api(`/api/cameras/${cam.id}/restart`,{method:'POST'});await changed();setDiag(v=>({...v,[cam.id]:'Worker переподключит камеру в течение нескольких секунд'}))}catch(e){setDiag(v=>({...v,[cam.id]:e instanceof Error?e.message:'Не удалось перезапустить камеру'}))}};const fullscreen=(cam:Cam)=>{const target=document.getElementById(`camera-feed-${cam.id}`);if(!target)return;if(document.fullscreenElement===target){void document.exitFullscreen()}else{void target.requestFullscreen().catch(()=>{})}};
  const toggleSelected=(id:string)=>setSelectedIds(ids=>ids.includes(id)?ids.filter(x=>x!==id):[...ids,id]);const stopSelecting=()=>{setSelectionMode(false);setSelectedIds([]);setBulkConfirm(false)};const deleteSelected=async()=>{if(!selectedIds.length)return;setBusy(true);try{for(const id of selectedIds)await api(`/api/cameras/${id}?delete_events=true`,{method:'DELETE'});stopSelecting();await changed()}catch(e){alert(e instanceof Error?e.message:'Не удалось удалить выбранные камеры')}finally{setBusy(false)}};
  const onlineCount=cams.filter(camera=>camera.status==='online').length;const attentionCount=cams.filter(camera=>camera.status!=='online').length;const configuredCount=cams.filter(camera=>!!camera.configured).length;const averageFps=cams.length?cams.reduce((sum,camera)=>sum+Number(camera.fps||0),0)/cams.length:0;
- return <div className="camera-workspace"><section className={`camera-hero ${selectionMode?'is-selecting':''}`}><div className="camera-hero-copy"><span className="camera-kicker"><Radio size={14}/> LIVE CONTROL</span><h2>{selectionMode?'Выбор камер':'Камеры площадки'}</h2><p>{selectionMode?'Отметьте карточки, которые нужно удалить. Связанные события и сохранённые кадры будут удалены только после подтверждения.':'Прямые RTSP-потоки с реальной частотой кадров, оперативными проверками и быстрым полноэкранным просмотром.'}</p><div className="camera-hero-stats"><span className="online"><i/><b>{onlineCount}</b><small>онлайн</small></span><span><b>{attentionCount}</b><small>требуют внимания</small></span><span><b>{averageFps.toFixed(1)}</b><small>ср. фактический FPS</small></span><span><b>{configuredCount}/{cams.length}</b><small>RTSP настроено</small></span></div></div><div className="camera-hero-actions">{!selectionMode?<><button type="button" className="camera-secondary" onClick={()=>setSelectionMode(true)}><Trash2 size={15}/> Выбрать для удаления</button><button type="button" className="camera-primary" onClick={()=>open()}><Plus size={16}/> Добавить камеру</button></>:<div className="bulk-delete-tools"><b>Выбрано: {selectedIds.length}</b><button type="button" onClick={stopSelecting}>Отмена</button><button type="button" className="danger" disabled={!selectedIds.length} onClick={()=>setBulkConfirm(true)}><Trash2 size={15}/> Удалить выбранные</button></div>}</div></section>{focusedCameraId&&<div className="search-context camera-search-context"><Search size={16}/><span><b>Открыт результат поиска</b><small>Камера выделена в рабочей области.</small></span><button type="button" onClick={clearSearchIntent}>Показать все</button></div>}<div className="camera-collection-toolbar"><div><span>ВИДЕОПОТОКИ</span><b>{cams.length?`${cams.length} ${cams.length===1?'камера':'камеры'} в рабочей области`:'Добавьте первый поток'}</b><small>{selectionMode?'Нажмите на карточку, чтобы отметить её.':'Нажмите на видео, чтобы открыть полноэкранный просмотр.'}</small></div>{!selectionMode&&<div className="camera-size-control" role="group" aria-label="Размер карточек">{(['compact','normal','large'] as const).map(size=><button type="button" key={size} className={cardSize===size?'active':''} aria-pressed={cardSize===size} onClick={()=>chooseCardSize(size)}>{size==='compact'?'Компакт':size==='normal'?'Обычные':'Крупные'}</button>)}</div>}</div>{cams.length===0?<div className="panel empty-state"><Camera size={36}/><h3>Камер пока нет</h3><p>Добавьте RTSP-камеру или заполните RTSP_CAM_01 в .env.</p><button onClick={()=>open()}><Plus size={15}/> Добавить</button></div>:<div className={`cards size-${cardSize} ${selectionMode?'selecting':''}`}>{cams.map(c=>{const selected=selectedIds.includes(c.id);return <article id={`camera-card-${c.id}`} className={`camera-card status-${c.status} ${selectionMode?'selection-mode':''} ${selected?'selected':''} ${focusedCameraId===c.id?'search-hit':''}`} key={c.id} onClick={selectionMode?()=>toggleSelected(c.id):undefined}><div id={`camera-feed-${c.id}`} className={`feed ${!selectionMode?'clickable':'selection-feed'}`} role="button" tabIndex={0} aria-pressed={selectionMode?selected:undefined} aria-label={selectionMode?`Выбрать камеру ${c.name}`:`Открыть камеру ${c.name} на весь экран`} onClick={e=>{if(selectionMode){e.stopPropagation();toggleSelected(c.id)}else fullscreen(c)}} onKeyDown={e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();selectionMode?toggleSelected(c.id):fullscreen(c)}}}><CameraPreview id={c.id} status={c.status} age={c.snapshot_age_seconds??null} telemetryStale={c.telemetry_stale} lastError={c.last_error} previewMode={c.preview_mode||'auto'}/>{selectionMode&&<span className={`selection-check ${selected?'checked':''}`}>{selected&&<Check size={16}/>}</span>}<span className={`live ${c.status}`}>{c.status==='online'?'● LIVE':(STATUS_LABEL[c.status]||c.status).toUpperCase()}</span><b>{c.id}</b></div><div className="camera-info"><div><h3>{c.name}</h3><p>{c.zone}</p></div><span className={`tag ${c.status}`}>{STATUS_LABEL[c.status]||c.status}</span></div><p className="camera-desc">{c.description||'Описание не задано'}</p><div className="camera-stats"><span title="Фактически декодированные кадры в секунду / заданный лимит">FPS <b>{c.fps.toFixed(1)}</b><small>/ лимит {c.fps_limit}</small></span><span>Latency <b>{c.latency_ms||'—'} ms</b></span><span>RTSP <b>{c.configured?'SET':'—'}</b></span></div>{c.last_error&&<div className="diag-result"><b>Причина:</b> {c.last_error}</div>}{diag[c.id]&&<div className="diag-result">{diag[c.id]}</div>}{!selectionMode?<div className="camera-actions"><button onClick={()=>diagnose(c)}><Stethoscope size={14}/> Проверить</button><button onClick={()=>setLogCamera(c)}><FileWarning size={14}/> Лог</button><button onClick={()=>restart(c)} disabled={!c.enabled}><RefreshCw size={14}/> Перезапустить</button><button onClick={()=>downloadFile(`/api/cameras/${c.id}/snapshot`,`zmk-${c.id}-${Date.now()}.jpg`).catch(()=>alert('Кадр пока не получен'))}><Download size={14}/> Снимок</button><button onClick={()=>open(c)}><Pencil size={14}/> Изменить</button></div>:<div className="selection-card-note">{selected?'Выбрана для удаления':'Нажмите на карточку для выбора'}</div>}</article>})}</div>}{logCamera&&<CameraLogs camera={logCamera} close={()=>setLogCamera(null)}/>} {bulkConfirm&&<div className="modal-backdrop"><div className="camera-modal"><div className="modal-head"><h2>Удалить выбранные камеры?</h2><button onClick={()=>setBulkConfirm(false)}><X/></button></div><p>Будет удалено камер: {selectedIds.length}. Связанные события, snapshots и live frames также будут удалены. Это действие нельзя отменить.</p><div className="modal-actions"><button disabled={busy} onClick={()=>setBulkConfirm(false)}>Отмена</button><button className="danger" disabled={busy} onClick={deleteSelected}><Trash2 size={15}/> {busy?'Удаляю…':'Удалить выбранные'}</button></div></div></div>}{editing!==undefined&&<div className="modal-backdrop"><div className="camera-modal"><div className="modal-head"><h2>{editing?'Изменить камеру':'Новая камера'}</h2><button onClick={()=>setEditing(undefined)}><X/></button></div><label>Название<input value={form.name} onChange={e=>setForm({...form,name:e.target.value})} placeholder="Камера цеха №1"/></label><label>Зона<input value={form.zone} onChange={e=>setForm({...form,zone:e.target.value})} placeholder="Цех №1"/></label><label>Описание<textarea value={form.description} onChange={e=>setForm({...form,description:e.target.value})} placeholder="Что контролирует камера"/></label>{editing?<label className="rtsp-edit">RTSP URL<em className="rtsp-note"><Check size={13}/> Ссылка уже настроена и скрыта. Чтобы заменить её — включите «Ввести новую ссылку» ниже.</em></label>:<label>RTSP URL<input type="password" value={form.rtsp_url} onChange={e=>setForm({...form,rtsp_url:e.target.value})} placeholder="rtsp://user:password@host/stream"/></label>}{editing&&!editRtsp&&<label className="check"><input type="checkbox" checked={false} onChange={e=>{setEditRtsp(e.target.checked);if(e.target.checked)setForm({...form,rtsp_url:''})}}/> Ввести новую ссылку</label>}{editing&&editRtsp&&<label>Новая RTSP URL<input type="password" value={form.rtsp_url} onChange={e=>setForm({...form,rtsp_url:e.target.value})} placeholder="rtsp://user:password@host/stream"/></label>}<label>Ограничение FPS <b className="fps-value">{form.fps_limit} FPS</b><input className="fps-slider" type="range" min="0.1" max="60" step="1" value={form.fps_limit} onChange={e=>setForm({...form,fps_limit:e.target.value})}/><small>До 60 FPS. Фактическое значение зависит от камеры, NVR, сети и декодера; AI не ограничивает live-превью.</small><div className="fps-presets">{[25,30,50,60].map(fps=><button type="button" key={fps} className={+form.fps_limit===fps?'active':''} onClick={()=>setForm({...form,fps_limit:String(fps)})}>{fps} FPS</button>)}</div></label><label className="check"><input type="checkbox" checked={form.enabled} onChange={e=>setForm({...form,enabled:e.target.checked})}/> Аналитика включена</label><label className="preview-mode"><span className="preview-mode-heading"><b>Режим предпросмотра</b><small>Как браузер показывает живое видео этой камеры. На RTSP-поток анализа не влияет.</small></span><div className="segmented" role="group" aria-label="Режим предпросмотра"><button type="button" className={form.preview_mode==='auto'?'active':''} aria-pressed={form.preview_mode==='auto'} onClick={()=>setForm({...form,preview_mode:'auto'})}>Авто</button><button type="button" className={form.preview_mode==='webrtc'?'active':''} aria-pressed={form.preview_mode==='webrtc'} onClick={()=>setForm({...form,preview_mode:'webrtc'})}>WebRTC · VP8</button><button type="button" className={form.preview_mode==='mse'?'active':''} aria-pressed={form.preview_mode==='mse'} onClick={()=>setForm({...form,preview_mode:'mse'})}>MSE · H.264</button><button type="button" className={form.preview_mode==='mjpeg'?'active':''} aria-pressed={form.preview_mode==='mjpeg'} onClick={()=>setForm({...form,preview_mode:'mjpeg'})}>MJPEG</button></div></label><div className="modal-actions"><button onClick={()=>setEditing(undefined)}>Отмена</button><button className="primary" disabled={busy||form.name.length<2} onClick={save}><Save size={15}/> Сохранить</button></div></div></div>}</div>
+ return <div className="camera-workspace"><section className={`camera-hero ${selectionMode?'is-selecting':''}`}><div className="camera-hero-copy"><span className="camera-kicker"><Radio size={14}/> LIVE CONTROL</span><h2>{selectionMode?'Выбор камер':'Камеры площадки'}</h2><p>{selectionMode?'Отметьте карточки, которые нужно удалить. Связанные события и сохранённые кадры будут удалены только после подтверждения.':'Прямые RTSP-потоки с реальной частотой кадров, оперативными проверками и быстрым полноэкранным просмотром.'}</p><div className="camera-hero-stats"><span className="online"><i/><b>{onlineCount}</b><small>онлайн</small></span><span><b>{attentionCount}</b><small>требуют внимания</small></span><span><b>{averageFps.toFixed(1)}</b><small>ср. фактический FPS</small></span><span><b>{configuredCount}/{cams.length}</b><small>RTSP настроено</small></span></div></div><div className="camera-hero-actions">{!selectionMode?<><button type="button" className="camera-secondary" onClick={()=>setSelectionMode(true)}><Trash2 size={15}/> Выбрать для удаления</button><button type="button" className="camera-primary" onClick={()=>open()}><Plus size={16}/> Добавить камеру</button></>:<div className="bulk-delete-tools"><b>Выбрано: {selectedIds.length}</b><button type="button" onClick={stopSelecting}>Отмена</button><button type="button" className="danger" disabled={!selectedIds.length} onClick={()=>setBulkConfirm(true)}><Trash2 size={15}/> Удалить выбранные</button></div>}</div></section>{focusedCameraId&&<div className="search-context camera-search-context"><Search size={16}/><span><b>Открыт результат поиска</b><small>Камера выделена в рабочей области.</small></span><button type="button" onClick={clearSearchIntent}>Показать все</button></div>}<div className="camera-collection-toolbar"><div><span>ВИДЕОПОТОКИ</span><b>{cams.length?`${cams.length} ${cams.length===1?'камера':'камеры'} в рабочей области`:'Добавьте первый поток'}</b><small>{selectionMode?'Нажмите на карточку, чтобы отметить её.':'Нажмите на видео, чтобы открыть полноэкранный просмотр.'}</small></div>{!selectionMode&&<div className="camera-size-control" role="group" aria-label="Размер карточек">{(['compact','normal','large'] as const).map(size=><button type="button" key={size} className={cardSize===size?'active':''} aria-pressed={cardSize===size} onClick={()=>chooseCardSize(size)}>{size==='compact'?'Компакт':size==='normal'?'Обычные':'Крупные'}</button>)}</div>}</div>{cams.length===0?<div className="panel empty-state"><Camera size={36}/><h3>Камер пока нет</h3><p>Добавьте RTSP-камеру или заполните RTSP_CAM_01 в .env.</p><button onClick={()=>open()}><Plus size={15}/> Добавить</button></div>:<div className={`cards size-${cardSize} ${selectionMode?'selecting':''}`}>{cams.map(c=>{const selected=selectedIds.includes(c.id);return <article id={`camera-card-${c.id}`} className={`camera-card status-${c.status} ${selectionMode?'selection-mode':''} ${selected?'selected':''} ${focusedCameraId===c.id?'search-hit':''}`} key={c.id} onClick={selectionMode?()=>toggleSelected(c.id):undefined}><div id={`camera-feed-${c.id}`} className={`feed ${!selectionMode?'clickable':'selection-feed'}`} role="button" tabIndex={0} aria-pressed={selectionMode?selected:undefined} aria-label={selectionMode?`Выбрать камеру ${c.name}`:`Открыть камеру ${c.name} на весь экран`} onClick={e=>{if(selectionMode){e.stopPropagation();toggleSelected(c.id)}else fullscreen(c)}} onKeyDown={e=>{if(e.key==='Enter'||e.key===' '){e.preventDefault();selectionMode?toggleSelected(c.id):fullscreen(c)}}}><CameraPreview id={c.id} status={c.status} age={c.snapshot_age_seconds??null} telemetryStale={c.telemetry_stale} lastError={c.last_error} previewMode={c.preview_mode||'auto'} previewResolution={c.preview_resolution||'source'} previewFps={c.preview_fps||'source'} previewContentHint={c.preview_content_hint||'motion'}/>{selectionMode&&<span className={`selection-check ${selected?'checked':''}`}>{selected&&<Check size={16}/>}</span>}<span className={`live ${c.status}`}>{c.status==='online'?'● LIVE':(STATUS_LABEL[c.status]||c.status).toUpperCase()}</span><b>{c.id}</b></div><div className="camera-info"><div><h3>{c.name}</h3><p>{c.zone}</p></div><span className={`tag ${c.status}`}>{STATUS_LABEL[c.status]||c.status}</span></div><p className="camera-desc">{c.description||'Описание не задано'}</p><div className="camera-stats"><span title="Фактически декодированные кадры в секунду / заданный лимит">FPS <b>{c.fps.toFixed(1)}</b><small>/ лимит {c.fps_limit}</small></span><span>Latency <b>{c.latency_ms||'—'} ms</b></span><span>RTSP <b>{c.configured?'SET':'—'}</b></span></div>{c.last_error&&<div className="diag-result"><b>Причина:</b> {c.last_error}</div>}{diag[c.id]&&<div className="diag-result">{diag[c.id]}</div>}{!selectionMode?<div className="camera-actions"><button onClick={()=>diagnose(c)}><Stethoscope size={14}/> Проверить</button><button onClick={()=>setLogCamera(c)}><FileWarning size={14}/> Лог</button><button onClick={()=>restart(c)} disabled={!c.enabled}><RefreshCw size={14}/> Перезапустить</button><button onClick={()=>downloadFile(`/api/cameras/${c.id}/snapshot`,`zmk-${c.id}-${Date.now()}.jpg`).catch(()=>alert('Кадр пока не получен'))}><Download size={14}/> Снимок</button><button onClick={()=>open(c)}><Pencil size={14}/> Изменить</button></div>:<div className="selection-card-note">{selected?'Выбрана для удаления':'Нажмите на карточку для выбора'}</div>}</article>})}</div>}{logCamera&&<CameraLogs camera={logCamera} close={()=>setLogCamera(null)}/>} {bulkConfirm&&<div className="modal-backdrop"><div className="camera-modal"><div className="modal-head"><h2>Удалить выбранные камеры?</h2><button onClick={()=>setBulkConfirm(false)}><X/></button></div><p>Будет удалено камер: {selectedIds.length}. Связанные события, snapshots и live frames также будут удалены. Это действие нельзя отменить.</p><div className="modal-actions"><button disabled={busy} onClick={()=>setBulkConfirm(false)}>Отмена</button><button className="danger" disabled={busy} onClick={deleteSelected}><Trash2 size={15}/> {busy?'Удаляю…':'Удалить выбранные'}</button></div></div></div>}{editing!==undefined&&<div className="modal-backdrop"><div className="camera-modal"><div className="modal-head"><h2>{editing?'Изменить камеру':'Новая камера'}</h2><button onClick={()=>setEditing(undefined)}><X/></button></div><label>Название<input value={form.name} onChange={e=>setForm({...form,name:e.target.value})} placeholder="Камера цеха №1"/></label><label>Зона<input value={form.zone} onChange={e=>setForm({...form,zone:e.target.value})} placeholder="Цех №1"/></label><label>Описание<textarea value={form.description} onChange={e=>setForm({...form,description:e.target.value})} placeholder="Что контролирует камера"/></label>{editing?<label className="rtsp-edit">RTSP URL<em className="rtsp-note"><Check size={13}/> Ссылка уже настроена и скрыта. Чтобы заменить её — включите «Ввести новую ссылку» ниже.</em></label>:<label>RTSP URL<input type="password" value={form.rtsp_url} onChange={e=>setForm({...form,rtsp_url:e.target.value})} placeholder="rtsp://user:password@host/stream"/></label>}{editing&&!editRtsp&&<label className="check"><input type="checkbox" checked={false} onChange={e=>{setEditRtsp(e.target.checked);if(e.target.checked)setForm({...form,rtsp_url:''})}}/> Ввести новую ссылку</label>}{editing&&editRtsp&&<label>Новая RTSP URL<input type="password" value={form.rtsp_url} onChange={e=>setForm({...form,rtsp_url:e.target.value})} placeholder="rtsp://user:password@host/stream"/></label>}<label>Ограничение FPS <b className="fps-value">{form.fps_limit} FPS</b><input className="fps-slider" type="range" min="0.1" max="60" step="1" value={form.fps_limit} onChange={e=>setForm({...form,fps_limit:e.target.value})}/><small>До 60 FPS. Фактическое значение зависит от камеры, NVR, сети и декодера; AI не ограничивает live-превью.</small><div className="fps-presets">{[25,30,50,60].map(fps=><button type="button" key={fps} className={+form.fps_limit===fps?'active':''} onClick={()=>setForm({...form,fps_limit:String(fps)})}>{fps} FPS</button>)}</div></label><label className="check"><input type="checkbox" checked={form.enabled} onChange={e=>setForm({...form,enabled:e.target.checked})}/> Аналитика включена</label><label className="preview-mode"><span className="preview-mode-heading"><b>Режим предпросмотра</b><small>Как браузер показывает живое видео этой камеры. На RTSP-поток анализа не влияет.</small></span><div className="segmented" role="group" aria-label="Режим предпросмотра"><button type="button" className={form.preview_mode==='auto'?'active':''} aria-pressed={form.preview_mode==='auto'} onClick={()=>setForm({...form,preview_mode:'auto'})}>Авто</button><button type="button" className={form.preview_mode==='webrtc'?'active':''} aria-pressed={form.preview_mode==='webrtc'} onClick={()=>setForm({...form,preview_mode:'webrtc'})}>WebRTC · VP8</button><button type="button" className={form.preview_mode==='mse'?'active':''} aria-pressed={form.preview_mode==='mse'} onClick={()=>setForm({...form,preview_mode:'mse'})}>MSE · H.264</button><button type="button" className={form.preview_mode==='mjpeg'?'active':''} aria-pressed={form.preview_mode==='mjpeg'} onClick={()=>setForm({...form,preview_mode:'mjpeg'})}>MJPEG</button></div></label><label className="preview-quality"><span className="preview-mode-heading"><b>Качество превью</b><small>Разрешение и частота кадров, которые получает браузер. Анализ всегда идёт по исходному потоку — эти настройки только разгружают карточку.</small></span><div className="preview-quality-row"><span className="preview-quality-caption">Разрешение</span><div className="segmented preview-quality-segmented" role="group" aria-label="Разрешение превью">{PREVIEW_RESOLUTIONS.map(value=><button type="button" key={value} className={form.preview_resolution===value?'active':''} aria-pressed={form.preview_resolution===value} onClick={()=>setForm({...form,preview_resolution:value})}>{value==='source'?'Оригинал':`${value}p`}</button>)}</div></div><div className="preview-quality-row"><span className="preview-quality-caption">Частота кадров</span><div className="segmented preview-quality-segmented" role="group" aria-label="Частота кадров превью">{PREVIEW_FPS_OPTIONS.map(value=><button type="button" key={value} className={form.preview_fps===value?'active':''} aria-pressed={form.preview_fps===value} onClick={()=>setForm({...form,preview_fps:value})}>{value==='source'?'Как в потоке':`${value} FPS`}</button>)}</div></div><div className="preview-quality-row"><span className="preview-quality-caption">Тип сцены</span><div className="segmented preview-quality-segmented" role="group" aria-label="Тип содержимого"><button type="button" className={form.preview_content_hint==='motion'?'active':''} aria-pressed={form.preview_content_hint==='motion'} onClick={()=>setForm({...form,preview_content_hint:'motion'})}>Плавность · движение</button><button type="button" className={form.preview_content_hint==='detail'?'active':''} aria-pressed={form.preview_content_hint==='detail'} onClick={()=>setForm({...form,preview_content_hint:'detail'})}>Чёткость · детали</button></div></div>{(form.preview_resolution!=='source'||form.preview_fps!=='source')?<small className="preview-quality-note">Будет создан отдельный масштабированный поток на сервере (перекодирование ffmpeg запускается только когда карточку смотрят). Исходный поток для аналитики не меняется.</small>:<small className="preview-quality-note">Оригинал — без перекодирования: минимальная задержка и нулевая нагрузка на сервер.</small>}</label><div className="modal-actions"><button onClick={()=>setEditing(undefined)}>Отмена</button><button className="primary" disabled={busy||form.name.length<2} onClick={save}><Save size={15}/> Сохранить</button></div></div></div>}</div>
 }
 function Events({events,ack,reject,ackMany,rejectMany,searchIntent,clearSearchIntent,readOnly=false}:{events:Event[],ack:(id:number)=>void,reject:(id:number,note:string)=>Promise<void>,ackMany:(ids:number[],note:string)=>Promise<number[]>,rejectMany:(ids:number[],note:string)=>Promise<number[]>,searchIntent?:SearchItem|null,clearSearchIntent?:()=>void,readOnly?:boolean}){type ReviewMode='accept'|'reject';const[filtersOpen,setFiltersOpen]=useState(false);const[severity,setSeverity]=useState('all');const[eventType,setEventType]=useState('all');const[reviewState,setReviewState]=useState('all');const[cameraId,setCameraId]=useState('all');const[term,setTerm]=useState('');const[evidence,setEvidence]=useState<Event|null>(null);const[selectionMode,setSelectionMode]=useState(false);const[selectedIds,setSelectedIds]=useState<number[]>([]);const[reviewDialog,setReviewDialog]=useState<{mode:ReviewMode,ids:number[]}|null>(null);const[reviewNote,setReviewNote]=useState('');const[reviewBusy,setReviewBusy]=useState(false);const[reviewError,setReviewError]=useState('');const[searchedEvent,setSearchedEvent]=useState<Event|null>(null);const focusedEventId=searchIntent?.kind==='event'?Number(searchIntent.id):0;useEffect(()=>{if(!focusedEventId){setSearchedEvent(null);return}if(events.some(event=>event.id===focusedEventId)){setSearchedEvent(null);return}let cancelled=false;api<Event>(`/api/events/by-id/${focusedEventId}`).then(event=>{if(!cancelled)setSearchedEvent(event)}).catch(()=>{if(!cancelled)setSearchedEvent(null)});return()=>{cancelled=true}},[focusedEventId,events]);const visibleEvents=focusedEventId&&searchedEvent?[searchedEvent]:events;const cameraOptions=Array.from(new Map(visibleEvents.map(event=>[event.camera_id,{id:event.camera_id,name:event.camera_name||event.camera_id,zone:event.zone||''}])).values());const statusOf=(event:Event)=>event.review_status||(event.acknowledged?'accepted':'pending');const shown=visibleEvents.filter(event=>{const haystack=`${labels[event.type]||event.type} ${event.camera_name||event.camera_id} ${event.zone||''} ${event.person_id||''} ${event.note||''}`.toLocaleLowerCase('ru-RU');return (severity==='all'||event.severity===severity)&&(eventType==='all'||event.type===eventType)&&(cameraId==='all'||event.camera_id===cameraId)&&(reviewState==='all'||statusOf(event)===reviewState)&&(!term.trim()||haystack.includes(term.trim().toLocaleLowerCase('ru-RU')))&&(!focusedEventId||event.id===focusedEventId)});const pendingTotal=events.filter(event=>statusOf(event)==='pending').length;const criticalTotal=events.filter(event=>event.severity==='critical').length;const reviewedTotal=events.filter(event=>statusOf(event)!=='pending').length;const evidenceTotal=events.filter(event=>!!event.has_frame).length;const reset=()=>{setSeverity('all');setEventType('all');setReviewState('all');setCameraId('all');setTerm('');clearSearchIntent?.()};const toggle=(id:number)=>setSelectedIds(ids=>ids.includes(id)?ids.filter(item=>item!==id):[...ids,id]);const stopSelecting=()=>{setSelectionMode(false);setSelectedIds([]);setReviewDialog(null);setReviewError('');setReviewNote('')};const selectVisible=()=>setSelectedIds(ids=>Array.from(new Set([...ids,...shown.map(event=>event.id)])));const reportParams=()=>{const params=new URLSearchParams();if(severity!=='all')params.set('severity',severity);if(eventType!=='all')params.set('event_type',eventType);if(cameraId!=='all')params.set('camera_id',cameraId);if(reviewState!=='all')params.set('review_status',reviewState);if(term.trim())params.set('q',term.trim());return params};const exportCsv=()=>{const params=reportParams();void downloadFile(`/api/reports/events.csv?${params.toString()}`,'zmk-zhurnal-narusheniy.csv').catch(()=>{})};const exportEvidenceZip=()=>{const params=reportParams();void downloadFile(`/api/reports/events.zip?${params.toString()}`,'zmk-zhurnal-narusheniy-s-kadrami.zip').catch(()=>{})};const openReview=(mode:ReviewMode,ids:number[],note='')=>{setReviewError('');setReviewNote(note);setReviewDialog({mode,ids})};const submitReview=async()=>{if(!reviewDialog?.ids.length)return;setReviewBusy(true);setReviewError('');try{if(reviewDialog.mode==='accept')await ackMany(reviewDialog.ids,reviewNote);else await rejectMany(reviewDialog.ids,reviewNote);if(selectionMode)stopSelecting();else{setReviewDialog(null);setReviewNote('')}}catch(e){setReviewError(e instanceof Error?e.message:'Не удалось сохранить решение')}finally{setReviewBusy(false)}};return <div className="events-workspace"><section className="events-hero"><div><span className="events-kicker"><ShieldAlert size={14}/> OPERATOR REVIEW</span><h2>Очередь событий</h2><p>{selectionMode?'Отметьте события и примените одно решение ко всей выборке.':readOnly?'Детекции, кадры-доказательства и статистика — режим только для просмотра.':'Проверяйте детекции, открывайте кадры-доказательства и оставляйте понятные решения для смены.'}</p></div><div className="events-hero-stats"><span className="attention"><b>{pendingTotal}</b><small>ждут решения</small></span><span className="critical"><b>{criticalTotal}</b><small>критических</small></span><span><b>{reviewedTotal}</b><small>проверено</small></span><span><b>{evidenceTotal}</b><small>с кадром</small></span></div></section>{focusedEventId>0&&<div className="search-context event-search-context"><Search size={16}/><span><b>Открыт результат поиска</b><small>Показано одно найденное событие. Сбросьте поиск, чтобы вернуться к очереди.</small></span><button type="button" onClick={clearSearchIntent}>Показать все</button></div>}<article className="panel full event-panel"><div className="toolbar"><div><h3>Журнал событий</h3><p>{selectionMode?`Выбрано: ${selectedIds.length}`:`Показано ${shown.length} из ${events.length} последних детекций`}</p></div>{!selectionMode?<div><button className={filtersOpen?'active-filter':''} onClick={()=>setFiltersOpen(v=>!v)}><SlidersHorizontal size={16}/> Фильтры</button>{!readOnly&&<button onClick={()=>setSelectionMode(true)}><Check size={16}/> Выбрать события</button>}<button onClick={exportEvidenceZip}><Camera size={16}/> Отчёт + кадры</button><button onClick={exportCsv}><Download size={16}/> Таблица CSV</button></div>:<div className="bulk-event-tools"><button onClick={selectVisible}><Check size={15}/> Выбрать видимые</button><button onClick={stopSelecting}>Отмена</button><button className="primary" disabled={!selectedIds.length} onClick={()=>openReview('accept',selectedIds)}><Check size={15}/> Принять</button><button className="danger" disabled={!selectedIds.length} onClick={()=>openReview('reject',selectedIds)}><X size={15}/> Не принять</button></div>}</div>{filtersOpen&&<div className="event-filters"><label><span>Поиск</span><input value={term} onChange={e=>setTerm(e.target.value)} placeholder="Камера, зона, объект"/></label><label><span>Камера</span><select value={cameraId} onChange={e=>setCameraId(e.target.value)}><option value="all">Все камеры</option>{cameraOptions.map(camera=><option value={camera.id} key={camera.id}>{camera.name}{camera.zone?` · ${camera.zone}`:''}</option>)}</select></label><label><span>Уровень</span><select value={severity} onChange={e=>setSeverity(e.target.value)}><option value="all">Все</option><option value="critical">Критический</option><option value="high">Высокий</option><option value="medium">Средний</option><option value="low">Низкий</option></select></label><label><span>Тип</span><select value={eventType} onChange={e=>setEventType(e.target.value)}><option value="all">Все типы</option>{Object.entries(labels).map(([id,label])=><option value={id} key={id}>{label}</option>)}</select></label><label><span>Решение</span><select value={reviewState} onChange={e=>setReviewState(e.target.value)}><option value="all">Все</option><option value="pending">Требуют внимания</option><option value="accepted">Приняты</option><option value="rejected">Не приняты</option></select></label><button onClick={reset}>Сбросить</button></div>}{shown.length?<EventsTable events={shown} ack={ack} onReject={readOnly?undefined:event=>openReview('reject',[event.id],event.note||'')} openEvidence={setEvidence} selectionMode={selectionMode} selectedIds={selectedIds} onToggle={toggle} highlightId={focusedEventId||undefined} readOnly={readOnly}/>:<div className="empty-state"><Search size={32}/><h3>События не найдены</h3><p>Измените фильтры или дождитесь новой детекции.</p><button onClick={reset}>Сбросить фильтры</button></div>}</article>{evidence&&<EventEvidenceModal event={evidence} close={()=>setEvidence(null)}/>} {reviewDialog&&<div className="modal-backdrop"><div className={`camera-modal bulk-ack-modal ${reviewDialog.mode==='reject'?'reject-review-modal':''}`}><div className="modal-head"><div><h2>{reviewDialog.mode==='reject'?'Не принять события':'Принять выбранные события'}</h2><p>{reviewDialog.ids.length} событий будут отмечены как {reviewDialog.mode==='reject'?'не принятые':'проверенные'}.</p></div><button disabled={reviewBusy} onClick={()=>setReviewDialog(null)} aria-label="Закрыть"><X/></button></div><label>Комментарий оператора<textarea value={reviewNote} onChange={e=>setReviewNote(e.target.value)} placeholder={reviewDialog.mode==='reject'?'Например: ложное срабатывание, ремонтная зона':'Например: проверено сменным мастером'}/><small>{reviewDialog.mode==='reject'?'Причина помогает улучшать датасет и отделять ложные срабатывания.':'Комментарий попадёт в журнал каждого нового принятого события.'}</small></label>{reviewError&&<div className="capture-error">{reviewError}</div>}<div className="modal-actions"><button disabled={reviewBusy} onClick={()=>setReviewDialog(null)}>Отмена</button><button className={reviewDialog.mode==='reject'?'danger':'primary'} disabled={reviewBusy} onClick={submitReview}>{reviewDialog.mode==='reject'?<><X size={15}/>{reviewBusy?'Сохраняю…':'Не принять'}</>:<><Check size={15}/>{reviewBusy?'Сохраняю…':'Принять выбранные'}</>}</button></div></div></div>}</div>}
 function ModelPipeline({models,onChanged}:{models:Model[],onChanged:()=>Promise<void>}){

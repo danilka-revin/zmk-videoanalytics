@@ -1,0 +1,33 @@
+# =============================================================================
+# ZMK Vision — Vesktop-style preview quality presets (overlay config)
+#
+# Why this is a SEPARATE file and not part of go2rtc.yaml
+# -----------------------------------------------------------------------------
+# /config/go2rtc.yaml is persisted state: the entrypoint copies the baseline
+# there on first start, and go2rtc rewrites that same file whenever a stream is
+# added through the API/WebUI. Existing installations therefore keep whatever
+# baseline shipped with the image they were first started with, and would never
+# learn about new ffmpeg templates added later.
+#
+# go2rtc merges every -config file key by key, with later files winning. This
+# overlay is loaded LAST (see the Dockerfile CMD), so these encoder templates
+# reach both fresh and long-running deployments, while /config keeps owning the
+# stream list and any operator edits.
+#
+# An unknown template name is passed to ffmpeg verbatim by go2rtc, so a missing
+# template here does not fall back gracefully — it kills the variant stream.
+# That is exactly the "black card" class of bug these presets must not cause.
+#
+# Used by the API as: ffmpeg:zmk-{id}#video=zmk_motion#width=..#height=..
+# The encoder only runs while a browser is actually watching the variant.
+# =============================================================================
+
+ffmpeg:
+  # "Prefer Smoothness" (Vesktop content hint = motion). Zero-latency, fast
+  # preset: moving people stay fluid on a busy camera wall. The bitrate ceiling
+  # mirrors Vesktop's 0.5-8 Mbit go-live range so many tiles stay affordable.
+  zmk_motion: "-c:v libx264 -g:v 50 -preset:v veryfast -tune:v zerolatency -profile:v main -level:v 4.1 -pix_fmt:v yuv420p -b:v 2500k -maxrate:v 4000k -bufsize:v 5000k"
+  # "Prefer Clarity" (Vesktop content hint = detail). Slower preset and a
+  # quality target instead of a fixed bitrate, for mostly-static scenes where
+  # small details (gauges, signage, PPE markings) must stay readable.
+  zmk_detail: "-c:v libx264 -g:v 50 -preset:v medium -profile:v high -level:v 4.1 -pix_fmt:v yuv420p -crf:v 21 -maxrate:v 8000k -bufsize:v 12000k"
