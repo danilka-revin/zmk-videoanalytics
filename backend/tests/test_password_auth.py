@@ -325,3 +325,18 @@ def test_switching_accounts_in_one_browser_closes_the_previous_session(monkeypat
         active = {session["id"] for session in browser.get("/api/auth/sessions").json()["sessions"]}
         assert admin_session not in active
         assert len(active) == 1
+
+
+def test_auth_status_without_password_auth_has_no_session_row(monkeypatch):
+    """С парольным входом по умолчанию отключённым сессии нет вообще — статус не должен падать."""
+    monkeypatch.setattr(main, "PASSWORD_AUTH_ENABLED", False)
+    monkeypatch.setattr(main, "API_KEY", "")
+    with TestClient(main.app) as client:
+        status = client.get("/api/auth/status")
+        assert status.status_code == 200, status.text
+        body = status.json()
+        assert body["enabled"] is False
+        assert body["authenticated"] is True
+        assert body["role"] == "admin"
+        # The console itself must stay reachable — this is what the panel asks first.
+        assert client.get("/api/dashboard").status_code == 200

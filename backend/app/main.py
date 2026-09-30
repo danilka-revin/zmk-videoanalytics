@@ -1208,7 +1208,9 @@ def auth_status(request: Request):
     email=_auth_setting("auth_email","") if PASSWORD_AUTH_ENABLED else ""
     login=_normalize_account_login(session.get("login") if session else DEFAULT_AUTH_LOGIN)
     identified=bool(session or api_key_ok or not PASSWORD_AUTH_ENABLED)
-    role=str(session.get("role") or "admin") if identified else ""
+    # With password auth disabled the console runs as the built-in admin and
+    # there is no session row at all — never dereference it blindly.
+    role=str((session or {}).get("role") or "admin") if identified else ""
     label=str(session.get("label") or login) if session else (AUTH_ROLES["admin"]["label"] if identified else login)
     # The picker shows every active account; the current one is marked so the
     # console can highlight it the way an account switcher does.
