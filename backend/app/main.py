@@ -44,7 +44,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Fallback version for a checkout started without any recorded build info.
-BASE_VERSION = "2.25.0"
+BASE_VERSION = "2.26.0"
 # Installed version + git commit, as recorded by the installers and the updater
 # service (see services/updater/core.py). Commit-based updates mean the version
 # string alone no longer identifies a build: every commit/merge of the tracked
@@ -872,6 +872,11 @@ def init_db():
     # камеры) хранятся в общем журнале, но помечены, чтобы их можно было
     # отличить от production-детекций.
     if "is_test" not in event_columns: con.execute("ALTER TABLE events ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0")
+    # Тестовое видео убирается после проверки, а его события остаются в журнале.
+    # Название и зона источника запоминаются прямо в событии, чтобы запись была
+    # понятна, когда карточки камеры уже нет (см. delete_camera).
+    if "camera_label" not in event_columns: con.execute("ALTER TABLE events ADD COLUMN camera_label TEXT NOT NULL DEFAULT ''")
+    if "zone_label" not in event_columns: con.execute("ALTER TABLE events ADD COLUMN zone_label TEXT NOT NULL DEFAULT ''")
     con.execute("UPDATE events SET review_status='pending' WHERE review_status NOT IN ('pending','accepted','rejected') OR review_status='' OR review_status IS NULL")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_events_external_id ON events(external_id) WHERE external_id IS NOT NULL")
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_timestamp ON events(timestamp DESC)")
@@ -1648,6 +1653,14 @@ class BulkAckIn(BaseModel):
     def unique_positive_ids(cls,value:list[int]):
         if any(item<1 for item in value): raise ValueError("event_ids must be positive")
         return list(dict.fromkeys(value))
+class EventDeleteIn(BaseModel):
+    """Удаление выбранных событий журнала (например, записей тестового видео)."""
+    event_ids:list[int]=Field(min_length=1,max_length=500)
+    @field_validator("event_ids")
+    @classmethod
+    def unique_positive_ids(cls,value:list[int]):
+        if any(item<1 for item in value): raise ValueError("event_ids must be positive")
+        return list(dict.fromkeys(value))
 class DetectionIn(BaseModel):
     camera_id:str=Field(min_length=1,max_length=64)
     model_name:str=Field(min_length=1,max_length=120)
@@ -2315,7 +2328,7 @@ def build_overview_analytics(hours:int,bucket:Literal["auto","hour","day"]="auto
         bucket_rows[key]={"start":key,"label":label(cursor),"total":0,"critical":0,"pending":0,"accepted":0,"rejected":0,"confidence_sum":0.0}
         cursor+=step
     con=db()
-    raw=con.execute("""SELECT e.timestamp,e.type,e.severity,e.confidence,e.review_status,e.acknowledged,e.camera_id,c.name camera_name,c.zone
+    raw=con.execute("""SELECT e.timestamp,e.type,e.severity,e.confidence,e.review_status,e.acknowledged,e.camera_id,COALESCE(c.name,NULLIF(e.camera_label,'')) camera_name,COALESCE(c.zone,NULLIF(e.zone_label,'')) zone
         FROM events e LEFT JOIN cameras c ON c.id=e.camera_id WHERE e.timestamp>=? ORDER BY e.timestamp""",(since.isoformat(),)).fetchall()
     con.close()
     types:dict[str,int]={}; cameras:dict[str,dict[str,Any]]={}; review={"pending":0,"accepted":0,"rejected":0}; severity={"critical":0,"high":0,"medium":0,"low":0}
@@ -2554,15 +2567,39 @@ def update_camera(camera_id:str,payload:CameraUpdate):
 
 @app.delete("/api/cameras/{camera_id}")
 def delete_camera(camera_id:str,delete_events:bool=False):
-    con=db(); camera=con.execute("SELECT name,source_type,video_path FROM cameras WHERE id=?",(camera_id,)).fetchone()
+    """Удалить камеру.
+
+    События RTSP-камеры блокируют удаление (409), пока оператор явно не
+    подтвердит `delete_events=true`. Временный источник «тест по видео» устроен
+    иначе: его события — результат проверки модели, поэтому при остановке теста
+    они остаются в журнале с отметкой ТЕСТ и удаляются отдельно (выбор событий
+    или очистка журнала). Явный `delete_events=true` по-прежнему удаляет их
+    вместе с источником.
+    """
+    con=db(); camera=con.execute("SELECT name,source_type,video_path,zone FROM cameras WHERE id=?",(camera_id,)).fetchone()
     if not camera: con.close(); raise HTTPException(404,"Камера не найдена")
     event_rows=con.execute("SELECT id FROM events WHERE camera_id=?",(camera_id,)).fetchall()
     event_ids=[int(row[0]) for row in event_rows]
     event_count=len(event_ids)
-    if event_count and not delete_events: con.close(); raise HTTPException(409,f"У камеры есть события: {event_count}. Подтвердите delete_events=true")
+    keep_events=bool(event_count and not delete_events and camera[1]=="video")
+    if event_count and not delete_events and not keep_events: con.close(); raise HTTPException(409,f"У камеры есть события: {event_count}. Подтвердите delete_events=true")
+    # События тестового видео переживают его карточку, поэтому ссылку
+    # events.camera_id → cameras(id) на этом соединении приходится отключить.
+    # PRAGMA не действует внутри транзакции — выполняем до BEGIN, а само
+    # соединение закрывается сразу после удаления.
+    if keep_events: con.execute("PRAGMA foreign_keys=OFF")
     con.execute("BEGIN IMMEDIATE")
+    if keep_events:
+        # Проверка внешних ключей отключена только ради событий: задания обучения
+        # и сбора датасета по-прежнему не должны остаться без камеры.
+        linked=con.execute("SELECT (SELECT COUNT(*) FROM training_jobs WHERE camera_id=?)+(SELECT COUNT(*) FROM dataset_capture_jobs WHERE camera_id=?)",(camera_id,camera_id)).fetchone()[0]
+        if linked:
+            con.rollback(); con.close()
+            raise HTTPException(409,f"Источник нельзя удалить: с ним связаны задания обучения или сбора датасета ({linked})")
     if delete_events: con.execute("DELETE FROM events WHERE camera_id=?",(camera_id,))
-    con.execute("DELETE FROM cameras WHERE id=?",(camera_id,)); con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(now_iso(),"WARNING","camera_manager",f"Camera deleted: {camera[0]}",camera_id)); con.commit(); con.close()
+    elif keep_events: con.execute("UPDATE events SET camera_label=?,zone_label=? WHERE camera_id=?",(str(camera[0] or ""),str(camera[3] or ""),camera_id))
+    message=f"Camera deleted: {camera[0]}"+(f" (events kept: {event_count})" if keep_events else "")
+    con.execute("DELETE FROM cameras WHERE id=?",(camera_id,)); con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(now_iso(),"WARNING","camera_manager",message,camera_id)); con.commit(); con.close()
     if camera[1]=="video" and camera[2]:
         try:
             candidate=Path(camera[2]).resolve()
@@ -2571,7 +2608,7 @@ def delete_camera(camera_id:str,delete_events:bool=False):
     snapshot=snapshot_path_for(camera_id); snapshot.unlink(missing_ok=True); clear_live_frame(camera_id)
     if delete_events: remove_event_frames(event_ids)
     sync_go2rtc_cameras()
-    return {"id":camera_id,"deleted":True,"deleted_events":event_count if delete_events else 0}
+    return {"id":camera_id,"deleted":True,"deleted_events":event_count if delete_events else 0,"kept_events":event_count if keep_events else 0}
 
 @app.patch("/api/cameras/{camera_id}/toggle")
 def toggle_camera(camera_id:str):
@@ -2804,7 +2841,10 @@ def diagnostics():
 @app.get("/api/events")
 def events(limit:int=Query(50,ge=1,le=500),severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None):
     ack=int(acknowledged) if acknowledged is not None else None
-    data=rows("""SELECT e.*,c.name camera_name,c.zone,c.source_type source_type FROM events e JOIN cameras c ON c.id=e.camera_id
+    # LEFT JOIN: события тестового видео остаются в журнале после остановки
+    # теста, когда строки камеры уже нет — имя и зона берутся из самого события.
+    data=rows("""SELECT e.*,COALESCE(c.name,NULLIF(e.camera_label,''),e.camera_id) camera_name,COALESCE(c.zone,NULLIF(e.zone_label,''),'') zone,c.source_type source_type
+        FROM events e LEFT JOIN cameras c ON c.id=e.camera_id
         WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?) AND (? IS NULL OR e.review_status=?)
         ORDER BY e.timestamp DESC LIMIT ?""",(severity,severity,event_type,event_type,ack,ack,review_status,review_status,limit))
     for item in data: item["has_frame"]=event_frame_path_for(int(item["id"])).is_file()
@@ -2891,7 +2931,8 @@ def analyst_summary(request:Request,hours:int=Query(24,ge=1,le=2160),start:str|N
 
 @app.get("/api/events/by-id/{event_id}")
 def event_by_id(event_id:int):
-    data=rows("""SELECT e.*,c.name camera_name,c.zone FROM events e JOIN cameras c ON c.id=e.camera_id
+    data=rows("""SELECT e.*,COALESCE(c.name,NULLIF(e.camera_label,''),e.camera_id) camera_name,COALESCE(c.zone,NULLIF(e.zone_label,''),'') zone
+        FROM events e LEFT JOIN cameras c ON c.id=e.camera_id
         WHERE e.id=?""",(event_id,))
     if not data: raise HTTPException(404,"Событие не найдено")
     item=data[0]; item["has_frame"]=event_frame_path_for(event_id).is_file()
@@ -2952,6 +2993,35 @@ def ack_events_bulk(payload:BulkAckIn,request:Request):
 def reject_events_bulk(payload:BulkAckIn,request:Request):
     result=_bulk_review_events(payload,"rejected","Не принято оператором",request)
     return {**result,"rejected_ids":result["updated_ids"],"already_rejected_ids":result["already_ids"]}
+
+@app.post("/api/events/delete-bulk")
+def delete_events_bulk(payload:EventDeleteIn,request:Request):
+    """Удалить выбранные события вместе с их кадрами-доказательствами.
+
+    Так удаляют, например, записи тестового видео после проверки модели, не
+    трогая остальной журнал. Маршрут открыт только администратору (аналитик,
+    гость и Telegram-роли отклоняются middleware-ом): действие необратимо.
+    """
+    event_ids=payload.event_ids
+    marks=",".join("?" for _ in event_ids)
+    reviewer=_reviewer_label(request)
+    con=db()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        found=[int(row[0]) for row in con.execute(f"SELECT id FROM events WHERE id IN ({marks}) ORDER BY id",event_ids).fetchall()]  # nosec B608 - placeholders only
+        tests=0
+        if found:
+            found_marks=",".join("?" for _ in found)
+            tests=int(con.execute(f"SELECT COUNT(*) FROM events WHERE is_test=1 AND id IN ({found_marks})",found).fetchone()[0])  # nosec B608 - placeholders only
+            con.execute(f"DELETE FROM events WHERE id IN ({found_marks})",found)  # nosec B608 - placeholders only
+        deleted=set(found)
+        missing=[event_id for event_id in event_ids if event_id not in deleted]
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","event_manager",f"Events deleted: events={len(found)} test={tests} missing={len(missing)} by {reviewer}"))
+        con.commit()
+    finally:
+        con.close()
+    remove_event_frames(found)
+    return {"deleted":len(found),"deleted_ids":found,"deleted_test":tests,"missing_ids":missing,"deleted_by":reviewer}
 
 @app.post("/api/events/clear")
 def clear_events(payload:EventClearIn,request:Request):
@@ -4433,7 +4503,7 @@ def global_search(q: str = Query(min_length=1, max_length=100), limit: int = Que
             add("camera", row[0], row[1], f"{row[2] or 'Без зоны'} · {_search_subtitle_status(status, _SEARCH_CAMERA_STATUS_ALIASES)} · {float(row[5] or 0):.1f} FPS", [
                 ("название", row[1]), ("ID камеры", row[0]), ("зона", row[2]), ("описание", row[3]), ("статус", _search_alias_text(status, _SEARCH_CAMERA_STATUS_ALIASES)),
             ])
-        for row in con.execute("""SELECT e.id,e.type,e.camera_id,e.severity,e.timestamp,e.person_id,e.note,e.review_status,c.name,c.zone
+        for row in con.execute("""SELECT e.id,e.type,e.camera_id,e.severity,e.timestamp,e.person_id,e.note,e.review_status,COALESCE(c.name,NULLIF(e.camera_label,'')),COALESCE(c.zone,NULLIF(e.zone_label,''))
             FROM events e LEFT JOIN cameras c ON c.id=e.camera_id ORDER BY e.timestamp DESC LIMIT 1200""").fetchall():
             event_type = str(row[1] or "")
             severity = str(row[3] or "")
@@ -4522,12 +4592,12 @@ def _event_report_rows(severity:str|None,event_type:str|None,acknowledged:bool|N
     like=f"%{term}%" if term else None
     since=(datetime.now(TZ)-timedelta(hours=hours)).isoformat() if hours else None
     return rows("""SELECT e.id,e.timestamp,e.camera_id,e.type,e.severity,e.confidence,e.person_id,e.external_id,e.acknowledged,e.review_status,e.reviewed_at,e.note,e.is_test,
-        c.name AS camera_name,c.zone AS camera_zone FROM events e
+        COALESCE(c.name,NULLIF(e.camera_label,'')) AS camera_name,COALESCE(c.zone,NULLIF(e.zone_label,'')) AS camera_zone FROM events e
         LEFT JOIN cameras c ON c.id=e.camera_id
         WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?) AND (? IS NULL OR e.review_status=?) AND (? IS NULL OR e.camera_id=?)
           AND (? IS NULL OR e.timestamp>=?)
-          AND (? IS NULL OR e.camera_id LIKE ? OR e.person_id LIKE ? OR e.external_id LIKE ? OR e.type LIKE ? OR c.name LIKE ? OR c.zone LIKE ?)
-        ORDER BY e.timestamp DESC""",(severity,severity,event_type,event_type,ack,ack,review_status,review_status,camera_id,camera_id,since,since,like,like,like,like,like,like,like))
+          AND (? IS NULL OR e.camera_id LIKE ? OR e.person_id LIKE ? OR e.external_id LIKE ? OR e.type LIKE ? OR c.name LIKE ? OR c.zone LIKE ? OR e.camera_label LIKE ? OR e.zone_label LIKE ?)
+        ORDER BY e.timestamp DESC""",(severity,severity,event_type,event_type,ack,ack,review_status,review_status,camera_id,camera_id,since,since,like,like,like,like,like,like,like,like,like))
 
 
 def _event_review_state(row:dict[str,Any]) -> str:
