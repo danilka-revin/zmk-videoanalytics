@@ -1128,3 +1128,20 @@ html[data-motion=off] nav em.hot{animation:none}
 .tgnav button{position:relative}
 .tgnav em{position:absolute;top:0;left:calc(50% + 4px);min-width:15px;padding:0 4px;border-radius:99px;background:#e4503e;color:#fff;font-size:6px;font-style:normal;font-weight:800;line-height:15px;text-align:center;box-shadow:0 2px 8px rgb(228 80 62 / .3)}
 .tgapp-dark .tgnav em{background:#e4503e!important;color:#fff!important}
+/* Звуковые оповещения: кнопка звука в шапке и раздел «Оповещения». */
+.custom-nav{grid-template-columns:repeat(3,minmax(0,1fr))}
+header .icon.sound-toggle.is-on{color:#4b8a5b;border-color:rgb(var(--accent-rgb) / .34);background:rgb(var(--accent-rgb) / .08)}
+header .icon.sound-toggle.is-off{color:var(--muted);opacity:.7}
+.alert-volume{gap:8px}
+.alert-volume>span{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.alert-volume>span b{color:var(--text);font-size:9px}
+.alert-volume input[type='range']{width:100%;height:22px;margin:0;padding:0;background:transparent;accent-color:#4b8a5b;cursor:pointer}
+.alert-note{display:block;margin-top:11px;color:var(--muted);font-size:8px;line-height:1.45}
+.alert-checks{margin-top:11px}
+.alert-check{display:flex;align-items:flex-start;gap:9px;padding:11px 12px;border:1px solid rgb(var(--ink-rgb) / .08);border-radius:12px;background:rgb(var(--surface-2-rgb) / .44);cursor:pointer}
+.alert-check input{flex:0 0 auto;width:14px;height:14px;margin:1px 0 0;accent-color:#4b8a5b;cursor:pointer}
+.alert-check b,.alert-check small{display:block}
+.alert-check b{font-size:9px}
+.alert-check small{margin-top:3px;color:var(--muted);font-size:8px;line-height:1.4}
+.alert-tip .alert-test{display:inline-flex;align-items:center;justify-content:center;gap:6px;margin-top:9px;min-height:32px;padding:7px 12px;border:1px solid rgb(var(--accent-rgb) / .34);border-radius:9px;background:rgb(var(--accent-rgb) / .12);color:#3f7a52;font-size:8px;font-weight:700;cursor:pointer}
+.alert-tip .alert-test:hover{background:rgb(var(--accent-rgb) / .22)}
