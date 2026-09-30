@@ -35,7 +35,11 @@ header>div:first-child{min-width:0}
   .head-actions .updater svg{display:none}
 }
 @media(max-width:1150px){
-  .head-actions .updater{display:none}
+  /* Кнопка проверки обновлений — единственное управление обновлением, поэтому
+     на узких экранах она остаётся видимой, но превращается в компактную иконку. */
+  .head-actions .updater{padding:9px 11px}
+  .head-actions .updater svg{display:block}
+  .head-actions .updater>span:not(.update-trigger-icon){display:none}
   .head-actions .search{width:min(220px,26vw)}
 }
 .feed-empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;width:100%;height:100%;color:#93a39b;padding:0 12px;text-align:center}
@@ -997,3 +1001,51 @@ html[data-font-scale=small] .customizer .custom-page,html[data-font-scale=large]
 
 /* Zovod mark: the supplied factory-and-gear emblem is used as the product logo. */
 .brandmark{overflow:hidden;background:#fff;color:#17211d}.brand-logo-img{display:block;width:100%;height:100%;object-fit:contain}.auth-card-logo{overflow:hidden;background:#fff!important;border-color:#fff!important;padding:3px;box-shadow:0 10px 21px rgb(0 0 0 / .2)}.tgapp .tghead .brandmark{background:#fff}
+
+/* Zovod update window: окно проверки и установки обновлений всегда тёмное.
+   Панель может быть в светлой теме, но это окно остаётся тёмным: фон, карточки
+   состояний, шаги и кнопки больше не подсвечиваются светлыми «пятнами». */
+.update-overlay{--surface:#15201b;--surface-2:#1b2923;--text:#e9f0ec;--muted:#94a59c;--line:#2c3d34;color-scheme:dark}
+.update-overlay .update-dialog{border-color:#31443a;background:#131f19;color:#e9f0ec;box-shadow:0 28px 90px #030906a6}
+.update-overlay .update-dialog-header{border-bottom-color:#26372f}
+.update-overlay .update-dialog-header h2{color:#f2f8f4}
+.update-overlay .update-dialog-header p{color:#94a59c}
+.update-overlay .update-dialog-mark{background:#1b3025;color:#d5ff45}
+.update-overlay .update-kicker{color:#8db896}
+.update-overlay .update-dialog-close{background:#1d2b24;border-color:#2f4139;color:#a8b9b0}
+.update-overlay .update-dialog-close:hover{background:#26382f;border-color:#3d5348;color:#eef6f1}
+.update-overlay .update-version-grid{background:#1a2822;border-color:#2c3d34}
+.update-overlay .update-version-grid>div b{color:#f2f8f4}
+.update-overlay .update-version-grid>div span{color:#94a59c}
+.update-overlay .update-version-grid>i{color:#7c9188}
+.update-overlay .update-release-link{color:#b6d883}
+.update-overlay .update-release-link:hover{color:#d0ecab}
+.update-overlay .update-state-card.available{border-color:#415c31;background:#1c2c1c}
+.update-overlay .update-state-card.current{border-color:#2f5240;background:#16291f}
+.update-overlay .update-state-card.checking{border-color:#2d4657;background:#152430}
+.update-overlay .update-state-card.failed{border-color:#6a3b33;background:#2b1c19}
+.update-overlay .update-state-card b{color:#eef6f1}
+.update-overlay .update-state-card small{color:#9aaba2}
+.update-overlay .update-state-mark{background:#26361a;color:#b3d878}
+.update-overlay .current .update-state-mark{background:#1e3a27;color:#7fca90}
+.update-overlay .failed .update-state-mark{background:#3b211d;color:#f2907f}
+.update-overlay .checking>svg{color:#7fb6d6}
+.update-overlay .update-progress-card{background:#182622;border-color:#2c3d34}
+.update-overlay .update-progress-heading b{color:#eef6f1}
+.update-overlay .update-progress-heading small{color:#94a59c}
+.update-overlay .update-progress-spinner{background:#1f3327;color:#84cb92}
+.update-overlay .update-progress-track{background:#25392f}
+.update-overlay .update-steps li{color:#93a49b}
+.update-overlay .update-steps li>span{background:#182620;border-color:#2f4139;color:#9aaba2}
+.update-overlay .update-steps li.done{color:#8ecb9c}
+.update-overlay .update-steps li.done>span{border-color:#2f5240;background:#1e3a27;color:#84cb92}
+.update-overlay .update-steps li.active{color:#f2f8f4}
+.update-overlay .update-steps li.active>span{border-color:#4d7040;background:#26361f;color:#b6dd7b}
+.update-overlay .mini-spinner{border-color:#3a5145;border-top-color:#8fd39b}
+.update-overlay .update-progress-note{color:#8b9c93}
+.update-overlay .update-dialog-footer{border-top-color:#26372f}
+.update-overlay .update-secondary{background:#1d2b24;border-color:#31443a;color:#b3c2b9}
+.update-overlay .update-secondary:hover{background:#26382f;border-color:#3d5348;color:#eef6f1}
+.update-overlay .update-primary{border-color:#2d5340;background:#1f3a2b;color:#d5ff45}
+.update-overlay .update-primary:hover{background:#2a4b38}
+.update-overlay .update-dialog-footer button:focus-visible,.update-overlay .update-dialog-close:focus-visible{outline-color:#a6d274}
