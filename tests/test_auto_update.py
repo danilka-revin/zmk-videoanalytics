@@ -79,19 +79,80 @@ def test_powershell_updater_contains_required_logic():
     # install-windows.ps1 -CheckOnly (Parser::ParseFile). Here we guard the
     # key implementation details so a regression is caught by the python test.
     updater = (ROOT / "installers" / "auto-update.ps1").read_text()
+    # Both channels must survive on Windows: commit (default) and release.
     for required in ["Get-FileHash", "SHA256", "ZMK_NO_AUTO_UPDATE", "Expand-Archive",
                      "robocopy", "ZMK_RELAUNCHED_AFTER_UPDATE", "releases/latest",
-                     "Get-CurrentVersion", "Test-VersionLt"]:
+                     "Get-CurrentVersion", "Test-VersionLt", "Get-LatestCommit",
+                     "Get-CurrentCommit", "Write-BuildInfo", "codeload.github.com",
+                     "ZMK_APPLY_COMMIT"]:
         assert required in updater, required
     start = (ROOT / "start.ps1").read_text()
-    for required in ["auto-update.ps1", "docker compose", "--remove-orphans", "Wait-Http"]:
+    for required in ["auto-update.ps1", "docker compose", "--remove-orphans", "Wait-Http", "Write-ZmkBuildInfo"]:
         assert required in start, required
 
 
 def test_relaunch_and_protect_paths_configured():
     updater = UPDATER.read_text()
     for needle in ["ZMK_NO_AUTO_UPDATE", "SHA256", "releases/download", "zmk_sync_tree",
-                   "exec env ZMK_RELAUNCHED_AFTER_UPDATE=1"]:
+                   "exec env ZMK_RELAUNCHED_AFTER_UPDATE=1",
+                   # commit channel: head commit of the branch + codeload archive
+                   "zmk_latest_commit", "zmk_current_commit", "codeload.github.com",
+                   "zmk_write_build_info", "ZMK_APPLY_COMMIT"]:
         assert needle in updater
-    # the launcher must reference the updater
-    assert "installers/auto-update.sh" in (ROOT / "start.sh").read_text()
+    # the launcher must reference the updater and record the running build
+    start = (ROOT / "start.sh").read_text()
+    assert "installers/auto-update.sh" in start
+    assert "zmk_record_build_info" in start
+
+
+def test_latest_commit_parses_the_github_api(tmp_path):
+    """The commit channel must read the head commit of the tracked branch."""
+    payload = '{"sha": "ffffffffffffffffffffffffffffffffffffffff", "commit": {"message": "merge"}}'
+    (tmp_path / "commits").mkdir()
+    (tmp_path / "commits" / "feature-x").write_text(payload)
+    code = f"""source '{UPDATER}'
+set -e
+export ZMK_UPDATE_NO_GIT=1
+export ZMK_COMMITS_API="file://{tmp_path}/commits"
+echo "SHA=$(zmk_latest_commit feature-x)"
+echo "BRANCH=$(zmk_branch /nonexistent-root)"
+echo "PLAIN=$(ZMK_UPDATE_BRANCH=feature-x zmk_branch /nonexistent-root)"
+"""
+    out = _bash(code)
+    assert "SHA=" + "f" * 40 in out
+    assert "BRANCH=main" in out
+    assert "PLAIN=feature-x" in out
+
+
+def test_commit_marker_round_trips():
+    code = f"""source '{UPDATER}'
+set -e
+root=$(mktemp -d)
+zmk_write_build_info "$root" "2.23.0" "{'e' * 40}" "main" "commit"
+echo "COMMIT=$(tr -d '[:space:]' < "$root/COMMIT")"
+echo "INFO=$(tr -d ' \n' < "$root/data/build-info.json")"
+rm -rf "$root"
+"""
+    out = _bash(code)
+    assert f"COMMIT={'e' * 40}" in out
+    assert '"commit":"' + "e" * 40 + '"' in out
+    assert '"channel":"commit"' in out
+
+    # A second call with the same version/commit must not rewrite the file
+    # (installed_at keeps its meaning across restarts).
+    code2 = f"""source '{UPDATER}'
+set -e
+root=$(mktemp -d)
+zmk_write_build_info "$root" "2.24.0" "{'e' * 40}" "main" "commit"
+before=$(cat "$root/data/build-info.json")
+zmk_write_build_info "$root" "2.24.0" "{'e' * 40}" "main" "commit"
+after=$(cat "$root/data/build-info.json")
+[ "$before" = "$after" ] && echo "UNCHANGED" || echo "REWRITTEN"
+before_marker=$(cat "$root/COMMIT")
+zmk_write_build_info "$root" "9.9.9" "{'f' * 40}" "feature" "release"
+echo "SECOND=$(cat "$root/COMMIT" | tr -d '\n')"
+rm -rf "$root"
+"""
+    out2 = _bash(code2)
+    assert "UNCHANGED" in out2
+    assert "SECOND=" + "f" * 40 in out2

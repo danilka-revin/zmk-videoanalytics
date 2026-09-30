@@ -84,6 +84,7 @@ run_config || fail "Настройка не завершена"
 
 [[ -f .env ]] || cp .env.example .env
 chmod 600 .env 2>/dev/null || true
+
 command -v docker >/dev/null 2>&1 || fail "Docker CLI is unavailable"
 DC=(docker compose)
 DOCKER=(docker)
@@ -100,6 +101,11 @@ if [[ -f installers/lib-stack.sh ]]; then
   # shellcheck disable=SC1091
   source installers/lib-stack.sh
 fi
+
+# Record the installed build (VERSION + git commit) before the containers
+# start: the API reads build-info.json from the mounted ./data and shows which
+# commit of the tracked branch is running (see installers/lib-stack.sh).
+if declare -f zmk_record_build_info >/dev/null 2>&1; then zmk_record_build_info "$ROOT" || true; fi
 
 # Desktop helpers (Wayland/X11 aware browser launch).
 if [[ -f installers/lib-desktop.sh ]]; then
@@ -176,12 +182,15 @@ print_zmk_logo(){
 print_install_summary(){
   local version ref revision profile compose_display launch_command
   version=$(tr -d '[:space:]' < VERSION 2>/dev/null || printf 'DEV')
+  declare -f zmk_record_build_info >/dev/null 2>&1 && zmk_record_build_info "$ROOT" || true
   if command -v git >/dev/null 2>&1 && [[ -d .git ]]; then
     git config --global --add safe.directory "$(pwd)" >/dev/null 2>&1 || true
     ref=$(git branch --show-current 2>/dev/null || printf 'DETACHED')
     revision=$(git rev-parse --short HEAD 2>/dev/null || printf 'UNKNOWN')
   else
-    ref="RELEASE ARCHIVE"; revision="N/A"
+    ref="RELEASE ARCHIVE"
+    revision=$(tr -d '[:space:]' < COMMIT 2>/dev/null | cut -c1-7)
+    revision="${revision:-N/A}"
   fi
   profile="${PROFILE[*]:-DEFAULT SERVICES}"
   compose_display=$(printf '%q ' "${DC[@]}" "${PROFILE[@]}")

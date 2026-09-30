@@ -43,7 +43,13 @@ from fastapi.openapi.utils import get_openapi
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-APP_VERSION = "2.23.0"
+# Fallback version for a checkout started without any recorded build info.
+BASE_VERSION = "2.24.0"
+# Installed version + git commit, as recorded by the installers and the updater
+# service (see services/updater/core.py). Commit-based updates mean the version
+# string alone no longer identifies a build: every commit/merge of the tracked
+# branch is a new version, so the panel shows "<VERSION>+<short sha>".
+BUILD_INFO_FILE = "build-info.json"
 TZ = timezone(timedelta(hours=7))
 CAMERA_TELEMETRY_STALE_SECONDS = 30
 HIGH_FPS_MODE = os.getenv("CAMERA_HIGH_FPS_MODE", "true").strip().lower() not in {"0","false","no","off"}
@@ -53,6 +59,47 @@ SNAPSHOT_DIR = Path(os.getenv("SNAPSHOT_DIR", "")) if os.getenv("SNAPSHOT_DIR") 
 EVENT_FRAME_DIR = Path(os.getenv("EVENT_FRAME_DIR", "")) if os.getenv("EVENT_FRAME_DIR") else None
 DB_PATH = Path(os.getenv("VIDEOANALYTICS_DB", str(Path(__file__).resolve().parent.parent / "videoanalytics.db")))
 STARTED = time.time()
+
+
+def _read_build_info() -> dict[str,str]:
+    """Version/commit of the running build, written next to the database.
+
+    The installers and the `updater` service record every applied
+    install/update in `data/build-info.json` (mounted here together with the
+    SQLite database). Reading it keeps the panel honest about which commit is
+    running after a commit-based update, without rebuilding the API image with
+    a new hardcoded version.
+    """
+    path = Path(os.getenv("ZMK_BUILD_INFO", "") or DB_PATH.parent / BUILD_INFO_FILE)
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    version = str(data.get("version") or BASE_VERSION).strip() or BASE_VERSION
+    commit = str(data.get("commit") or "").strip().lower()
+    commit = commit if re.fullmatch(r"[0-9a-f]{40}", commit) else ""
+    return {"version":version,"commit":commit,"short":commit[:7],"branch":str(data.get("branch") or ""),"channel":str(data.get("channel") or ""),"installed_at":str(data.get("installed_at") or "")}
+
+
+def _display_version(info: dict[str,str]) -> str:
+    return f"{info['version']}+{info['short']}" if info.get("short") else str(info.get("version") or BASE_VERSION)
+
+
+BUILD_INFO = _read_build_info()
+APP_VERSION = _display_version(BUILD_INFO)
+
+
+def _running_build() -> dict[str,str]:
+    """Fresh build info: the updater may record a new build while we run.
+
+    `data/build-info.json` is written next to the SQLite database (same mounted
+    volume), so re-reading it costs a stat and keeps `/api/health` truthful
+    even if only the updater sidecar was restarted.
+    """
+    info = _read_build_info()
+    return info if info.get("version") else BUILD_INFO
 API_KEY = os.getenv("ZMK_API_KEY", "").strip()
 PASSWORD_AUTH_ENABLED=os.getenv("ZMK_PASSWORD_AUTH","false").strip().lower() not in {"0","false","no","off"}
 DEFAULT_INITIAL_APP_PASSWORD="admin"  # nosec B105 - operator-visible bootstrap default for the admin account
@@ -2147,17 +2194,35 @@ def update_headers() -> dict[str,str]:
     if UPDATE_TOKEN: headers["X-Update-Token"] = UPDATE_TOKEN
     return headers
 
+def _local_update_state(reason: str = "") -> dict[str,Any]:
+    """Fallback answer when the `updater` sidecar is missing or unreachable."""
+    info = _running_build()
+    return {"available":False,"channel":info.get("channel") or "commit","branch":info.get("branch") or "",
+            "current":_display_version(info),"current_version":info.get("version") or BASE_VERSION,"current_commit":info.get("commit") or "",
+            "current_short":info.get("short") or "","latest":"","latest_version":"","latest_commit":"","latest_short":"","latest_message":"",
+            "commits_behind":None,"update_available":False,"release_url":"","reason":reason}
+
+
 def _updater_status() -> dict[str,Any]:
     if not UPDATE_SERVICE_URL:
-        return {"available": False, "current":APP_VERSION, "latest":"", "update_available":False, "reason":"updater service not configured"}
+        return _local_update_state("Служба updater не подключена: задайте UPDATE_SERVICE_URL и запустите стенд через ./start.sh")
     try:
-        response = httpx.get(f"{UPDATE_SERVICE_URL}/status", headers=update_headers(), timeout=5)
+        # The updater resolves the branch head over the network (git ls-remote
+        # first, then the GitHub API), so allow more than a local round-trip.
+        response = httpx.get(f"{UPDATE_SERVICE_URL}/status", headers=update_headers(), timeout=30)
         response.raise_for_status()
         data = response.json()
         data["available"] = True
+        # The sidecar reads the same bind-mounted tree; its answer wins, but a
+        # stale build-info must never hide the commit that is really running.
+        info = _running_build()
+        if info.get("commit"):
+            data["current_commit"] = info["commit"]
+            data["current_short"] = info["short"]
+            data["current"] = _display_version(info)
         return data
     except httpx.HTTPError as exc:
-        return {"available": False, "current":APP_VERSION, "latest":"", "update_available":False, "reason":f"updater unreachable: {type(exc).__name__}"}
+        return _local_update_state(f"Служба updater недоступна: {type(exc).__name__}")
 
 @app.get("/api/update/status")
 def update_status():
@@ -2191,7 +2256,9 @@ def capabilities():
     return {"demo_mode":SEED_TEST_DATA,"training_worker":worker["reachable"],"training":worker,"external_inference_gateway":True,"camera_crud":True,"diagnostics":True,"search":True,"update_service":bool(UPDATE_SERVICE_URL),"inference_worker":inference["connected"],"inference":inference,"fresh_snapshots":fresh}
 
 @app.get("/api/health")
-def health(): return {"status":"ok","version":APP_VERSION,"uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
+def health():
+    info = _running_build()
+    return {"status":"ok","version":_display_version(info),"version_base":info.get("version") or BASE_VERSION,"commit":info.get("commit") or "","commit_short":info.get("short") or "","branch":info.get("branch") or "","channel":info.get("channel") or "","built_at":info.get("installed_at") or "","uptime_seconds":int(time.time()-STARTED),"time":now_iso()}
 
 @app.get("/api/dashboard")
 def dashboard():

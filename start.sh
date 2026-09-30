@@ -98,7 +98,8 @@ if [[ -d .git ]]; then
   git config pull.rebase false >/dev/null 2>&1 || true
   git config pull.ff only >/dev/null 2>&1 || true
 fi
-# Upgrade the selected branch itself. Release archives are used only on main.
+# Upgrade the selected branch itself: any commit or merge of that branch is a
+# new version (release archives are only the fallback for ZMK_UPDATE_CHANNEL=release).
 if ! zmk_has_flag --no-update "$@" && [[ -z "${ZMK_NO_AUTO_UPDATE:-}" && -f installers/auto-update.sh ]]; then
   if [[ -d .git ]]; then git config --global --add safe.directory "$(pwd)" >/dev/null 2>&1 || true; fi
   ZMK_UPDATE_BRANCH="${ZMK_UPDATE_BRANCH:-$(git branch --show-current 2>/dev/null || true)}" \
@@ -262,11 +263,14 @@ print_zmk_logo(){
 print_launch_summary(){
   local version ref revision profile compose_display launch_command
   version=$(tr -d '[:space:]' < VERSION 2>/dev/null || printf 'DEV')
+  declare -f zmk_record_build_info >/dev/null 2>&1 && zmk_record_build_info "$ROOT" || true
   if command -v git >/dev/null 2>&1 && [[ -d .git ]]; then
     ref=$(git branch --show-current 2>/dev/null || printf 'DETACHED')
     revision=$(git rev-parse --short HEAD 2>/dev/null || printf 'UNKNOWN')
   else
-    ref="RELEASE ARCHIVE"; revision="N/A"
+    ref="RELEASE ARCHIVE"
+    revision=$(tr -d '[:space:]' < COMMIT 2>/dev/null | cut -c1-7)
+    revision="${revision:-N/A}"
   fi
   profile="${PROFILE[*]:-DEFAULT SERVICES}"
   compose_display=$(printf '%q ' "${DC[@]}" "${PROFILE[@]}")
@@ -303,6 +307,13 @@ print_launch_summary(){
 
 echo "[start] Запускаю сервисы Zovod..."
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml или .env не прошли валидацию"
+
+# Фиксирую установленный билд (VERSION + коммит) в ./COMMIT и
+# ./data/build-info.json до старта контейнеров: API читает этот файл из
+# смонтированного ./data и показывает панели, какой коммит запущен. Любой
+# коммит или мердж ветки считается новой версией, поэтому номер версии сам
+# по себе билд больше не идентифицирует.
+if declare -f zmk_record_build_info >/dev/null 2>&1; then zmk_record_build_info "$ROOT" || true; fi
 
 # --rebuild / ZMK_REBUILD=1 — принудительная пересборка образов.
 # Обычный старт больше не пересобирает стек: installers/lib-stack.sh хранит

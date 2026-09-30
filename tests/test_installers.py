@@ -56,8 +56,8 @@ def test_bootstrap_launcher_and_rtsp_wizard_escape_credentials(tmp_path):
     # the merge by ancestry and switch the one-command channel back to main.
     assert 'merge-base --is-ancestor' in bootstrap
     assert 'is already merged into main; switching to main' in bootstrap
-    # bootstrap has already checked out the requested Git ref; the release
-    # updater must not replace a feature branch immediately afterwards.
+    # bootstrap has already checked out the requested Git ref; the updater
+    # must not run a second (identical) branch update immediately afterwards.
     assert 'ZMK_NO_AUTO_UPDATE=1' in bootstrap
 
     # An RTSP password may include & or |. The wizard must preserve it rather
