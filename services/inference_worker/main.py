@@ -1638,11 +1638,16 @@ class Runtime:
             self._log(f"overlay render failed; raw preview continues: {redact_error(exc)}")
             annotated=None
 
-        # A requested camera test is deliberately global: no specialised slot
-        # may emit production alerts while the operator evaluates a test model.
-        if detections and not self.model_test_mode:
+        # Тестовый прогон («PPE-тест» / «Тест на камере») виден оператору в
+        # журнале: событие сохраняется с флагом test_mode, поэтому оно не
+        # становится production-оповещением (webhook, боты) но остаётся
+        # кадром-доказательством для проверки модели.
+        if detections:
+            payload={"detections":detections}
+            if self.model_test_mode:
+                payload={"detections":[{**item,"test_mode":True} for item in detections]}
             try:
-                receipt=await self.post("/api/inference/detections",{"detections":detections})
+                receipt=await self.post("/api/inference/detections",payload)
                 await self._publish_event_evidence(session,receipt,annotated if annotated is not None else image)
             except (httpx.HTTPError,OSError,RuntimeError,ValueError) as exc:
                 self._log(f"detections rejected: {redact_error(exc)}")

@@ -230,9 +230,11 @@ def test_ppe_inference_posts_no_helmet_event_for_the_matching_person(worker_mod)
     assert detection["event_type"] == "no_helmet"
     assert detection["bbox"] == [0.0, 0.0, 100.0, 200.0]
     assert detection["person_id"].startswith("cam_01-person-")
+    # Production-детекция не должна помечаться тестовой.
+    assert "test_mode" not in detection
 
 
-def test_camera_test_mode_draws_boxes_without_sending_production_events(worker_mod):
+def test_camera_test_mode_reports_events_marked_as_test(worker_mod):
     class Tensor:
         def __init__(self, value): self.value = value
         def cpu(self): return self
@@ -259,7 +261,11 @@ def test_camera_test_mode_draws_boxes_without_sending_production_events(worker_m
     visual = asyncio.run(runtime._infer(session, _FakeImage()))
 
     assert visual is not None and visual.boxes
-    assert posted == []
+    # Тестовый прогон тоже попадает в журнал оператора, но каждая детекция
+    # помечена test_mode: backend сохраняет её как тестовую и не отправляет
+    # в webhook или боты-оповещения.
+    assert posted and posted[0][0] == "/api/inference/detections"
+    assert [item["test_mode"] for item in posted[0][1]["detections"]] == [True]
 
 
 def test_accepted_event_gets_an_annotated_evidence_frame(worker_mod):
