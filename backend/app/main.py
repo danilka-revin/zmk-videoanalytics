@@ -44,7 +44,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Fallback version for a checkout started without any recorded build info.
-BASE_VERSION = "2.26.0"
+BASE_VERSION = "2.27.0"
 # Installed version + git commit, as recorded by the installers and the updater
 # service (see services/updater/core.py). Commit-based updates mean the version
 # string alone no longer identifies a build: every commit/merge of the tracked
@@ -2290,6 +2290,11 @@ def dashboard():
     con=db(); total=con.execute("SELECT COUNT(*) FROM cameras").fetchone()[0]; online=con.execute("SELECT COUNT(*) FROM cameras WHERE status='online' AND telemetry_at>=?",(fresh_after,)).fetchone()[0]
     events24=con.execute("SELECT COUNT(*) FROM events WHERE timestamp >= ?",((datetime.now(TZ)-timedelta(days=1)).isoformat(),)).fetchone()[0]
     critical=con.execute("SELECT COUNT(*) FROM events WHERE severity='critical' AND acknowledged=0").fetchone()[0]
+    # Счётчик для бейджа вкладки «События». Любая произошедшая детекция — не
+    # только критическая — поднимает число в меню; принятое («Принять») или не
+    # принятое («Не принять») событие уходит из счётчика, и когда очередь
+    # разобрана, бейдж исчезает — ровно как бейдж вкладки «Логи».
+    pending=con.execute("SELECT COUNT(*) FROM events WHERE review_status='pending'").fetchone()[0]
     avg=con.execute("SELECT COALESCE(AVG(fps),0), COALESCE(AVG(latency_ms),0) FROM cameras WHERE status='online' AND telemetry_at>=?",(fresh_after,)).fetchone()
     model=con.execute("SELECT m.name,m.precision,m.recall FROM model_registry m JOIN settings s ON s.key='active_model' AND s.value=m.name").fetchone()
     bot_settings={row[0]:row[1] for row in con.execute("SELECT key,value FROM settings WHERE key IN ('telegram_bot_enabled','max_bot_enabled')").fetchall()}
@@ -2301,7 +2306,7 @@ def dashboard():
         end=datetime.now(TZ)-timedelta(hours=h); start=end-timedelta(hours=1)
         n=con.execute("SELECT COUNT(*) FROM events WHERE timestamp BETWEEN ? AND ?",(start.isoformat(),end.isoformat())).fetchone()[0]
         trend.append({"label":end.strftime("%H:00"),"value":n})
-    con.close(); gpu=gpu_metrics(); return {"cameras":{"total":total,"online":online},"events24h":events24,"critical_unacked":critical,"avg_fps":round(avg[0],1),"avg_latency_ms":round(avg[1]),"gpu_load":gpu["gpu"],"gpu_temp":gpu["gpu_temp"],"messenger_provider":messenger_provider,"active_model":model[0] if model else None,"precision":model[1] if model else None,"recall":model[2] if model else None,"log_errors_24h":log_errors,"trend":trend}
+    con.close(); gpu=gpu_metrics(); return {"cameras":{"total":total,"online":online},"events24h":events24,"critical_unacked":critical,"pending_events":pending,"avg_fps":round(avg[0],1),"avg_latency_ms":round(avg[1]),"gpu_load":gpu["gpu"],"gpu_temp":gpu["gpu_temp"],"messenger_provider":messenger_provider,"active_model":model[0] if model else None,"precision":model[1] if model else None,"recall":model[2] if model else None,"log_errors_24h":log_errors,"trend":trend}
 
 EVENT_LABELS={"no_helmet":"Без каски","no_vest":"Без жилета","phone_usage":"Телефон","smoking":"Курение","restricted_zone":"Опасная зона","immobility":"Неподвижность"}
 REVIEW_LABELS={"pending":"Требуют внимания","accepted":"Приняты","rejected":"Не приняты"}
