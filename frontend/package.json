@@ -2,7 +2,7 @@
   "name": "zmk-vision-console",
   "private": true,
   "version": "2.23.0",
-  "description": "ZMK Vision web administration console and Telegram Mini App for on-premise industrial safety video analytics",
+  "description": "Zovod web administration console and Telegram Mini App for on-premise industrial safety video analytics",
   "type": "module",
   "scripts": {
     "dev": "vite --host 0.0.0.0",

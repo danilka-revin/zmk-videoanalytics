@@ -88,7 +88,7 @@ async def lifespan(app:FastAPI):
  install_log_shipping(); ship_log(f'training worker started (device={DEVICE}, base={BASE_MODEL})')
  try: yield
  finally: await ship_logs()
-app=FastAPI(title='ZMK Training Worker',version='1.0.0',lifespan=lifespan); running:set[int]=set(); tasks:dict[int,asyncio.Task]={}
+app=FastAPI(title='Zovod Training Worker',version='1.0.0',lifespan=lifespan); running:set[int]=set(); tasks:dict[int,asyncio.Task]={}
 class Job(BaseModel):
  id:int; camera_id:str=''; rtsp_url:str=''; target_name:str; base_artifact:str|None=None; image_count:int=Field(ge=20,le=5000); epochs:int=Field(ge=1,le=300); fps_limit:float=Field(default=2,gt=0,le=10); batch:int=Field(default=8,ge=1,le=128); imgsz:int=Field(default=640,ge=320,le=1920); patience:int=Field(default=20,ge=0,le=100); confidence:float=Field(default=.35,ge=.05,le=.95); val_split:float=Field(default=.2,ge=.1,le=.4); source:str='camera'; dataset_path:str|None=None; dataset_kind:str='yolo'; frame_skip:int=Field(default=8,ge=1,le=120)
 async def callback(job:int,**values):

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# ZMK Vision — configuration wizard (shared by start.sh and install-linux.sh).
+# Zovod — configuration wizard (shared by start.sh and install-linux.sh).
 #
 # Sourced (not executed) by start.sh and install-linux.sh. Provides
 # run_config() which writes .env and .zmk-profiles based on user answers.

@@ -1,4 +1,4 @@
-"""ZMK Vision updater sidecar.
+"""Zovod updater sidecar.
 
 This service runs inside the Docker network with the host project root
 bind-mounted at UPDATE_ROOT (default /workspace) and the Docker socket at
@@ -116,7 +116,7 @@ async def lifespan(app: FastAPI):
         root.removeHandler(handler)
 
 
-app = FastAPI(title="ZMK Vision Updater", version="2.12.0", lifespan=lifespan)
+app = FastAPI(title="Zovod Updater", version="2.12.0", lifespan=lifespan)
 
 
 def _require_token(x_update_token: str | None) -> None:

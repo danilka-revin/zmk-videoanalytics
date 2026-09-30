@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# ZMK Vision — ЕДИНАЯ ТОЧКА ЗАПУСКА (Linux). Один клик:  ./start.sh
+# Zovod — ЕДИНАЯ ТОЧКА ЗАПУСКА (Linux). Один клик:  ./start.sh
 #
 #   1) Проверяет/скачивает новую версию с GitHub (если есть).
 #   2) На ПЕРВОМ запуске открывает мастер настройки:
@@ -126,7 +126,7 @@ fi
 
 if [[ "$wizard_needed" == "true" ]]; then
   echo ""
-  echo "═══ Первый запуск ZMK Vision — настройка ═══"
+  echo "═══ Первый запуск Zovod — настройка ═══"
   # shellcheck disable=SC1091
   source installers/wizard.sh
   run_config || { echo "Настройка не завершена — выходим."; exit 1; }
@@ -274,7 +274,7 @@ print_launch_summary(){
   [[ -x "$launch_command" ]] || launch_command="./start.sh (launcher is created by bootstrap)"
   printf '\n%s\n' '================================================================'
   print_zmk_logo
-  printf '%s\n' '                           ZMK VISION'
+  printf '%s\n' '                           ZOVOD'
   printf '%s\n' '                 VIDEO ANALYTICS CONTROL PLATFORM'
   printf '%s\n' '================================================================'
   printf ' STATUS              : RUNNING\n'
@@ -301,7 +301,7 @@ print_launch_summary(){
   printf '%s\n\n' '================================================================'
 }
 
-echo "[start] Запускаю сервисы ZMK Vision..."
+echo "[start] Запускаю сервисы Zovod..."
 "${DC[@]}" "${PROFILE[@]}" config --quiet || fail "docker-compose.yml или .env не прошли валидацию"
 
 # --rebuild / ZMK_REBUILD=1 — принудительная пересборка образов.

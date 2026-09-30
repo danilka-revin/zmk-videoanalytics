@@ -1,3 +1,4 @@
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -8,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_linux_installers_pass_shell_parser_and_dry_check():
-    scripts = [ROOT/'installers/bootstrap-linux.sh', ROOT/'installers/install-linux.sh', ROOT/'installers/uninstall-linux.sh', ROOT/'installers/wizard.sh', ROOT/'start.sh']
+    scripts = [ROOT/'installers/bootstrap-linux.sh', ROOT/'installers/install-linux.sh', ROOT/'installers/uninstall-linux.sh', ROOT/'installers/wizard.sh', ROOT/'installers/create-desktop.sh', ROOT/'start.sh']
     subprocess.run(['bash','-n',*[str(x) for x in scripts]], check=True)
     result = subprocess.run(['bash',str(ROOT/'installers/install-linux.sh'),'--check'], cwd=ROOT, text=True, capture_output=True, check=False)
     assert result.returncode == 0, result.stderr
@@ -33,7 +34,7 @@ def test_linux_installers_pass_shell_parser_and_dry_check():
         assert 'builder prune -af' in script
         assert 'COMPOSE_PARALLEL_LIMIT=1' in script
         assert 'buildx prune -af' in script
-        assert 'ZMK VISION' in script
+        assert 'ZOVOD' in script
         assert '███████' in script
         assert 'VIDEO ANALYTICS CONTROL PLATFORM' in script
         assert 'SERVICE STATUS' in script
@@ -331,6 +332,27 @@ def test_launchers_use_shared_stack_and_desktop_helpers():
         assert 'installers/lib-desktop.sh' in script
     # Forcing a rebuild has to stay possible.
     assert '--rebuild' in start or 'ZMK_REBUILD' in start
+
+
+def test_ubuntu_desktop_shortcut_updates_and_starts_project(tmp_path):
+    project = tmp_path / 'Zovod'
+    project.mkdir()
+    (project / 'start.sh').write_text('#!/usr/bin/env bash\necho start\n')
+    home = tmp_path / 'home'
+    env = os.environ.copy()
+    env.update({'HOME': str(home), 'XDG_DATA_HOME': str(home / '.local' / 'share')})
+    subprocess.run(
+        ['bash', str(ROOT / 'installers' / 'create-desktop.sh'), str(project)],
+        cwd=ROOT, env=env, text=True, capture_output=True, check=True,
+    )
+    app_shortcut = home / '.local' / 'share' / 'applications' / 'zmk-vision.desktop'
+    desktop_shortcut = home / 'Desktop' / 'zmk-vision.desktop'
+    for shortcut in (app_shortcut, desktop_shortcut):
+        content = shortcut.read_text()
+        assert 'Name=Zovod — обновить и запустить' in content
+        assert 'Comment=Скачать последнюю версию и перезапустить сервисы Docker' in content
+        assert f'Exec=bash "{project}/start.sh"' in content
+        assert shortcut.stat().st_mode & 0o111
 
 
 def test_wayland_desktop_helper_opens_panel_in_user_session():

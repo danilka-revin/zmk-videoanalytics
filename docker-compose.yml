@@ -7,6 +7,7 @@ services:
     - ./data:/app/data
     - dataset-data:/datasets
     - model-data:/models
+    - test-video-data:/test-videos
     # Dedicated secret volume: bot workers must not get a read-only mount of
     # the database/RTSP data just to receive their token.
     - bot-token-data:/bot-tokens
@@ -18,6 +19,8 @@ services:
       MODEL_DIR: /models
       # Maximum size of a locally uploaded model artifact (2 GB by default).
       MODEL_UPLOAD_MAX_BYTES: ${MODEL_UPLOAD_MAX_BYTES:-2000000000}
+      TEST_VIDEO_DIR: /test-videos
+      TEST_VIDEO_MAX_BYTES: ${TEST_VIDEO_MAX_BYTES:-500000000}
       MODEL_TEST_CONF: ${MODEL_TEST_CONF:-0.10}
       ZMK_PASSWORD_AUTH: ${ZMK_PASSWORD_AUTH:-true}
       ZMK_INITIAL_PASSWORD: ${ZMK_INITIAL_PASSWORD:-admin}
@@ -210,6 +213,7 @@ services:
       CAMERA_HEARTBEAT_SECONDS: ${CAMERA_HEARTBEAT_SECONDS:-5}
     volumes:
     - model-data:/models
+    - test-video-data:/test-videos:ro
     depends_on:
       api:
         condition: service_healthy
@@ -301,3 +305,4 @@ volumes:
   dataset-data: {}
   bot-token-data: {}
   go2rtc-data: {}
+  test-video-data: {}

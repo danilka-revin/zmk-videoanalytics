@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# ZMK Vision — shared Docker stack helpers (sourced by start.sh and
+# Zovod — shared Docker stack helpers (sourced by start.sh and
 # installers/install-linux.sh).
 #
 # Why this file exists

@@ -21,6 +21,39 @@ def _camera(client: TestClient) -> str:
     return response.json()["id"]
 
 
+def test_uploaded_video_creates_worker_source_and_deletes_clip(tmp_path, monkeypatch):
+    video_dir=tmp_path/"uploaded-test-videos"
+    monkeypatch.setattr(main,"TEST_VIDEO_DIR",video_dir)
+    monkeypatch.setattr(main,"sync_go2rtc_cameras",lambda:{"ok":True})
+    with TestClient(main.app) as client:
+        uploaded=client.post("/api/test-videos?filename=shift.mp4",content=b"0"*2048,headers={"Content-Type":"video/mp4"})
+        assert uploaded.status_code==201,uploaded.text
+        result=uploaded.json()
+        assert result["source_type"]=="video" and result["configured"] is True
+        assert result["status"]=="connecting"
+        cameras=client.get("/api/cameras").json()
+        camera=next(item for item in cameras if item["id"]==result["id"])
+        assert camera["source_type"]=="video" and bool(camera["configured"]) is True
+        assert "video_path" not in camera and "rtsp_url" not in camera
+        worker=main.internal_cameras()
+        assert any(item["id"]==result["id"] and item["video_path"].endswith(".mp4") for item in worker)
+        stored=next(video_dir.glob("*.mp4"))
+        removed=client.delete(f"/api/cameras/{result['id']}?delete_events=true")
+        assert removed.status_code==200
+        assert not stored.exists()
+
+
+def test_uploaded_video_rejects_unsupported_format_and_size(tmp_path, monkeypatch):
+    monkeypatch.setattr(main,"TEST_VIDEO_DIR",tmp_path/"videos")
+    monkeypatch.setattr(main,"TEST_VIDEO_MAX_BYTES",1024)
+    monkeypatch.setattr(main,"sync_go2rtc_cameras",lambda:{"ok":True})
+    with TestClient(main.app) as client:
+        assert client.post("/api/test-videos?filename=not-a-video.txt",content=b"x"*100).status_code==415
+        oversized=client.post("/api/test-videos?filename=oversize.mp4",content=b"x"*2048)
+        assert oversized.status_code==413
+        assert not list((tmp_path/"videos").glob("*"))
+
+
 def test_go2rtc_source_url_appends_operator_transport(monkeypatch):
     monkeypatch.setattr(main, "GO2RTC_RTSP_TRANSPORT", "tcp")
     # go2rtc joins RTSP source options with '#' fragments, never '&'. Using '&'
@@ -177,7 +210,7 @@ def test_camera_schema_migrates_existing_database(tmp_path, monkeypatch):
     columns = {row[1] for row in con.execute("PRAGMA table_info(cameras)")}
     tables = {row[0] for row in con.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     con.close()
-    assert {"telemetry_at", "last_error", "restart_requested_at", "preview_mode"} <= columns
+    assert {"telemetry_at", "last_error", "restart_requested_at", "preview_mode", "source_type", "video_path"} <= columns
     assert "worker_status" in tables
 
 

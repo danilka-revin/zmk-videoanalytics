@@ -415,6 +415,19 @@ def test_ppe_preset_refuses_artifact_without_person_and_helmet_labels(worker_mod
         })
 
 
+def test_uploaded_video_source_opens_locally_without_go2rtc(worker_mod, monkeypatch):
+    paths=[]
+    monkeypatch.setattr(worker_mod.cv2,"VideoCapture",lambda path:(paths.append(path) or _FakeCap()))
+    runtime=worker_mod.Runtime()
+    async def no_report(*args,**kwargs): return None
+    monkeypatch.setattr(runtime,"_report",no_report)
+    config=worker_mod.CameraConfig.from_api({"id":"test_clip","name":"Clip","rtsp_url":"","fps_limit":30,"source_type":"video","video_path":"/test-videos/clip.mp4"})
+    session=worker_mod.CameraSession(config=config)
+    assert asyncio.run(runtime._open(session)) is True
+    assert paths==["/test-videos/clip.mp4"]
+    assert session.using_go2rtc is False
+
+
 def test_auto_transport_starts_with_tcp_then_falls_back_to_udp(worker_mod):
     worker_mod.RTSP_TRANSPORT = "auto"
     worker_mod.TRANSPORT_ORDER = ["tcp", "udp"]

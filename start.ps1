@@ -1,5 +1,5 @@
 # =====================================================================
-# ZMK Vision launcher (Windows).
+# Zovod launcher (Windows).
 #
 # On every start this launcher:
 #   1. Checks for a newer GitHub release.
@@ -57,7 +57,7 @@ function Wait-Http([string]$Url, [int]$Seconds = 120) {
   return $false
 }
 
-Write-Host '[start] Starting ZMK Vision services...'
+Write-Host '[start] Starting Zovod services...'
 docker compose @ComposeProfile config --quiet
 if ($LASTEXITCODE -ne 0) { throw 'docker-compose.yml or .env validation failed' }
 docker compose @ComposeProfile up -d --build --remove-orphans
@@ -65,7 +65,7 @@ if ($LASTEXITCODE -ne 0) { docker compose @ComposeProfile logs --tail=100; throw
 if (-not (Wait-Http 'http://localhost:8000/api/health' 120)) { docker compose logs --tail=100 api; throw 'API health check failed' }
 if (-not (Wait-Http 'http://localhost:5173' 120)) { docker compose logs --tail=100 web; throw 'Web health check failed' }
 
-Write-Host 'ZMK Vision is running.' -ForegroundColor Green
+Write-Host 'Zovod is running.' -ForegroundColor Green
 Write-Host 'Dashboard: http://localhost:5173'
 Write-Host 'API docs:  http://localhost:8000/docs'
 Start-Process 'http://localhost:5173'
