@@ -259,6 +259,13 @@ services:
       UPDATE_ROOT: /workspace
       ZMK_UPDATE_TOKEN: ${ZMK_UPDATE_TOKEN:-}
       ZMK_UPDATE_REPO: ${ZMK_UPDATE_REPO:-danilka-revin/zmk-videoanalytics}
+      # Channel of self-update: every commit/merge of ZMK_UPDATE_BRANCH
+      # (default main) counts as a new version. Releases stay available with
+      # ZMK_UPDATE_CHANNEL=release.
+      ZMK_UPDATE_CHANNEL: ${ZMK_UPDATE_CHANNEL:-commit}
+      ZMK_UPDATE_BRANCH: ${ZMK_UPDATE_BRANCH:-main}
+      # Optional: only needed to raise the anonymous GitHub API quota.
+      ZMK_GITHUB_TOKEN: ${ZMK_GITHUB_TOKEN:-}
       # Вкладка «Логи»: updater зеркалит свой журнал в API тем же токеном.
       ZMK_API_URL: http://api:8000
       ZMK_BOT_API_TOKEN_FILE: /bot-secrets/.api-token

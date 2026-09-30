@@ -33,6 +33,50 @@ ZMK_FINGERPRINT_FILE="${ZMK_FINGERPRINT_FILE:-.zmk-build-fingerprint}"
 
 zmk_note(){ [[ "${ZMK_QUIET:-0}" == "1" ]] || echo "$@"; }
 
+# Record the running build (VERSION + commit) into ./COMMIT and
+# ./data/build-info.json. Commit-based updates make the git commit the
+# identity of a build — every commit or merge of the tracked branch counts as
+# a new version — and the API container (which mounts ./data) reads this file
+# to show the installed version in the panel.
+zmk_record_build_info(){
+  local root="${1:-.}" version commit branch channel
+  version=$(tr -d '[:space:]' < "$root/VERSION" 2>/dev/null || true)
+  commit=""
+  if [[ -f "$root/COMMIT" ]]; then
+    commit=$(tr -d '[:space:]' < "$root/COMMIT" 2>/dev/null || true)
+  fi
+  if [[ ! "$commit" =~ ^[0-9a-fA-F]{40}$ ]] && command -v git >/dev/null 2>&1 && [[ -d "$root/.git" ]]; then
+    commit=$(git -C "$root" rev-parse HEAD 2>/dev/null | tr -d '[:space:]')
+  fi
+  commit="${commit,,}"
+  [[ "$commit" =~ ^[0-9a-f]{40}$ ]] || commit=""
+  branch="${ZMK_UPDATE_BRANCH:-}"
+  if [[ -z "$branch" ]] && command -v git >/dev/null 2>&1 && [[ -d "$root/.git" ]]; then
+    branch=$(git -C "$root" branch --show-current 2>/dev/null | tr -d '[:space:]' || true)
+  fi
+  channel="${ZMK_UPDATE_CHANNEL:-commit}"
+  if [[ -n "$commit" ]]; then
+    printf '%s\n' "$commit" > "$root/COMMIT" 2>/dev/null || true
+  fi
+  # Nothing changed since the last launch: keep installed_at meaningful.
+  if [[ -f "$root/data/build-info.json" && -n "$commit" ]] \
+    && grep -q "\"commit\": \"$commit\"" "$root/data/build-info.json" 2>/dev/null \
+    && grep -q "\"version\": \"$version\"" "$root/data/build-info.json" 2>/dev/null; then
+    return 0
+  fi
+  mkdir -p "$root/data" 2>/dev/null || return 1
+  {
+    printf '{\n'
+    printf ' "version": "%s",\n' "$version"
+    printf ' "commit": "%s",\n' "$commit"
+    printf ' "short": "%s",\n' "${commit:0:7}"
+    printf ' "branch": "%s",\n' "$branch"
+    printf ' "channel": "%s",\n' "$channel"
+    printf ' "installed_at": "%s"\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf '}\n'
+  } > "$root/data/build-info.json" 2>/dev/null
+}
+
 # Run a command with a hard time limit when coreutils `timeout` is available.
 # A docker pull against an unreachable registry is the classic "it hangs
 # forever" case; without this the launcher waits indefinitely and the user

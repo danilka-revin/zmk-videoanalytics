@@ -12,7 +12,7 @@ rem                   opens the dashboard);
 rem   * next runs  -> starts the already-installed stack with one click.
 rem
 rem Use ZMK_NO_AUTO_UPDATE=1 here so a local build/feature branch is never
-rem silently replaced by the latest GitHub release during a demo.
+rem silently replaced by an automatic branch update during a demo.
 rem =====================================================================
 
 set ZMK_NO_AUTO_UPDATE=1

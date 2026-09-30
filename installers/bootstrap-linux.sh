@@ -214,8 +214,8 @@ if [[ "$needs_setup" == true ]]; then
   fi
   [[ "$ZMK_RTSP_URL" =~ ^rtsps?://[^[:space:]]+$ ]] || fail "A non-empty rtsp:// or rtsps:// URL is required"
   info "Installing Docker if necessary, configuring the camera and starting Zovod..."
-  # bootstrap already fetched the requested Git ref. Do not let the release
-  # updater immediately replace a feature branch with the latest main release.
+  # bootstrap already fetched the requested Git ref. Do not let the updater
+  # immediately run a second (identical) branch update on the same start.
   exec env \
     ZMK_NO_AUTO_UPDATE=1 \
     NONINTERACTIVE=1 \
@@ -230,5 +230,6 @@ fi
 
 info "Configuration already exists. Updating source and starting Zovod..."
 # The Git ref above is authoritative for this launcher run (including custom
-# arena/feature refs), so skip the release-only updater in start.sh.
+# arena/feature refs), so skip the auto-updater in start.sh: it follows the
+# branch too, but this launcher already fetched the requested ref.
 exec env ZMK_NO_AUTO_UPDATE=1 bash start.sh

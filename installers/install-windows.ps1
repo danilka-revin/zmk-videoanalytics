@@ -29,6 +29,49 @@ function Wait-Http([string]$Url, [int]$Seconds = 120) {
   return $false
 }
 
+# Record the running build (VERSION + commit) in COMMIT / data\build-info.json.
+# Commit-based updates make the git commit the identity of a build — every
+# commit or merge of the tracked branch counts as a new version — and the API
+# container (which mounts .\data) reads this file for the panel and logs.
+function Write-ZmkBuildInfo([string]$Dir) {
+  if (-not $Dir) { $Dir = (Get-Location).Path }
+  $version = ''
+  if (Test-Path (Join-Path $Dir 'VERSION')) { $version = (Get-Content (Join-Path $Dir 'VERSION') -Raw).Trim() }
+  $commit = ''
+  if (Test-Path (Join-Path $Dir 'COMMIT')) { $commit = (Get-Content (Join-Path $Dir 'COMMIT') -Raw).Trim() }
+  $git = Get-Command git -ErrorAction SilentlyContinue
+  if ((-not ($commit -match '^[0-9a-fA-F]{40}$')) -and $git -and (Test-Path (Join-Path $Dir '.git'))) {
+    try { $commit = (& git -C $Dir rev-parse HEAD 2>$null | Select-Object -First 1).Trim() } catch { }
+  }
+  if (-not ($commit -match '^[0-9a-fA-F]{40}$')) { $commit = '' } else { $commit = $commit.ToLowerInvariant() }
+  $branch = if ($env:ZMK_UPDATE_BRANCH) { $env:ZMK_UPDATE_BRANCH } else { '' }
+  if (-not $branch -and $git -and (Test-Path (Join-Path $Dir '.git'))) {
+    try { $branch = (& git -C $Dir branch --show-current 2>$null | Select-Object -First 1).Trim() } catch { }
+  }
+  $channel = if ($env:ZMK_UPDATE_CHANNEL) { $env:ZMK_UPDATE_CHANNEL } else { 'commit' }
+  $short = if ($commit) { $commit.Substring(0, 7) } else { '' }
+  if ($commit) { Set-Content -Path (Join-Path $Dir 'COMMIT') -Value $commit }
+  $dataDir = Join-Path $Dir 'data'
+  New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
+  # Nothing changed since the last launch: keep installed_at meaningful.
+  $infoPath = Join-Path $dataDir 'build-info.json'
+  if (Test-Path $infoPath) {
+    try {
+      $existing = Get-Content $infoPath -Raw | ConvertFrom-Json
+      if ($existing.commit -eq $commit -and $existing.version -eq $version) { return }
+    } catch { }
+  }
+  $info = [ordered]@{
+    version      = $version
+    commit       = $commit
+    short        = $short
+    branch       = $branch
+    channel      = $channel
+    installed_at = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+  }
+  ($info | ConvertTo-Json) + "`n" | Set-Content -Path $infoPath -Encoding UTF8
+}
+
 Write-Host "`n=== Zovod installer for Windows 10/11 ===" -ForegroundColor Green
 Assert-ProjectFiles
 if ($CheckOnly) {
@@ -154,6 +197,7 @@ if ($runtimes -match 'nvidia') {
 
 docker compose @ComposeProfile config --quiet
 if ($LASTEXITCODE -ne 0) { throw "docker-compose.yml or .env validation failed" }
+Write-ZmkBuildInfo $Root
 docker compose @ComposeProfile up -d --build --remove-orphans
 if ($LASTEXITCODE -ne 0) { docker compose @ComposeProfile logs --tail=100; throw "docker compose failed" }
 if (-not (Wait-Http "http://localhost:8000/api/health" 120)) { docker compose @ComposeProfile logs --tail=100 api; throw "API health check failed" }

@@ -2,7 +2,8 @@
 # =====================================================================
 # Zovod — create an Ubuntu desktop/menu shortcut.
 #
-# The shortcut runs start.sh, which checks GitHub for the newest release,
+# The shortcut runs start.sh, which checks GitHub for the newest commit of the
+# tracked branch (any commit or merge is a new version),
 # applies a verified update when available, and then starts/recreates the
 # Docker Compose services. Runtime data and Docker volumes are preserved.
 #

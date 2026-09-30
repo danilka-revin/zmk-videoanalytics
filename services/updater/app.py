@@ -2,14 +2,25 @@
 
 This service runs inside the Docker network with the host project root
 bind-mounted at UPDATE_ROOT (default /workspace) and the Docker socket at
-/var/run/docker.sock. It performs real, verifiable updates: it fetches the
-latest release, verifies the SHA256 checksum, swaps the new files into the
-host project directory (preserving .env, ./data, databases and the saved
-Compose profiles) and then redeploys the application containers so the new
-code actually runs.
+/var/run/docker.sock. It performs real, verifiable updates and then redeploys
+the application containers so the new code actually runs.
 
-The Web panel reaches this service through the backend, which proxies
-GET /api/update/status and POST /api/update/apply here.
+Two channels are supported (``ZMK_UPDATE_CHANNEL``):
+
+``commit`` (default)
+    Every commit — including a merge of any branch — is a new version,
+    exactly like the desktop updater of ``danilka-revin/linux_pcb_app``: the
+    head commit of ``ZMK_UPDATE_BRANCH`` (default ``main``) is compared with
+    the installed commit (``COMMIT`` file / git HEAD) and its source archive
+    is swapped in. The download is pinned to the commit that was checked.
+
+``release`` (legacy)
+    Follow GitHub Releases, verify the published SHA256 checksum of the
+    archive and swap it in.
+
+Both channels preserve .env, ./data, databases and the saved Compose
+profiles. The Web panel reaches this service through the backend, which
+proxies GET /api/update/status and POST /api/update/apply here.
 """
 from __future__ import annotations
 
@@ -26,7 +37,7 @@ from pathlib import Path
 from typing import Any
 
 import httpx
-from core import UpdateError, apply_update, current_version, plan_update
+from core import UpdateError, apply_update, local_state, plan_update, record_local_build
 from fastapi import FastAPI, Header, HTTPException
 from pydantic import BaseModel
 
@@ -35,6 +46,22 @@ REPO = os.getenv("ZMK_UPDATE_REPO", "danilka-revin/zmk-videoanalytics")
 TOKEN = os.getenv("ZMK_UPDATE_TOKEN", "").strip()
 API_URL = os.getenv("ZMK_UPDATE_API", "") or None
 DL_BASE = os.getenv("ZMK_UPDATE_DL_BASE", "") or None
+
+# --- Commit channel (default) ------------------------------------------------
+# Any commit or merge pushed to BRANCH counts as a new version of the program.
+BRANCH = os.getenv("ZMK_UPDATE_BRANCH", "main").strip() or "main"
+CHANNEL = os.getenv("ZMK_UPDATE_CHANNEL", "commit").strip() or "commit"
+# Optional endpoints: mirrors and tests point these at a local server, and a
+# GitHub token raises the anonymous API quota (60 requests/hour) if needed.
+COMMITS_API = os.getenv("ZMK_UPDATE_COMMITS_API", "") or None
+COMPARE_API = os.getenv("ZMK_UPDATE_COMPARE_API", "") or None
+CODELOAD = os.getenv("ZMK_UPDATE_CODELOAD", "") or None
+RAW_BASE = os.getenv("ZMK_UPDATE_RAW_BASE", "") or None
+CONTENTS_API = os.getenv("ZMK_UPDATE_CONTENTS_API", "") or None
+GITHUB_TOKEN = os.getenv("ZMK_GITHUB_TOKEN", "").strip() or None
+# `git ls-remote` avoids the anonymous API quota, but a locked-down network may
+# forbid git; ZMK_UPDATE_NO_GIT=1 falls back to the REST API only.
+USE_GIT = os.getenv("ZMK_UPDATE_NO_GIT", "0").strip() != "1"
 
 # --- Зеркалирование журнала в API (вкладка «Логи») ---------------------------
 # Полный журнал остаётся в `docker compose logs updater`, но ход обновления
@@ -106,7 +133,13 @@ async def lifespan(app: FastAPI):
     if not any(isinstance(item, _ProjectLogHandler) for item in root.handlers):
         root.addHandler(handler)
     ship_task = asyncio.create_task(log_ship_worker()) if ZMK_API_URL else None
-    ship_log(f"updater запущен (root={ROOT}, repo={REPO}, current={current_version(ROOT)})")
+    # A plain `git pull && docker compose up -d --build` must not leave the
+    # panel showing an older commit: record the tree that is really mounted.
+    record_local_build(ROOT, branch=BRANCH, channel=CHANNEL)
+    ship_log(
+        "updater запущен "
+        f"(root={ROOT}, repo={REPO}, channel={CHANNEL}, branch={BRANCH}, current={local_state(ROOT)['display']})"
+    )
     try:
         yield
     finally:
@@ -130,15 +163,44 @@ class ApplyResponse(BaseModel):
     result: dict[str, Any] | None = None
 
 
+def _update_kwargs(*, apply: bool = False) -> dict[str, Any]:
+    """Settings shared by the status check and the update itself.
+
+    ``contents_api`` is only used when applying an update: it pins the
+    downloaded tree to the commit that was checked.
+    """
+    kwargs: dict[str, Any] = {
+        "channel": CHANNEL,
+        "repo": REPO,
+        "branch": BRANCH,
+        "api_url": API_URL,
+        "dl_base": DL_BASE,
+        "commits_api": COMMITS_API,
+        "compare_api": COMPARE_API,
+        "codeload": CODELOAD,
+        "raw_base": RAW_BASE,
+        "token": GITHUB_TOKEN,
+        "use_git": USE_GIT,
+        # Per-request budget for the head-commit lookup (git ls-remote, the
+        # REST API, the raw VERSION file, the compare API). The panel proxies
+        # /status with a 30 s timeout, so the check always answers in time.
+        "timeout": 6.0,
+    }
+    if apply:
+        kwargs["contents_api"] = CONTENTS_API
+    return kwargs
+
+
 @app.get("/health")
 def health() -> dict[str, Any]:
-    return {"status": "ok", "root": str(ROOT), "current": current_version(ROOT)}
+    state = local_state(ROOT)
+    return {"status": "ok", "root": str(ROOT), "current": state["display"], "version": state["version"], "commit": state["commit"]}
 
 
 @app.get("/status")
 def status(x_update_token: str | None = Header(default=None)) -> dict[str, Any]:
     _require_token(x_update_token)
-    data = plan_update(ROOT, repo=REPO, api_url=API_URL, dl_base=DL_BASE)
+    data = plan_update(ROOT, **_update_kwargs())
     data["root"] = str(ROOT)
     return data
 
@@ -146,16 +208,19 @@ def status(x_update_token: str | None = Header(default=None)) -> dict[str, Any]:
 @app.post("/apply", response_model=ApplyResponse)
 def apply(x_update_token: str | None = Header(default=None)) -> dict[str, Any]:
     _require_token(x_update_token)
-    ship_log("update requested from the web panel")
+    ship_log(f"update requested from the web panel (channel={CHANNEL}, branch={BRANCH})")
     try:
-        result = apply_update(ROOT, repo=REPO, api_url=API_URL, dl_base=DL_BASE)
+        result = apply_update(ROOT, **_update_kwargs(apply=True))
     except UpdateError as exc:
         ship_log(f"update failed: {exc}", "ERROR")
         raise HTTPException(400, str(exc)) from exc
     if result.get("applied"):
         # Kick a detached redeploy so the running stack picks up the new code.
         _start_redploy()
-        ship_log(f"update applied: {result.get('current')} -> {result.get('latest')}, redeploy started")
+        ship_log(
+            f"update applied: {result.get('current')} -> {result.get('latest')} "
+            f"(commit {str(result.get('commit') or '')[:7]}), redeploy started"
+        )
         return ApplyResponse(status="updated", message="Обновление применено, сервисы перезапускаются.", result=result)
     ship_log(f"update skipped: already on {result.get('latest') or result.get('current')}")
     return ApplyResponse(status="up_to_date", message="Уже установлена последняя версия.", result=result)
