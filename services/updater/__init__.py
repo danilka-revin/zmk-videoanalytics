@@ -1,1 +1,1 @@
-"""ZMK Vision updater sidecar package."""
+"""Zovod updater sidecar package."""

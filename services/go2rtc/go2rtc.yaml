@@ -1,4 +1,4 @@
-# ZMK Vision go2rtc v2.18.0 — REAL STREAM ONLY, TRUE 25-60 FPS
+# Zovod go2rtc v2.18.0 — REAL STREAM ONLY, TRUE 25-60 FPS
 #
 # Architecture v2.18.0 (codec-agnostic browser preview):
 # - go2rtc is the ONLY RTSP client to camera (single connection, like VLC)

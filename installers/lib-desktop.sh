@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# ZMK Vision — desktop session helpers (Wayland / X11).
+# Zovod — desktop session helpers (Wayland / X11).
 #
 # Sourced by start.sh and installers/install-linux.sh.
 #

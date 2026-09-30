@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# ZMK Vision — ONE-CLICK START (Linux).
+# Zovod — ONE-CLICK START (Linux).
 #
 #   bash install.sh      # первый запуск: мастер настройки + запуск
 #                        # повторный запуск: просто запуск

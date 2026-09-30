@@ -1,5 +1,5 @@
 # =====================================================================
-# ZMK Vision auto-updater (Windows).
+# Zovod auto-updater (Windows).
 #
 # Normal mode:
 #   & installers\auto-update.ps1 -Relaunch install-windows.ps1

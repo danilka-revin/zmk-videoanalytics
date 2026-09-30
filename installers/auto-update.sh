@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# ZMK Vision auto-updater (Linux).
+# Zovod auto-updater (Linux).
 #
 # Usage:
 #   bash installers/auto-update.sh <relaunch-script>            # normal

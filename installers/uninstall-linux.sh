@@ -12,4 +12,4 @@ if [[ "${1:-}" == "--purge" ]]; then
     rm -rf data
   fi
 fi
-echo "ZMK Vision services stopped. Data preserved unless --purge was confirmed."
+echo "Zovod services stopped. Data preserved unless --purge was confirmed."

@@ -1,4 +1,4 @@
-# Регистрация модели в ZMK Vision
+# Регистрация модели в Zovod
 
 Гайд основан на фактической логике `POST /api/models/upload`, `POST /api/models`, `POST /api/models/{name}/activate`, `GET /api/internal/active-model` и кода inference-воркера.
 

@@ -1,4 +1,4 @@
-"""Core of the ZMK Vision self-update logic (pure, testable).
+"""Core of the Zovod self-update logic (pure, testable).
 
 This module contains no network wiring: it is driven by the FastAPI app
 in app.py and can be unit-tested directly with a local mirror. It mirrors

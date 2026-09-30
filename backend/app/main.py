@@ -164,6 +164,10 @@ GO2RTC_USE_FOR_INFERENCE = os.getenv("GO2RTC_USE_FOR_INFERENCE", "true").strip()
 GO2RTC_WEBRTC_VP8 = os.getenv("GO2RTC_WEBRTC_VP8", "true").strip().lower() not in {"0", "false", "no", "off"}
 TRAINING_WORKER_URL = os.getenv("TRAINING_WORKER_URL", "").rstrip("/")
 DATASET_DIR = Path(os.getenv("DATASET_DIR", "")) if os.getenv("DATASET_DIR") else (DB_PATH.parent / "datasets")
+TEST_VIDEO_DIR = Path(os.getenv("TEST_VIDEO_DIR", "/test-videos"))
+try: TEST_VIDEO_MAX_BYTES=max(10_000_000,min(2_000_000_000,int(os.getenv("TEST_VIDEO_MAX_BYTES","500_000_000"))))
+except ValueError: TEST_VIDEO_MAX_BYTES=500_000_000
+TEST_VIDEO_EXTENSIONS={".mp4",".mov",".mkv",".avi",".webm",".m4v"}
 MODEL_DIR = Path(os.getenv("MODEL_DIR", "")) if os.getenv("MODEL_DIR") else (DB_PATH.parent / "models")
 # Uploads are streamed to the shared model volume instead of being accumulated
 # in API memory. Keep an explicit, operator-configurable ceiling because model
@@ -724,10 +728,10 @@ def _send_recovery_email(address: str, code: str) -> None:
     if not _smtp_ready():
         raise RuntimeError("SMTP не настроен")
     message=EmailMessage()
-    message["Subject"]="ZMK Vision — код восстановления пароля"
+    message["Subject"]="Zovod — код восстановления пароля"
     message["From"]=SMTP_FROM
     message["To"]=address
-    message.set_content(f"Код восстановления ZMK Vision: {code}\n\nОн действует {AUTH_RECOVERY_MINUTES} минут. Если вы не запрашивали восстановление, проигнорируйте это письмо.")
+    message.set_content(f"Код восстановления Zovod: {code}\n\nОн действует {AUTH_RECOVERY_MINUTES} минут. Если вы не запрашивали восстановление, проигнорируйте это письмо.")
     if SMTP_USE_SSL:
         client=smtplib.SMTP_SSL(SMTP_HOST,SMTP_PORT,timeout=20,context=ssl.create_default_context())
     else:
@@ -785,7 +789,7 @@ def init_db():
     CREATE TABLE IF NOT EXISTS auth_recovery_codes(id TEXT PRIMARY KEY, email TEXT NOT NULL, code_hash TEXT NOT NULL, created_at TEXT NOT NULL, expires_at TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, used_at TEXT NOT NULL DEFAULT '');
     """)
     camera_columns={r[1] for r in con.execute("PRAGMA table_info(cameras)").fetchall()}
-    for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''","telemetry_at":"TEXT NOT NULL DEFAULT ''","last_error":"TEXT NOT NULL DEFAULT ''","restart_requested_at":"TEXT NOT NULL DEFAULT ''","preview_mode":"TEXT NOT NULL DEFAULT 'auto'","preview_resolution":"TEXT NOT NULL DEFAULT 'source'","preview_fps":"TEXT NOT NULL DEFAULT 'source'","preview_content_hint":"TEXT NOT NULL DEFAULT 'motion'"}.items():
+    for column,ddl in {"description":"TEXT NOT NULL DEFAULT ''","fps_limit":"REAL NOT NULL DEFAULT 8","created_at":"TEXT NOT NULL DEFAULT ''","telemetry_at":"TEXT NOT NULL DEFAULT ''","last_error":"TEXT NOT NULL DEFAULT ''","restart_requested_at":"TEXT NOT NULL DEFAULT ''","preview_mode":"TEXT NOT NULL DEFAULT 'auto'","preview_resolution":"TEXT NOT NULL DEFAULT 'source'","preview_fps":"TEXT NOT NULL DEFAULT 'source'","preview_content_hint":"TEXT NOT NULL DEFAULT 'motion'","source_type":"TEXT NOT NULL DEFAULT 'rtsp'","video_path":"TEXT NOT NULL DEFAULT ''"}.items():
         if column not in camera_columns: con.execute(f"ALTER TABLE cameras ADD COLUMN {column} {ddl}")
     con.execute("UPDATE cameras SET created_at=updated_at WHERE created_at='' OR created_at IS NULL")
     # A live MJPEG browser stream has a deliberate upper bound: keep stored
@@ -847,7 +851,7 @@ def init_db():
         # The panel ships with ready-to-use local accounts (admin / директор), so
         # a first login is not blocked by a forced password change any more. The
         # gate itself is still enforced for databases that have the flag set.
-        "active_model":"", "active_model_slots":"{}", "active_model_disabled":"false", "ppe_trial_previous_model":"", "model_test_mode":"false", "auth_email":"", "auth_password_must_change":str(False).lower(), "site_name":"ZMK Vision", "timezone":"Asia/Krasnoyarsk", "language":"ru",
+        "active_model":"", "active_model_slots":"{}", "active_model_disabled":"false", "ppe_trial_previous_model":"", "model_test_mode":"false", "auth_email":"", "auth_password_must_change":str(False).lower(), "site_name":"Zovod", "timezone":"Asia/Krasnoyarsk", "language":"ru",
         "retention_days":"90", "archive_quality":"90", "archive_clip_seconds":"10",
         "inference_fps":"8", "inference_device":"cuda:0", "batch_size":"4", "nms_iou":"0.45", "model_test_conf":str(MODEL_TEST_CONF_DEFAULT),
         "helmet_conf":"0.85", "vest_conf":"0.80", "phone_conf":"0.78", "smoking_conf":"0.80", "restricted_zone_conf":"0.82", "immobility_conf":"0.80", "min_model_precision":"90", "min_model_recall":"85",
@@ -868,6 +872,8 @@ def init_db():
         "rtsp_reconnect_seconds":"5", "event_cooldown_seconds":"30"
     }
     for key,value in config_defaults.items(): con.execute("INSERT OR IGNORE INTO settings VALUES(?,?)",(key,value))
+    # Rebrand the legacy default while preserving any site name customized by an operator.
+    con.execute("UPDATE settings SET value='Zovod' WHERE key='site_name' AND value IN ('ZMK Vision','ZMK VISION')")
     _initialize_or_upgrade_auth_password(con)
     con.execute("DELETE FROM auth_sessions WHERE expires_at<=?",(now_iso(),))
     con.execute("DELETE FROM auth_recovery_codes WHERE expires_at<=? OR used_at!=''",(now_iso(),))
@@ -1011,7 +1017,7 @@ async def lifespan(app: FastAPI):
             pending.append(sync_task)
         if pending: await asyncio.gather(*pending,return_exceptions=True)
 
-app=FastAPI(title="ZMK Vision API",version=APP_VERSION,description="On-premise API контура видеоаналитики",lifespan=lifespan)
+app=FastAPI(title="Zovod API",version=APP_VERSION,description="On-premise API контура видеоаналитики",lifespan=lifespan)
 app.add_middleware(CORSMiddleware,allow_origins=[x.strip() for x in os.getenv("CORS_ORIGINS","http://localhost:5173").split(",") if x.strip()],allow_credentials=False,allow_methods=["GET","POST","PUT","PATCH","DELETE"],allow_headers=["Content-Type","X-API-Key","X-Telegram-Init-Data"])
 
 def custom_openapi():
@@ -1110,6 +1116,7 @@ async def security_middleware(request: Request, call_next):
     # The handlers enforce the same ceiling again while reading chunks, which
     # also covers clients using chunked transfer without Content-Length.
     if path=="/api/models/upload" and request.method=="POST": cap=MODEL_UPLOAD_MAX_BYTES
+    elif path=="/api/test-videos" and request.method=="POST": cap=TEST_VIDEO_MAX_BYTES
     elif path.startswith("/api/datasets") and request.method=="POST": cap=512_000_000
     else: cap=2_000_000
     try: too_large=bool(length and int(length)>cap)
@@ -2268,7 +2275,7 @@ def overview_analytics_csv(hours:int=Query(24,ge=1,le=2160),bucket:Literal["auto
     return StreamingResponse(iter([out.getvalue()]),media_type="text/csv",headers={"Content-Disposition":f"attachment; filename=zmk-analytics-{hours}h.csv"})
 
 @app.get("/api/internal/cameras")
-def internal_cameras(): return rows("SELECT id,name,rtsp_url,fps_limit,enabled,restart_requested_at FROM cameras WHERE enabled=1 AND rtsp_url!='' ORDER BY id")
+def internal_cameras(): return rows("SELECT id,name,rtsp_url,fps_limit,enabled,restart_requested_at,source_type,video_path FROM cameras WHERE enabled=1 AND (rtsp_url!='' OR video_path!='') ORDER BY id")
 
 @app.post("/api/internal/inference/heartbeat",status_code=204)
 def inference_heartbeat(payload:InferenceHeartbeat):
@@ -2369,14 +2376,62 @@ def camera_with_snapshot(row:dict|sqlite3.Row) -> dict:
         data["status"]="offline"; data["fps"]=0
     return data
 
+@app.post("/api/test-videos",status_code=201)
+async def upload_test_video(request:Request,filename:str=Query(...,min_length=1,max_length=255)):
+    """Create a temporary camera-like source from an uploaded video clip.
+
+    The request body is streamed to a shared volume (never buffered in RAM),
+    then the inference worker decodes it through the same frame pipeline used
+    for RTSP cameras. The original upload name is only used for a display label.
+    """
+    safe_name=Path(filename.replace("\\","/")).name
+    extension=Path(safe_name).suffix.lower()
+    if extension not in TEST_VIDEO_EXTENSIONS:
+        raise HTTPException(415,"Поддерживаются видео MP4, MOV, MKV, AVI, WebM и M4V")
+    TEST_VIDEO_DIR.mkdir(parents=True,exist_ok=True)
+    camera_id=f"test_{uuid.uuid4().hex[:12]}"
+    target=(TEST_VIDEO_DIR/f"{camera_id}{extension}").resolve()
+    temp=target.with_suffix(target.suffix+".uploading")
+    total=0
+    try:
+        with temp.open("wb") as stream:
+            async for chunk in request.stream():
+                if not chunk: continue
+                total+=len(chunk)
+                if total>TEST_VIDEO_MAX_BYTES:
+                    raise HTTPException(413,f"Видео превышает лимит {TEST_VIDEO_MAX_BYTES//1_000_000} МБ")
+                stream.write(chunk)
+        if total<64:
+            raise HTTPException(400,"Видеофайл пустой или слишком мал")
+        temp.replace(target)
+        timestamp=now_iso()
+        title=Path(safe_name).stem.strip()[:72] or "Видео"
+        name=(f"Тест · {title}")[:80]
+        con=db()
+        con.execute("INSERT INTO cameras(id,name,zone,description,rtsp_url,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,restart_requested_at,source_type,video_path) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",(camera_id,name,"Тест по видео","Временный источник: загруженный видеоролик", "",30,"connecting",0,0,1,timestamp,timestamp,timestamp,"video",str(target)))
+        con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(timestamp,"INFO","camera_manager",f"Uploaded test video accepted ({total} bytes)",camera_id))
+        con.commit(); con.close()
+    except HTTPException:
+        temp.unlink(missing_ok=True); target.unlink(missing_ok=True)
+        raise
+    except OSError as exc:
+        temp.unlink(missing_ok=True); target.unlink(missing_ok=True)
+        raise HTTPException(500,"Не удалось сохранить видео для проверки") from exc
+    except Exception:
+        temp.unlink(missing_ok=True); target.unlink(missing_ok=True)
+        raise
+    sync_go2rtc_cameras()
+    return {"id":camera_id,"name":name,"zone":"Тест по видео","description":"Временный источник: загруженный видеоролик","source_type":"video","enabled":True,"configured":True,"status":"connecting","size_bytes":total}
+
+
 @app.get("/api/cameras")
 def cameras():
-    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,last_error,restart_requested_at,preview_mode,preview_resolution,preview_fps,preview_content_hint,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras ORDER BY created_at,id")
+    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,last_error,restart_requested_at,preview_mode,preview_resolution,preview_fps,preview_content_hint,source_type,CASE WHEN rtsp_url!='' OR video_path!='' THEN 1 ELSE 0 END AS configured FROM cameras ORDER BY created_at,id")
     return [camera_with_snapshot(r) for r in data]
 
 @app.get("/api/cameras/{camera_id}")
 def camera_detail(camera_id:str):
-    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,last_error,restart_requested_at,preview_mode,preview_resolution,preview_fps,preview_content_hint,CASE WHEN rtsp_url='' THEN 0 ELSE 1 END AS configured FROM cameras WHERE id=?",(camera_id,))
+    data=rows("SELECT id,name,zone,description,fps_limit,status,fps,latency_ms,enabled,created_at,updated_at,telemetry_at,last_error,restart_requested_at,preview_mode,preview_resolution,preview_fps,preview_content_hint,source_type,CASE WHEN rtsp_url!='' OR video_path!='' THEN 1 ELSE 0 END AS configured FROM cameras WHERE id=?",(camera_id,))
     if not data: raise HTTPException(404,"Камера не найдена")
     return camera_with_snapshot(data[0])
 
@@ -2421,7 +2476,7 @@ def update_camera(camera_id:str,payload:CameraUpdate):
 
 @app.delete("/api/cameras/{camera_id}")
 def delete_camera(camera_id:str,delete_events:bool=False):
-    con=db(); camera=con.execute("SELECT name FROM cameras WHERE id=?",(camera_id,)).fetchone()
+    con=db(); camera=con.execute("SELECT name,source_type,video_path FROM cameras WHERE id=?",(camera_id,)).fetchone()
     if not camera: con.close(); raise HTTPException(404,"Камера не найдена")
     event_rows=con.execute("SELECT id FROM events WHERE camera_id=?",(camera_id,)).fetchall()
     event_ids=[int(row[0]) for row in event_rows]
@@ -2430,6 +2485,11 @@ def delete_camera(camera_id:str,delete_events:bool=False):
     con.execute("BEGIN IMMEDIATE")
     if delete_events: con.execute("DELETE FROM events WHERE camera_id=?",(camera_id,))
     con.execute("DELETE FROM cameras WHERE id=?",(camera_id,)); con.execute("INSERT INTO logs(timestamp,level,service,message,camera_id) VALUES(?,?,?,?,?)",(now_iso(),"WARNING","camera_manager",f"Camera deleted: {camera[0]}",camera_id)); con.commit(); con.close()
+    if camera[1]=="video" and camera[2]:
+        try:
+            candidate=Path(camera[2]).resolve()
+            if candidate.parent==TEST_VIDEO_DIR.resolve(): candidate.unlink(missing_ok=True)
+        except OSError: pass
     snapshot=snapshot_path_for(camera_id); snapshot.unlink(missing_ok=True); clear_live_frame(camera_id)
     if delete_events: remove_event_frames(event_ids)
     sync_go2rtc_cameras()
@@ -2666,7 +2726,7 @@ def diagnostics():
 @app.get("/api/events")
 def events(limit:int=Query(50,ge=1,le=500),severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None):
     ack=int(acknowledged) if acknowledged is not None else None
-    data=rows("""SELECT e.*,c.name camera_name,c.zone FROM events e JOIN cameras c ON c.id=e.camera_id
+    data=rows("""SELECT e.*,c.name camera_name,c.zone,c.source_type source_type FROM events e JOIN cameras c ON c.id=e.camera_id
         WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?) AND (? IS NULL OR e.review_status=?)
         ORDER BY e.timestamp DESC LIMIT ?""",(severity,severity,event_type,event_type,ack,ack,review_status,review_status,limit))
     for item in data: item["has_frame"]=event_frame_path_for(int(item["id"])).is_file()
@@ -2841,9 +2901,10 @@ def ingest_detections(payload:DetectionBatch):
     cooldown_row=con.execute("SELECT value FROM settings WHERE key='event_cooldown_seconds'").fetchone()
     try: cooldown=max(0,int(float(cooldown_row[0]))) if cooldown_row else 30
     except ValueError: cooldown=30
-    accepted=[]; rejected=[]
+    accepted=[]; rejected=[]; test_video_source=False
     for i,d in enumerate(payload.detections):
-        cam=con.execute("SELECT status,enabled,telemetry_at FROM cameras WHERE id=?",(d.camera_id,)).fetchone()
+        cam=con.execute("SELECT status,enabled,telemetry_at,source_type FROM cameras WHERE id=?",(d.camera_id,)).fetchone()
+        if cam and cam[3]=="video": test_video_source=True
         cam_age=telemetry_age_seconds(cam[2]) if cam else None
         reason=None; normalized_timestamp=now_iso()
         if d.detection_id:
@@ -2871,7 +2932,8 @@ def ingest_detections(payload:DetectionBatch):
         accepted.append({"index":i,"event_id":cur.lastrowid})
     con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","inference_gateway",f"batch models={','.join(sorted(active_models)) or 'none'} accepted={len(accepted)} rejected={len(rejected)}"))
     webhook={r[0]:r[1] for r in con.execute("SELECT key,value FROM settings WHERE key IN ('webhook_enabled','webhook_url','webhook_timeout')").fetchall()}; con.commit(); con.close()
-    if accepted and webhook.get('webhook_enabled')=='true' and webhook.get('webhook_url'):
+    # Test clips must never trigger outbound production webhooks.
+    if accepted and not test_video_source and webhook.get('webhook_enabled')=='true' and webhook.get('webhook_url'):
         try: httpx.post(webhook['webhook_url'],json={"source":"zmk-vision","model":active or None,"models":sorted(active_models),"events":accepted,"timestamp":now_iso()},timeout=float(webhook.get('webhook_timeout','5'))).raise_for_status()
         except httpx.HTTPError as exc:
             logcon=db(); logcon.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"ERROR","integration",f"Webhook delivery failed: {str(exc)[:300]}")); logcon.commit(); logcon.close()
@@ -2987,7 +3049,7 @@ def request_bot_test_alert(provider: Literal["telegram","max"]):
         settings=_bot_settings_map(con)
         if settings.get(f"{provider}_bot_enabled")!="true":
             raise HTTPException(409,"Сначала включите бота и сохраните настройки")
-        cur=con.execute("INSERT INTO bot_commands(provider,action,payload,status,created_at) VALUES(?,?,?,?,?)",(provider,"test_alert",json.dumps({"text":"Тестовое сообщение из Admin панели ZMK Vision"},ensure_ascii=False),"pending",now_iso()))
+        cur=con.execute("INSERT INTO bot_commands(provider,action,payload,status,created_at) VALUES(?,?,?,?,?)",(provider,"test_alert",json.dumps({"text":"Тестовое сообщение из Admin панели Zovod"},ensure_ascii=False),"pending",now_iso()))
         con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","bot_admin",f"{provider} test alert queued: command={cur.lastrowid}"))
         con.commit()
         return {"id":cur.lastrowid,"provider":provider,"status":"pending","message":"Тест поставлен в очередь бота"}
@@ -4101,7 +4163,7 @@ def support_bundle(hours:int=Query(24,ge=1,le=720)):
         bundle.writestr("camera-status.json",json.dumps({"generated_at":now_iso(),"worker":health.get("worker"),"cameras":camera_state},ensure_ascii=False,indent=2).encode())
         bundle.writestr("analytics.json",json.dumps(analytics,ensure_ascii=False,indent=2).encode())
         bundle.writestr("error-summary.json",json.dumps({"period_hours":hours,"generated_at":errors.get("generated_at"),"summary":errors.get("summary",{}),"count":len(errors.get("items",[]))},ensure_ascii=False,indent=2).encode())
-        bundle.writestr("README.txt",("ZMK Vision — пакет диагностики\n\n"
+        bundle.writestr("README.txt",("Zovod — пакет диагностики\n\n"
             "Внутри: состояние ресурсов, безопасное состояние камер, аналитика и сводка ошибок.\n"
             "Пакет не содержит RTSP URL, пароли, API-ключи, токены ботов, email и тексты журналов.\n"
             f"Период аналитики: {hours} ч. Сформировано: {now_iso()}.\n").encode())
@@ -4415,9 +4477,9 @@ def _event_report_html(records:list[dict[str,Any]]) -> str:
         rows_html.append("<tr>"+"".join(cells)+"</tr>")
     headers="".join(f"<th>{html_escape(field)}</th>" for field in _EVENT_REPORT_FIELDS)
     evidence=sum(1 for record in records if record.get("Файл кадра") not in {"", "—"})
-    return f"""<!doctype html><html lang="ru"><meta charset="utf-8"><title>ZMK Vision — журнал нарушений</title>
+    return f"""<!doctype html><html lang="ru"><meta charset="utf-8"><title>Zovod — журнал нарушений</title>
 <style>body{{font:13px/1.4 Arial,sans-serif;color:#17211d;margin:24px}}h1{{margin:0 0 4px}}p{{color:#526158}}.summary{{display:flex;gap:12px;margin:18px 0}}.summary span{{padding:8px 10px;border:1px solid #d9e5dd;border-radius:8px;background:#f4faf6}}table{{width:100%;border-collapse:collapse;font-size:11px}}th{{position:sticky;top:0;background:#193426;color:#f4ffef}}th,td{{border:1px solid #dce6df;padding:6px;text-align:left;vertical-align:top}}tr:nth-child(even){{background:#f7faf8}}img{{display:block;max-width:180px;max-height:112px;border-radius:4px;background:#16231d}}td small{{display:block;margin-top:3px;color:#66756d}}@media print{{body{{margin:8px}}th{{position:static}}}}</style>
-<h1>ZMK Vision — журнал нарушений</h1><p>Сформировано: {html_escape(now_iso())}. В архиве сохранены доступные кадры нарушений.</p>
+<h1>Zovod — журнал нарушений</h1><p>Сформировано: {html_escape(now_iso())}. В архиве сохранены доступные кадры нарушений.</p>
 <div class="summary"><span>Событий: <b>{len(records)}</b></span><span>Кадров: <b>{evidence}</b></span></div>
 <table><thead><tr>{headers}</tr></thead><tbody>{''.join(rows_html) or '<tr><td colspan="18">Событий по выбранному фильтру нет.</td></tr>'}</tbody></table></html>"""
 
@@ -4450,7 +4512,7 @@ def report_zip(severity:str|None=None,event_type:str|None=None,acknowledged:bool
             if frame.is_file():
                 bundle.write(frame,filename)
                 frame_count+=1
-        bundle.writestr("README.txt",("ZMK Vision — экспорт журнала нарушений\n\n"
+        bundle.writestr("README.txt",("Zovod — экспорт журнала нарушений\n\n"
             "events_ru.csv — таблица с русскими названиями столбцов для Excel.\n"
             "report.html — наглядный отчёт с кадрами нарушений.\n"
             "frames/ — JPEG-кадры, доступные на момент экспорта.\n"

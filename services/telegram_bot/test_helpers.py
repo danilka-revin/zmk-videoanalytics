@@ -23,10 +23,10 @@ def test_local_bot_menu_omits_invalid_http_mini_app_button():
     try:
         bot_main.WEBAPP_URL='http://localhost:5173/telegram'
         labels=[button.text for row in bot_main.menu(100).inline_keyboard for button in row]
-        assert '📊 Открыть ZMK Mini App' not in labels
+        assert '📊 Открыть Zovod Mini App' not in labels
         bot_main.WEBAPP_URL='https://vision.example.test/telegram'
         labels=[button.text for row in bot_main.menu(100).inline_keyboard for button in row]
-        assert '📊 Открыть ZMK Mini App' in labels
+        assert '📊 Открыть Zovod Mini App' in labels
     finally:
         bot_main.WEBAPP_URL=previous
 

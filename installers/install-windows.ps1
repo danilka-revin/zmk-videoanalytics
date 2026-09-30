@@ -2,7 +2,7 @@
 param([switch]$CheckOnly, [switch]$NonInteractive)
 $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
-$Host.UI.RawUI.WindowTitle = "ZMK Vision Installer"
+$Host.UI.RawUI.WindowTitle = "Zovod Installer"
 $Root = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Path)
 Set-Location $Root
 
@@ -29,7 +29,7 @@ function Wait-Http([string]$Url, [int]$Seconds = 120) {
   return $false
 }
 
-Write-Host "`n=== ZMK Vision installer for Windows 10/11 ===" -ForegroundColor Green
+Write-Host "`n=== Zovod installer for Windows 10/11 ===" -ForegroundColor Green
 Assert-ProjectFiles
 if ($CheckOnly) {
   Write-Host "Project files: OK"
@@ -159,7 +159,7 @@ if ($LASTEXITCODE -ne 0) { docker compose @ComposeProfile logs --tail=100; throw
 if (-not (Wait-Http "http://localhost:8000/api/health" 120)) { docker compose @ComposeProfile logs --tail=100 api; throw "API health check failed" }
 if (-not (Wait-Http "http://localhost:5173" 120)) { docker compose @ComposeProfile logs --tail=100 web; throw "Web health check failed" }
 
-Write-Host "`nZMK Vision installed and verified successfully." -ForegroundColor Green
+Write-Host "`nZovod installed and verified successfully." -ForegroundColor Green
 Write-Host "Dashboard: http://localhost:5173"
 Write-Host "API docs:  http://localhost:8000/docs"
 Write-Host "Next starts: .\start.ps1  (checks for updates automatically)"

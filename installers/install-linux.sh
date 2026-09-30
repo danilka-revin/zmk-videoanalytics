@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# ZMK Vision installer (Linux). Uses the shared config wizard.
+# Zovod installer (Linux). Uses the shared config wizard.
 #
 #   bash installers/install-linux.sh            # install deps + config + run
 #   bash installers/install-linux.sh --setup    # config ONLY (no run)
@@ -57,13 +57,13 @@ source installers/wizard.sh
 
 case "${1:-}" in
   --setup)
-    echo "=== ZMK Vision: настройка конфигурации ==="
+    echo "=== Zovod: настройка конфигурации ==="
     run_config || fail "Настройка не завершена"
     exit 0
     ;;
 esac
 
-echo -e "\n=== ZMK Vision installer for Ubuntu/Debian ==="
+echo -e "\n=== Zovod installer for Ubuntu/Debian ==="
 if [[ "$(uname -s)" != "Linux" ]]; then fail "This installer supports Linux only"; fi
 if ! command -v apt-get >/dev/null 2>&1; then fail "Automatic installation supports Ubuntu/Debian (apt). Install Docker manually on this distribution."; fi
 # A mirror that answers slowly must not hang the installer: cap every apt
@@ -189,7 +189,7 @@ print_install_summary(){
   [[ -x "$launch_command" ]] || launch_command="./start.sh (launcher is created by bootstrap)"
   printf '\n%s\n' '================================================================'
   print_zmk_logo
-  printf '%s\n' '                           ZMK VISION'
+  printf '%s\n' '                           ZOVOD'
   printf '%s\n' '                 VIDEO ANALYTICS CONTROL PLATFORM'
   printf '%s\n' '================================================================'
   printf ' STATUS              : INSTALLED AND RUNNING\n'

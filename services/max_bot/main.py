@@ -1,4 +1,4 @@
-"""ZMK Vision control bot for the MAX messenger."""
+"""Zovod control bot for the MAX messenger."""
 from __future__ import annotations
 
 import asyncio
@@ -153,7 +153,7 @@ def alert_recipients() -> set[int]:
 
 def should_alert(event: dict[str, Any]) -> bool:
     threshold=SEVERITY_LEVEL.get(RUNTIME.alert_min_severity, SEVERITY_LEVEL["high"])
-    return RUNTIME.alerts_enabled and SEVERITY_LEVEL.get(str(event.get("severity", "")), 0) >= threshold
+    return RUNTIME.alerts_enabled and event.get("source_type")!="video" and SEVERITY_LEVEL.get(str(event.get("severity", "")), 0) >= threshold
 
 
 def user_id(event: MessageCreated) -> int:
@@ -194,7 +194,7 @@ async def api(method: str, path: str, **kwargs: Any) -> Any:
 
 def dashboard_text(data: dict[str, Any]) -> str:
     return (
-        "📊 ZMK Vision — состояние\n\n"
+        "📊 Zovod — состояние\n\n"
         f"Камеры: {data['cameras']['online']}/{data['cameras']['total']} online\n"
         f"События за 24 ч: {data['events24h']}\n"
         f"Критические: {data['critical_unacked']}\n"
@@ -255,7 +255,7 @@ async def start(event: MessageCreated):
     if not await guard(event):
         return
     await event.message.answer(
-        "ZMK Vision для MAX\n"
+        "Zovod для MAX\n"
         f"Роль: {role_for(user_id(event))}\n\n"
         "/status /cameras /camera <camera_id> /events /health\n"
         "/logs /report /models /thresholds\n"
@@ -423,7 +423,7 @@ async def _send_test_alert(text: str) -> tuple[bool, str]:
     if not recipients: return False, "Не настроены получатели теста"
     failures=[]
     for recipient in recipients:
-        try: await bot.send_message(user_id=recipient, text=f"✅ ZMK Vision\n{text}")
+        try: await bot.send_message(user_id=recipient, text=f"✅ Zovod\n{text}")
         except Exception as exc:  # noqa: BLE001 - messenger SDK exposes heterogeneous transport errors
             failures.append(f"{recipient}: {type(exc).__name__}")
     return (not failures, "; ".join(failures))
@@ -472,7 +472,7 @@ async def alert_worker():
                 last_id = max((x["id"] for x in events_data), default=0)
             fresh = [x for x in events_data if x["id"] > last_id and RUNTIME.enabled and should_alert(x)]
             for item in reversed(fresh):
-                text = "🚨 Новое событие ZMK Vision\n" + event_text(item) + f"\nID: {item['id']}"
+                text = "🚨 Новое событие Zovod\n" + event_text(item) + f"\nID: {item['id']}"
                 for recipient in alert_recipients():
                     try:
                         await bot.send_message(user_id=recipient, text=text)

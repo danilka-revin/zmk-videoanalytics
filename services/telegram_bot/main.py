@@ -1,4 +1,4 @@
-"""ZMK Vision Telegram control plane: polling bot + Mini App launcher."""
+"""Zovod Telegram control plane: polling bot + Mini App launcher."""
 from __future__ import annotations
 
 import asyncio
@@ -183,13 +183,13 @@ def alert_recipients() -> set[int]:
     return set(RUNTIME.alert_recipients) or (set(RUNTIME.admins) | set(RUNTIME.operators))
 def should_alert(event: dict[str, Any]) -> bool:
     threshold=SEVERITY_LEVEL.get(RUNTIME.alert_min_severity, SEVERITY_LEVEL["high"])
-    return RUNTIME.alerts_enabled and SEVERITY_LEVEL.get(str(event.get("severity", "")), 0) >= threshold
+    return RUNTIME.alerts_enabled and event.get("source_type")!="video" and SEVERITY_LEVEL.get(str(event.get("severity", "")), 0) >= threshold
 
 def menu(user_id: int, username: str = "") -> InlineKeyboardMarkup:
     rows = []
     webapp_url=RUNTIME.webapp_url or WEBAPP_URL
     if webapp_url.startswith("https://"):
-        rows.append([InlineKeyboardButton(text="📊 Открыть ZMK Mini App", web_app=WebAppInfo(url=webapp_url))])
+        rows.append([InlineKeyboardButton(text="📊 Открыть Zovod Mini App", web_app=WebAppInfo(url=webapp_url))])
     rows += [
         [InlineKeyboardButton(text="🟢 Статус", callback_data="status"), InlineKeyboardButton(text="📷 Камеры", callback_data="cameras")],
         [InlineKeyboardButton(text="🚨 События", callback_data="events"), InlineKeyboardButton(text="🧾 Ошибки", callback_data="errors")],
@@ -216,7 +216,7 @@ async def api(method: str, path: str, **kwargs: Any) -> Any:
     raise RuntimeError("API request failed")
 
 def dashboard_text(d: dict[str, Any]) -> str:
-    return ("<b>📊 ZMK Vision — состояние</b>\n\n"
+    return ("<b>📊 Zovod — состояние</b>\n\n"
             f"Камеры: <b>{d['cameras']['online']}/{d['cameras']['total']}</b> online\n"
             f"События за 24 ч: <b>{d['events24h']}</b>\n"
             f"Критические: <b>{d['critical_unacked']}</b>\n"
@@ -300,7 +300,7 @@ async def guard(message: Message, minimum: str = "viewer") -> bool:
 @router.message(Command("start"))
 async def start(message: Message):
     if not await guard(message): return
-    await message.answer(f"<b>ZMK Vision</b>\nРоль: <code>{role_for(message.from_user.id,message.from_user.username or '')}</code>\nУправление видеоаналитикой и отчётами.", reply_markup=menu(message.from_user.id,message.from_user.username or ''))
+    await message.answer(f"<b>Zovod</b>\nРоль: <code>{role_for(message.from_user.id,message.from_user.username or '')}</code>\nУправление видеоаналитикой и отчётами.", reply_markup=menu(message.from_user.id,message.from_user.username or ''))
 
 @router.message(Command("help"))
 async def help_cmd(message: Message):
@@ -454,7 +454,7 @@ async def _send_test_alert(bot: Bot, text: str) -> tuple[bool, str]:
     if not recipients: return False, "Не настроены получатели теста"
     failures=[]
     for chat_id in recipients:
-        try: await bot.send_message(chat_id, f"✅ <b>ZMK Vision</b>\n{text}")
+        try: await bot.send_message(chat_id, f"✅ <b>Zovod</b>\n{text}")
         except Exception as exc:  # noqa: BLE001 - messenger SDK exposes heterogeneous transport errors
             failures.append(f"{chat_id}: {type(exc).__name__}")
     return (not failures, "; ".join(failures))
@@ -506,7 +506,7 @@ async def alert_worker(bot: Bot):
             if last_id==0: last_id=max((e["id"] for e in events),default=0)
             fresh=[e for e in events if e["id"]>last_id and RUNTIME.enabled and should_alert(e)]
             for event in reversed(fresh):
-                text="🚨 <b>Новое событие ZMK Vision</b>\n"+event_text(event)+f"\nID: <code>{event['id']}</code>"
+                text="🚨 <b>Новое событие Zovod</b>\n"+event_text(event)+f"\nID: <code>{event['id']}</code>"
                 for chat_id in alert_recipients():
                     try: await bot.send_message(chat_id,text)
                     except Exception: log.exception("Alert delivery failed: chat_id=%s",chat_id)

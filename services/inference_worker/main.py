@@ -1,4 +1,4 @@
-"""Reliable RTSP camera runtime for ZMK Vision.
+"""Reliable RTSP camera runtime for Zovod.
 
 This worker deliberately separates camera acquisition from ML inference:
 RTSP preview, telemetry and reconnects start immediately; Ultralytics is
@@ -569,20 +569,26 @@ class CameraConfig:
     rtsp_url: str
     fps_limit: float
     restart_token: str = ""
+    source_type: str = "rtsp"
+    video_path: str = ""
 
     @classmethod
     def from_api(cls, raw: dict[str, Any]) -> CameraConfig:
+        source_type="video" if str(raw.get("source_type") or "rtsp")=="video" else "rtsp"
+        video_path=str(raw.get("video_path") or "") if source_type=="video" else ""
         return cls(
             camera_id=str(raw["id"]),
             name=str(raw.get("name") or raw["id"]),
-            rtsp_url=str(raw["rtsp_url"]),
+            rtsp_url=str(raw.get("rtsp_url") or ""),
             fps_limit=max(0.1, min(60.0, float(raw.get("fps_limit") or 30))),
             restart_token=str(raw.get("restart_requested_at") or ""),
+            source_type=source_type,
+            video_path=video_path,
         )
 
     @property
-    def signature(self) -> tuple[str, float, str]:
-        return self.rtsp_url, self.fps_limit, self.restart_token
+    def signature(self) -> tuple[str, float, str, str, str]:
+        return self.rtsp_url, self.fps_limit, self.restart_token, self.source_type, self.video_path
 
 
 @dataclass
@@ -596,6 +602,7 @@ class CameraSession:
     using_go2rtc: bool = False
     next_attempt_at: float = 0.0
     next_frame_at: float = 0.0
+    video_frame_interval: float = 0.0
     last_telemetry_at: float = 0.0
     telemetry_window_started: float = 0.0
     frames_in_window: int = 0
@@ -941,6 +948,7 @@ class Runtime:
                 session.using_go2rtc = False
                 session.next_attempt_at = 0
                 session.next_frame_at = 0
+                session.video_frame_interval = 0
                 session.last_error = ""
                 session.last_live_at = 0
                 session.opened_at = 0
@@ -1124,21 +1132,25 @@ class Runtime:
 
         await self._report(session, "connecting", error="", force=session.status != "connecting")
 
-        # NEW ARCHITECTURE: Try go2rtc RTSP first when enabled (single connection to camera)
-        # go2rtc -> camera (1 connection), inference -> go2rtc (local), browser WebRTC -> go2rtc
-        # This gives true 25-60 FPS like VLC and avoids camera overload/reconnects.
-        urls_to_try = []
-        if (
-            GO2RTC_PREVIEW_ENABLED
-            and GO2RTC_USE_FOR_INFERENCE
-            and GO2RTC_RTSP_URL
-            and session.go2rtc_failures < GO2RTC_INFERENCE_MAX_FAILURES
-        ):
-            go2rtc_url = _go2rtc_rtsp_url_for(session.config.camera_id)
-            if go2rtc_url:
+        # Uploaded clips enter the exact same frame/inference pipeline, but are
+        # decoded locally and never registered as RTSP sources in go2rtc.
+        if session.config.source_type=="video":
+            urls_to_try=[(session.config.video_path,False)]
+        else:
+            # NEW ARCHITECTURE: Try go2rtc RTSP first when enabled (single connection to camera)
+            # go2rtc -> camera (1 connection), inference -> go2rtc (local), browser WebRTC -> go2rtc
+            urls_to_try=[]
+            if (
+                GO2RTC_PREVIEW_ENABLED
+                and GO2RTC_USE_FOR_INFERENCE
+                and GO2RTC_RTSP_URL
+                and session.go2rtc_failures < GO2RTC_INFERENCE_MAX_FAILURES
+            ):
+                go2rtc_url = _go2rtc_rtsp_url_for(session.config.camera_id)
+                if go2rtc_url:
                     urls_to_try.append((go2rtc_url, True))  # True = is go2rtc
-        # Direct camera URL always as fallback
-        urls_to_try.append((session.config.rtsp_url, False))
+            # Direct camera URL always as fallback
+            urls_to_try.append((session.config.rtsp_url, False))
 
         transport = session.transport
         started = time.perf_counter()
@@ -1148,7 +1160,10 @@ class Runtime:
             try_transport = "tcp" if is_go2rtc else transport
             try:
                 async with self._capture_open_lock:
-                    capture = await asyncio.to_thread(self._open_capture, rtsp_url, try_transport)
+                    if session.config.source_type=="video":
+                        capture=await asyncio.to_thread(cv2.VideoCapture,rtsp_url)
+                    else:
+                        capture = await asyncio.to_thread(self._open_capture, rtsp_url, try_transport)
             except (TimeoutError, OSError, RuntimeError, ValueError) as exc:
                 last_error = redact_error(exc)
                 if is_go2rtc:
@@ -1161,7 +1176,7 @@ class Runtime:
 
             if not self._is_open(capture):
                 self._release(capture)
-                last_error = f"не удалось открыть RTSP по {try_transport.upper()} ({'go2rtc' if is_go2rtc else 'direct'})"
+                last_error = "не удалось открыть загруженный видеофайл" if session.config.source_type=="video" else f"не удалось открыть RTSP по {try_transport.upper()} ({'go2rtc' if is_go2rtc else 'direct'})"
                 if is_go2rtc:
                     session.go2rtc_failures += 1
                     self._log(f"camera {session.config.camera_id} go2rtc RTSP open failed ({session.go2rtc_failures}/{GO2RTC_INFERENCE_MAX_FAILURES}): {last_error}")
@@ -1173,13 +1188,23 @@ class Runtime:
             # Success
             session.capture = capture
             session.failures = 0
+            if session.config.source_type=="video":
+                source_fps=session.config.fps_limit
+                try:
+                    get_fps=getattr(capture,"get",None)
+                    reported=float(get_fps(getattr(cv2,"CAP_PROP_FPS",5))) if get_fps else 0
+                    if 0.1<=reported<=240: source_fps=min(reported,session.config.fps_limit,60)
+                except (AttributeError,TypeError,ValueError): pass
+                session.video_frame_interval=1/max(.1,source_fps)
             session.using_go2rtc = is_go2rtc
             if is_go2rtc:
                 # Reset failures on success, but keep go2rtc_failures low
                 session.go2rtc_failures = max(0, session.go2rtc_failures - 1)
                 self._log(f"camera {session.config.camera_id} opened via GO2RTC RTSP {try_transport.upper()} (single connection to camera, true FPS)", force=True)
             else:
-                if GO2RTC_PREVIEW_ENABLED and GO2RTC_USE_FOR_INFERENCE:
+                if session.config.source_type=="video":
+                    self._log(f"camera {session.config.camera_id} opened from uploaded test video",force=True)
+                elif GO2RTC_PREVIEW_ENABLED and GO2RTC_USE_FOR_INFERENCE:
                     self._log(f"camera {session.config.camera_id} opened via DIRECT RTSP {try_transport.upper()} (go2rtc fallback, {session.go2rtc_failures} go2rtc fails)", force=True)
                 else:
                     self._log(f"camera {session.config.camera_id} opened via {try_transport.upper()}", force=True)
@@ -1653,9 +1678,10 @@ class Runtime:
             session.transport_index = 0
             session.failures = 0
             session.next_attempt_at = 0
+            session.video_frame_interval = 0
 
         started = time.perf_counter()
-        if CAMERA_DECODER == "ffmpeg":
+        if CAMERA_DECODER == "ffmpeg" and config.source_type!="video":
             if time.monotonic() < session.next_attempt_at:
                 return
             image, error = await self._ffmpeg_frame(session)
@@ -1671,9 +1697,19 @@ class Runtime:
                 ok, image = False, None
                 error = redact_error(exc)
             else:
-                error = "пустой кадр от RTSP-потока"
+                error = "пустой кадр из видеофайла" if config.source_type=="video" else "пустой кадр от RTSP-потока"
         latency = round((time.perf_counter() - started) * 1000)
 
+        if (not ok or image is None) and config.source_type=="video" and session.capture is not None:
+            # Uploaded clips are looped until the operator removes the test
+            # source, keeping the card and inference session available to inspect.
+            try:
+                position_property=getattr(cv2,"CAP_PROP_POS_FRAMES",1)
+                await asyncio.to_thread(session.capture.set,position_property,0)
+                ok,image=await asyncio.to_thread(session.capture.read)
+                if ok and image is not None: error=""
+            except (AttributeError,OSError,RuntimeError,TypeError,ValueError):
+                ok,image=False,None
         if not ok or image is None:
             await self._failed_read(session, error, latency)
             return
@@ -1756,10 +1792,13 @@ class Runtime:
                         now = time.monotonic()
                         if now < session.next_frame_at:
                             continue
-                        # For true VLC-like FPS, decode as fast as possible, not limited by fps_limit
-                        # fps_limit only limits published preview rate, not decode rate
-                        # Use 1ms min delay for max 1000 FPS decode, actual FPS limited by camera and decoder
-                        session.next_frame_at = now + 0.001
+                        # Live RTSP is decoded as fast as possible; uploaded test
+                        # clips retain their recorded pace, capped by fps_limit.
+                        if session.config.source_type=="video":
+                            interval=session.video_frame_interval or (1/max(.1,min(session.config.fps_limit,30)))
+                            session.next_frame_at=now+interval
+                        else:
+                            session.next_frame_at = now + 0.001
                         session.frame_task = asyncio.create_task(
                             self.frame(session.config),
                             name=f"camera-frame-{session.config.camera_id}",
