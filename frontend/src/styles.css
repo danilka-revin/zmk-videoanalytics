@@ -1115,3 +1115,16 @@ html[data-theme=dark] .swipe-knob{background:#f2f6f3;color:#b8443d}
 .tg-clear-body{display:flex;flex-direction:column;gap:10px}
 .tg-sheet-link{align-self:center;border:0;background:transparent;color:#748179;font-size:8px;text-decoration:underline;padding:4px}
 .tgapp-dark .tg-sheet-link{color:var(--tg-muted)}
+
+/* Бейдж очереди событий в меню. Работает как бейдж «Логов»: появился —
+   подсвечен, принять или не принять событие — счётчик уменьшается, разобрали
+   очередь — бейдж исчез. Пульсация только при критических событиях. */
+nav em.hot{animation:nav-badge-pulse 1.7s ease-in-out infinite}
+html[data-motion=off] nav em.hot{animation:none}
+@keyframes nav-badge-pulse{0%,100%{transform:scale(1);box-shadow:0 2px 8px rgb(228 80 62 / .26)}50%{transform:scale(1.08);box-shadow:0 0 0 5px rgb(228 80 62 / .16)}}
+.icon i.critical{width:7px;height:7px;box-shadow:0 0 0 3px rgb(228 80 62 / .18)}
+
+/* Тот же счётчик в нижнем меню Telegram Mini App. */
+.tgnav button{position:relative}
+.tgnav em{position:absolute;top:0;left:calc(50% + 4px);min-width:15px;padding:0 4px;border-radius:99px;background:#e4503e;color:#fff;font-size:6px;font-style:normal;font-weight:800;line-height:15px;text-align:center;box-shadow:0 2px 8px rgb(228 80 62 / .3)}
+.tgapp-dark .tgnav em{background:#e4503e!important;color:#fff!important}
