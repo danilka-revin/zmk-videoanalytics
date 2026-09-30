@@ -148,3 +148,17 @@ def test_project_log_handler_skips_service_noise_but_keeps_warnings():
     assert any('connection reset by peer' in message for message in messages)
     assert any('Опрос Telegram запущен' in message for message in messages)
     bot_main._log_ship_lines.clear()
+
+
+def test_alerts_skip_test_events_and_uploaded_clips():
+    """«PPE-тест» и ролик вместо камеры видны в журнале, но не в push-алертах."""
+    previous_enabled, previous_severity = bot_main.RUNTIME.alerts_enabled, bot_main.RUNTIME.alert_min_severity
+    try:
+        bot_main.RUNTIME.alerts_enabled = True
+        bot_main.RUNTIME.alert_min_severity = 'high'
+        production = {'severity': 'high', 'source_type': 'rtsp', 'type': 'no_helmet'}
+        assert bot_main.should_alert(production) is True
+        assert bot_main.should_alert({**production, 'is_test': 1}) is False
+        assert bot_main.should_alert({**production, 'source_type': 'video'}) is False
+    finally:
+        bot_main.RUNTIME.alerts_enabled, bot_main.RUNTIME.alert_min_severity = previous_enabled, previous_severity

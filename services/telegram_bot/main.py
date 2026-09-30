@@ -182,8 +182,10 @@ def allowed(user_id: int, minimum: str = "viewer", username: str = "") -> bool:
 def alert_recipients() -> set[int]:
     return set(RUNTIME.alert_recipients) or (set(RUNTIME.admins) | set(RUNTIME.operators))
 def should_alert(event: dict[str, Any]) -> bool:
+    """Production-события порога алертов; тестовые прогоны и ролик вместо
+    камеры оператор смотрит в журнале, но не получает о них push."""
     threshold=SEVERITY_LEVEL.get(RUNTIME.alert_min_severity, SEVERITY_LEVEL["high"])
-    return RUNTIME.alerts_enabled and event.get("source_type")!="video" and SEVERITY_LEVEL.get(str(event.get("severity", "")), 0) >= threshold
+    return RUNTIME.alerts_enabled and event.get("source_type")!="video" and not event.get("is_test") and SEVERITY_LEVEL.get(str(event.get("severity", "")), 0) >= threshold
 
 def menu(user_id: int, username: str = "") -> InlineKeyboardMarkup:
     rows = []

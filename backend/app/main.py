@@ -44,7 +44,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 # Fallback version for a checkout started without any recorded build info.
-BASE_VERSION = "2.24.0"
+BASE_VERSION = "2.25.0"
 # Installed version + git commit, as recorded by the installers and the updater
 # service (see services/updater/core.py). Commit-based updates mean the version
 # string alone no longer identifies a build: every commit/merge of the tracked
@@ -824,7 +824,7 @@ def init_db():
     con.execute("PRAGMA journal_mode=WAL")
     con.executescript("""
     CREATE TABLE IF NOT EXISTS cameras(id TEXT PRIMARY KEY, name TEXT NOT NULL, zone TEXT NOT NULL, description TEXT NOT NULL DEFAULT '', rtsp_url TEXT NOT NULL DEFAULT '', fps_limit REAL NOT NULL DEFAULT 8, status TEXT NOT NULL DEFAULT 'unknown', fps REAL NOT NULL DEFAULT 0, latency_ms INTEGER NOT NULL DEFAULT 0, enabled INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL, telemetry_at TEXT NOT NULL DEFAULT '', last_error TEXT NOT NULL DEFAULT '', restart_requested_at TEXT NOT NULL DEFAULT '');
-    CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, camera_id TEXT NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL, confidence REAL NOT NULL, person_id TEXT, external_id TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, review_status TEXT NOT NULL DEFAULT 'pending', reviewed_at TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '', FOREIGN KEY(camera_id) REFERENCES cameras(id));
+    CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, camera_id TEXT NOT NULL, type TEXT NOT NULL, severity TEXT NOT NULL, confidence REAL NOT NULL, person_id TEXT, external_id TEXT, acknowledged INTEGER NOT NULL DEFAULT 0, review_status TEXT NOT NULL DEFAULT 'pending', reviewed_at TEXT NOT NULL DEFAULT '', note TEXT NOT NULL DEFAULT '', is_test INTEGER NOT NULL DEFAULT 0, FOREIGN KEY(camera_id) REFERENCES cameras(id));
     CREATE TABLE IF NOT EXISTS logs(id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp TEXT NOT NULL, level TEXT NOT NULL, service TEXT NOT NULL, message TEXT NOT NULL, camera_id TEXT);
     CREATE TABLE IF NOT EXISTS worker_status(name TEXT PRIMARY KEY, status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', camera_count INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL, model_name TEXT NOT NULL DEFAULT '', model_status TEXT NOT NULL DEFAULT 'none', model_error TEXT NOT NULL DEFAULT '');
     CREATE TABLE IF NOT EXISTS settings(key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -868,6 +868,10 @@ def init_db():
         con.execute("UPDATE events SET review_status=CASE WHEN acknowledged=1 THEN 'accepted' ELSE 'pending' END")
     if "reviewed_at" not in event_columns: con.execute("ALTER TABLE events ADD COLUMN reviewed_at TEXT NOT NULL DEFAULT ''")
     if "reviewed_by" not in event_columns: con.execute("ALTER TABLE events ADD COLUMN reviewed_by TEXT NOT NULL DEFAULT ''")
+    # События тестовых прогонов («PPE-тест», «Тест на камере», ролик вместо
+    # камеры) хранятся в общем журнале, но помечены, чтобы их можно было
+    # отличить от production-детекций.
+    if "is_test" not in event_columns: con.execute("ALTER TABLE events ADD COLUMN is_test INTEGER NOT NULL DEFAULT 0")
     con.execute("UPDATE events SET review_status='pending' WHERE review_status NOT IN ('pending','accepted','rejected') OR review_status='' OR review_status IS NULL")
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS ux_events_external_id ON events(external_id) WHERE external_id IS NOT NULL")
     con.execute("CREATE INDEX IF NOT EXISTS ix_events_timestamp ON events(timestamp DESC)")
@@ -1633,6 +1637,9 @@ class CameraSnapshotIn(BaseModel):
     captured_at:datetime|None=None
 class SettingIn(BaseModel): value:float=Field(ge=.1,le=1)
 class AckIn(BaseModel): note:str=Field(default="",max_length=500)
+class EventClearIn(BaseModel):
+    """Полная очистка журнала. Без явного подтверждения запрос отклоняется."""
+    confirm:bool=False
 class BulkAckIn(BaseModel):
     event_ids:list[int]=Field(min_length=1,max_length=500)
     note:str=Field(default="",max_length=500)
@@ -1649,6 +1656,10 @@ class DetectionIn(BaseModel):
     confidence:float=Field(ge=0,le=1)
     person_id:str|None=Field(default=None,max_length=120)
     detection_id:str|None=Field(default=None,min_length=8,max_length=160,pattern=r"^[a-zA-Z0-9._:-]+$")
+    # Тестовый прогон («PPE-тест», «Тест на камере», загруженный ролик) тоже
+    # попадает в журнал, но помечается тестовым: такие события показываются
+    # оператору и никогда не уходят в webhook или боты-оповещения.
+    test_mode:bool=False
     bbox:list[float]=Field(default_factory=list,min_length=0,max_length=4)
     @field_validator("bbox")
     @classmethod
@@ -2942,6 +2953,28 @@ def reject_events_bulk(payload:BulkAckIn,request:Request):
     result=_bulk_review_events(payload,"rejected","Не принято оператором",request)
     return {**result,"rejected_ids":result["updated_ids"],"already_rejected_ids":result["already_ids"]}
 
+@app.post("/api/events/clear")
+def clear_events(payload:EventClearIn,request:Request):
+    """Полностью очистить журнал событий вместе с кадрами-доказательствами.
+
+    Маршрут открыт только администратору (роли «Аналитик», «Гость» и боты
+    отклоняются middleware-ом) и требует явного `confirm`: интерфейс
+    подтверждает действие дважды — кнопкой и проведением ползунка.
+    """
+    if not payload.confirm: raise HTTPException(422,"Очистка журнала не подтверждена")
+    reviewer=_reviewer_label(request)
+    con=db()
+    try:
+        con.execute("BEGIN IMMEDIATE")
+        event_ids=[int(row[0]) for row in con.execute("SELECT id FROM events ORDER BY id").fetchall()]
+        if event_ids: con.execute("DELETE FROM events")
+        con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"WARNING","event_manager",f"Event journal cleared: events={len(event_ids)} by {reviewer}"))
+        con.commit()
+    finally:
+        con.close()
+    remove_event_frames(event_ids)
+    return {"cleared":len(event_ids),"cleared_by":reviewer,"cleared_at":now_iso()}
+
 @app.post("/api/events/{event_id}/ack")
 def ack(event_id:int,payload:AckIn,request:Request):
     note=payload.note.strip() or "Проверено оператором"
@@ -2968,10 +3001,17 @@ def ingest_detections(payload:DetectionBatch):
     cooldown_row=con.execute("SELECT value FROM settings WHERE key='event_cooldown_seconds'").fetchone()
     try: cooldown=max(0,int(float(cooldown_row[0]))) if cooldown_row else 30
     except ValueError: cooldown=30
-    accepted=[]; rejected=[]; test_video_source=False
+    accepted=[]; rejected=[]; test_batch=False
+    test_conf_row=con.execute("SELECT value FROM settings WHERE key='model_test_conf'").fetchone()
+    try: test_threshold=max(.01,min(.95,float(test_conf_row[0]))) if test_conf_row else MODEL_TEST_CONF_DEFAULT
+    except (TypeError,ValueError): test_threshold=MODEL_TEST_CONF_DEFAULT
     for i,d in enumerate(payload.detections):
         cam=con.execute("SELECT status,enabled,telemetry_at,source_type FROM cameras WHERE id=?",(d.camera_id,)).fetchone()
-        if cam and cam[3]=="video": test_video_source=True
+        # Тестовый прогон (флаг worker-а) и загруженный ролик вместо камеры —
+        # это проверка модели, а не охрана труда: событие сохраняется в журнал
+        # с пометкой «тест» и никогда не становится production-оповещением.
+        is_test=bool(d.test_mode or (cam and cam[3]=="video"))
+        if is_test: test_batch=True
         cam_age=telemetry_age_seconds(cam[2]) if cam else None
         reason=None; normalized_timestamp=now_iso()
         if d.detection_id:
@@ -2988,6 +3028,10 @@ def ingest_detections(payload:DetectionBatch):
             elif cam[0] != "online" or not cam[1] or cam_age is None or cam_age>CAMERA_TELEMETRY_STALE_SECONDS: reason="camera_unavailable"
             else:
                 key=thresholds[d.event_type]; threshold=float(con.execute("SELECT value FROM settings WHERE key=?",(key,)).fetchone()[0])
+                # В тестовом прогоне действует тот же порог, что видит оператор
+                # рамками на экране (model_test_conf), иначе проверка PPE-модели
+                # молча теряла бы кадры ниже production-порога.
+                if is_test: threshold=min(threshold,test_threshold)
                 if d.confidence < threshold: reason=f"below_threshold:{threshold}"
         if not reason and cooldown>0:
             cutoff=(datetime.now(TZ)-timedelta(seconds=cooldown)).isoformat()
@@ -2995,12 +3039,13 @@ def ingest_detections(payload:DetectionBatch):
             if recent: rejected.append({"index":i,"reason":f"event_cooldown:{cooldown}","event_id":recent[0]}); continue
         if reason: rejected.append({"index":i,"reason":reason}); continue
         severity="critical" if d.event_type in {"restricted_zone","immobility"} else "high" if d.event_type in {"no_helmet","smoking"} else "medium"
-        cur=con.execute("INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id,external_id) VALUES(?,?,?,?,?,?,?)",(normalized_timestamp,d.camera_id,d.event_type,severity,d.confidence,d.person_id,d.detection_id))
-        accepted.append({"index":i,"event_id":cur.lastrowid})
-    con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","inference_gateway",f"batch models={','.join(sorted(active_models)) or 'none'} accepted={len(accepted)} rejected={len(rejected)}"))
+        cur=con.execute("INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id,external_id,is_test) VALUES(?,?,?,?,?,?,?,?)",(normalized_timestamp,d.camera_id,d.event_type,severity,d.confidence,d.person_id,d.detection_id,int(is_test)))
+        accepted.append({"index":i,"event_id":cur.lastrowid,"test":is_test})
+    con.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"INFO","inference_gateway",f"batch models={','.join(sorted(active_models)) or 'none'} accepted={len(accepted)} rejected={len(rejected)} test={str(test_batch).lower()}"))
     webhook={r[0]:r[1] for r in con.execute("SELECT key,value FROM settings WHERE key IN ('webhook_enabled','webhook_url','webhook_timeout')").fetchall()}; con.commit(); con.close()
-    # Test clips must never trigger outbound production webhooks.
-    if accepted and not test_video_source and webhook.get('webhook_enabled')=='true' and webhook.get('webhook_url'):
+    # Тестовые прогоны (в том числе ролик вместо камеры) никогда не дергают
+    # production-интеграции.
+    if accepted and not test_batch and webhook.get('webhook_enabled')=='true' and webhook.get('webhook_url'):
         try: httpx.post(webhook['webhook_url'],json={"source":"zmk-vision","model":active or None,"models":sorted(active_models),"events":accepted,"timestamp":now_iso()},timeout=float(webhook.get('webhook_timeout','5'))).raise_for_status()
         except httpx.HTTPError as exc:
             logcon=db(); logcon.execute("INSERT INTO logs(timestamp,level,service,message) VALUES(?,?,?,?)",(now_iso(),"ERROR","integration",f"Webhook delivery failed: {str(exc)[:300]}")); logcon.commit(); logcon.close()
@@ -4463,7 +4508,7 @@ def csv_safe(value:Any):
 def sanitize_csv_rows(data:list[dict[str,Any]]): return [{k:csv_safe(v) for k,v in row.items()} for row in data]
 
 _EVENT_REPORT_FIELDS=(
-    "№ события","Дата и время","Тип нарушения","Код нарушения","Критичность","Уверенность, %",
+    "№ события","Дата и время","Тип нарушения","Код нарушения","Критичность","Тестовое событие","Уверенность, %",
     "Камера","ID камеры","Зона","Объект / человек","ID детекции","Статус проверки","Подтверждено",
     "Время решения","Комментарий оператора","Кадр нарушения","Файл кадра","Ссылка на кадр",
 )
@@ -4476,7 +4521,7 @@ def _event_report_rows(severity:str|None,event_type:str|None,acknowledged:bool|N
     term=(q or "").strip()
     like=f"%{term}%" if term else None
     since=(datetime.now(TZ)-timedelta(hours=hours)).isoformat() if hours else None
-    return rows("""SELECT e.id,e.timestamp,e.camera_id,e.type,e.severity,e.confidence,e.person_id,e.external_id,e.acknowledged,e.review_status,e.reviewed_at,e.note,
+    return rows("""SELECT e.id,e.timestamp,e.camera_id,e.type,e.severity,e.confidence,e.person_id,e.external_id,e.acknowledged,e.review_status,e.reviewed_at,e.note,e.is_test,
         c.name AS camera_name,c.zone AS camera_zone FROM events e
         LEFT JOIN cameras c ON c.id=e.camera_id
         WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?) AND (? IS NULL OR e.review_status=?) AND (? IS NULL OR e.camera_id=?)
@@ -4504,6 +4549,7 @@ def _event_report_record(row:dict[str,Any]) -> dict[str,Any]:
         "Тип нарушения":EVENT_LABELS.get(str(row.get("type") or ""),str(row.get("type") or "—")),
         "Код нарушения":str(row.get("type") or ""),
         "Критичность":_EVENT_SEVERITY_LABELS.get(str(row.get("severity") or ""),str(row.get("severity") or "—")),
+        "Тестовое событие":"Да" if row.get("is_test") else "Нет",
         "Уверенность, %":round(float(row.get("confidence") or 0)*100,2),
         "Камера":str(row.get("camera_name") or row.get("camera_id") or "—"),
         "ID камеры":str(row.get("camera_id") or ""),
@@ -4548,7 +4594,7 @@ def _event_report_html(records:list[dict[str,Any]]) -> str:
 <style>body{{font:13px/1.4 Arial,sans-serif;color:#17211d;margin:24px}}h1{{margin:0 0 4px}}p{{color:#526158}}.summary{{display:flex;gap:12px;margin:18px 0}}.summary span{{padding:8px 10px;border:1px solid #d9e5dd;border-radius:8px;background:#f4faf6}}table{{width:100%;border-collapse:collapse;font-size:11px}}th{{position:sticky;top:0;background:#193426;color:#f4ffef}}th,td{{border:1px solid #dce6df;padding:6px;text-align:left;vertical-align:top}}tr:nth-child(even){{background:#f7faf8}}img{{display:block;max-width:180px;max-height:112px;border-radius:4px;background:#16231d}}td small{{display:block;margin-top:3px;color:#66756d}}@media print{{body{{margin:8px}}th{{position:static}}}}</style>
 <h1>Zovod — журнал нарушений</h1><p>Сформировано: {html_escape(now_iso())}. В архиве сохранены доступные кадры нарушений.</p>
 <div class="summary"><span>Событий: <b>{len(records)}</b></span><span>Кадров: <b>{evidence}</b></span></div>
-<table><thead><tr>{headers}</tr></thead><tbody>{''.join(rows_html) or '<tr><td colspan="18">Событий по выбранному фильтру нет.</td></tr>'}</tbody></table></html>"""
+<table><thead><tr>{headers}</tr></thead><tbody>{''.join(rows_html) or '<tr><td colspan="19">Событий по выбранному фильтру нет.</td></tr>'}</tbody></table></html>"""
 
 
 def _event_report_args(severity:str|None,event_type:str|None,acknowledged:bool|None,review_status:Literal["pending","accepted","rejected"]|None,camera_id:str|None,q:str|None,hours:int|None=None) -> list[dict[str,Any]]:

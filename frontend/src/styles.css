@@ -1049,3 +1049,58 @@ html[data-font-scale=small] .customizer .custom-page,html[data-font-scale=large]
 .update-overlay .update-primary{border-color:#2d5340;background:#1f3a2b;color:#d5ff45}
 .update-overlay .update-primary:hover{background:#2a4b38}
 .update-overlay .update-dialog-footer button:focus-visible,.update-overlay .update-dialog-close:focus-visible{outline-color:#a6d274}
+
+/* ------------------------------------------------------------------ */
+/* Тестовые события в журнале                                          */
+/*                                                                     */
+/* «PPE-тест», «Тест на камере» и загруженный ролик вместо камеры тоже */
+/* попадают в журнал, но помечаются, чтобы оператор отличал проверку   */
+/* модели от production-детекций. Оповещения о них не отправляются.    */
+/* ------------------------------------------------------------------ */
+.event-test-flag{display:inline-block;margin-left:6px;padding:1px 5px;border-radius:5px;background:#fff1d4;color:#9c6d21;font-size:7px;font-style:normal;font-weight:800;letter-spacing:.08em;vertical-align:middle;border:1px solid rgb(228 167 67 / .35)}
+html[data-theme=dark] .event-test-flag{background:#3a2f18;color:#e9c66e;border-color:#5c4a24}
+
+/* Кнопка полной очистки журнала: разрушительное действие. */
+.toolbar .clear-events-button{border-color:#e6cbc8;background:#fbecea;color:#b8443d;font-weight:650}
+.toolbar .clear-events-button:hover{background:#f8dedb;border-color:#d9a9a4}
+html[data-theme=dark] .toolbar .clear-events-button{background:#3a2321;border-color:#6e3934;color:#ffaaa1}
+html[data-theme=dark] .toolbar .clear-events-button:hover{background:#472925}
+
+.clear-events-modal{width:min(520px,100%)}
+.clear-events-modal .modal-head p{margin:3px 0 0;color:var(--muted);font-size:9px;line-height:1.45}
+.clear-events-list{margin:0;padding:0 0 0 18px;color:var(--muted);font-size:9px;line-height:1.65}
+.clear-events-list b{color:var(--text)}
+.modal-actions .danger{display:flex;align-items:center;gap:6px;border-color:#b8443d;background:#b8443d;color:#fff}
+.modal-actions .danger:hover{background:#a83b34;border-color:#a83b34}
+.modal-actions .danger:disabled{opacity:.5;cursor:default;transform:none;box-shadow:none}
+html[data-theme=dark] .modal-actions .danger{background:#ab4139;border-color:#ab4139;color:#fff}
+
+/* ------------------------------------------------------------------ */
+/* Второе подтверждение жестом («провести по экрану», как в Яндекс ID) */
+/* ------------------------------------------------------------------ */
+.swipe-confirm{display:flex;flex-direction:column;gap:8px;margin-top:4px}
+.swipe-track{position:relative;display:flex;align-items:center;height:56px;border-radius:99px;border:1px solid rgb(var(--ink-rgb) / .12);background:var(--surface-2);overflow:hidden;touch-action:none;user-select:none;-webkit-user-select:none;cursor:grab}
+.swipe-track:focus-visible{outline:2px solid var(--accent);outline-offset:3px}
+.swipe-confirm.dragging .swipe-track{cursor:grabbing}
+.swipe-fill{position:absolute;left:0;top:0;bottom:0;border-radius:99px;background:linear-gradient(90deg,#e9b1ac,#c9544b);transition:width .16s ease}
+.swipe-confirm.dragging .swipe-fill,.swipe-confirm.done .swipe-fill{transition:none;background:linear-gradient(90deg,#e9a6a0,#b8443d)}
+.swipe-hint{position:relative;margin:0 auto;padding:0 14px;font-size:9px;font-weight:650;color:var(--muted);letter-spacing:.02em;text-align:center;pointer-events:none}
+.swipe-confirm.dragging .swipe-hint,.swipe-confirm.done .swipe-hint{color:#fff}
+.swipe-knob{position:absolute;top:4px;bottom:4px;width:48px;border-radius:99px;background:#fff;border:1px solid rgb(var(--ink-rgb) / .12);box-shadow:0 4px 14px rgb(23 33 29 / .2);display:grid;place-items:center;color:#b8443d;transition:left .16s ease}
+.swipe-confirm.dragging .swipe-knob,.swipe-confirm.done .swipe-knob{transition:none}
+.swipe-confirm.blocked .swipe-track{opacity:.55;cursor:not-allowed}
+.swipe-note{display:block;font-size:8px;line-height:1.45;color:var(--muted)}
+html[data-theme=dark] .swipe-track{background:var(--surface-2);border-color:rgb(255 255 255 / .12)}
+html[data-theme=dark] .swipe-fill{background:linear-gradient(90deg,#7d413c,#c9544b)}
+html[data-theme=dark] .swipe-knob{background:#f2f6f3;color:#b8443d}
+
+/* Очистка журнала в Telegram Mini App. */
+.tg-danger-head{margin-top:4px}
+.tgapp-full .tgaction.danger{color:#b8443d;border-color:rgb(184 68 61 / .28);background:rgb(184 68 61 / .07)}
+.tgapp-full .tgaction.danger span b{color:#a93f38}
+.tgapp-dark .tgaction.danger{color:#ffb2aa!important;border-color:#79433e!important;background:#3a2421!important}
+.tgapp-dark .tgaction.danger span b{color:#ffb2aa!important}
+.tgapp-dark .tgaction.danger span small{color:#e3a49d!important}
+.tg-clear-body{display:flex;flex-direction:column;gap:10px}
+.tg-sheet-link{align-self:center;border:0;background:transparent;color:#748179;font-size:8px;text-decoration:underline;padding:4px}
+.tgapp-dark .tg-sheet-link{color:var(--tg-muted)}

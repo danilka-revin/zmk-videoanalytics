@@ -152,8 +152,10 @@ def alert_recipients() -> set[int]:
 
 
 def should_alert(event: dict[str, Any]) -> bool:
+    """Production-события порога алертов; тестовые прогоны и ролик вместо
+    камеры оператор смотрит в журнале, но не получает о них push."""
     threshold=SEVERITY_LEVEL.get(RUNTIME.alert_min_severity, SEVERITY_LEVEL["high"])
-    return RUNTIME.alerts_enabled and event.get("source_type")!="video" and SEVERITY_LEVEL.get(str(event.get("severity", "")), 0) >= threshold
+    return RUNTIME.alerts_enabled and event.get("source_type")!="video" and not event.get("is_test") and SEVERITY_LEVEL.get(str(event.get("severity", "")), 0) >= threshold
 
 
 def user_id(event: MessageCreated) -> int:
