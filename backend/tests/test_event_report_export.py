@@ -74,3 +74,72 @@ def test_event_evidence_zip_honors_overview_period():
         with zipfile.ZipFile(io.BytesIO(archive_response.content)) as archive:
             manifest = json.loads(archive.read("manifest.json"))
             assert manifest["events"] == 0
+
+
+def _insert_event(person_id: str, zone: str = "Тестовая зона") -> int:
+    con = main.db()
+    cursor = con.execute(
+        """INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id,external_id,
+           acknowledged,review_status,reviewed_at,note) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+        (
+            main.now_iso(), "cam_01", "no_helmet", "critical", 0.91,
+            person_id, f"{person_id}-ID", 1, "accepted", main.now_iso(), "Проверено",
+        ),
+    )
+    event_id = int(cursor.lastrowid)
+    con.commit()
+    con.close()
+    evidence = main.event_frame_path_for(event_id)
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    evidence.write_bytes(b"\xff\xd8brief-export-frame\xff\xd9")
+    return event_id
+
+
+def test_short_export_keeps_only_time_place_violator_and_photo():
+    """Директору нужен минимальный отчёт: когда, где, кто нарушил, есть ли фото."""
+    with TestClient(main.app) as client:
+        event_id = _insert_event("SHORT-EXPORT-001")
+
+        table = client.get("/api/reports/events.csv?columns=short&q=SHORT-EXPORT-001")
+        assert table.status_code == 200, table.text
+        text = table.content.decode("utf-8-sig")
+        header = text.splitlines()[0].split(";")
+        assert header == ["№ события", "Дата и время", "Тип нарушения", "Место", "Кто нарушил", "Фото", "Файл кадра"]
+
+        row = next(iter(csv.DictReader(io.StringIO(text), delimiter=";")))
+        assert row["Тип нарушения"] == "Без каски"
+        assert row["Место"] == "Камера 01 · Тестовая зона"
+        assert row["Кто нарушил"] == "SHORT-EXPORT-001"
+        assert row["Фото"] == "Есть"
+        assert row["Файл кадра"] == f"frames/event-{event_id}.jpg"
+        # Полной карточки в коротком отчёте нет: она остаётся у администратора.
+        assert "Комментарий оператора" not in row and "Уверенность, %" not in row
+
+        archive_response = client.get("/api/reports/events.zip?columns=short&q=SHORT-EXPORT-001")
+        assert archive_response.status_code == 200, archive_response.text
+        with zipfile.ZipFile(io.BytesIO(archive_response.content)) as archive:
+            manifest = json.loads(archive.read("manifest.json"))
+            assert manifest["columns"] == ["index", "time", "type", "place", "person", "photo", "frame_file"]
+            # Кадры кладутся в архив независимо от набора колонок: фото должно быть.
+            assert f"frames/event-{event_id}.jpg" in archive.namelist()
+            html = archive.read("report.html").decode("utf-8")
+            assert f'<img src="frames/event-{event_id}.jpg"' in html
+            assert "Комментарий оператора" not in html
+
+
+def test_explicit_column_list_and_unknown_columns():
+    with TestClient(main.app) as client:
+        _insert_event("COLUMN-LIST-001")
+
+        response = client.get("/api/reports/events.csv?columns=time,place,person,photo,nonsense&q=COLUMN-LIST-001")
+        assert response.status_code == 200, response.text
+        header = response.content.decode("utf-8-sig").splitlines()[0].split(";")
+        assert header == ["Дата и время", "Место", "Кто нарушил", "Фото"]
+
+        # Неизвестный или пустой набор не ломает отчёт: возвращается полная таблица.
+        fallback = client.get("/api/reports/events.csv?columns=unknown-only&q=COLUMN-LIST-001")
+        assert fallback.status_code == 200, fallback.text
+        assert "Комментарий оператора" in fallback.content.decode("utf-8-sig").splitlines()[0]
+
+        default_response = client.get("/api/reports/events.csv?q=COLUMN-LIST-001")
+        assert "Кадр нарушения" in default_response.content.decode("utf-8-sig").splitlines()[0]
