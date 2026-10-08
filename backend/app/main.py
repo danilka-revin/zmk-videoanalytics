@@ -2853,7 +2853,9 @@ def events(limit:int=Query(50,ge=1,le=500),severity:str|None=None,event_type:str
     data=rows("""SELECT e.*,COALESCE(c.name,NULLIF(e.camera_label,''),e.camera_id) camera_name,COALESCE(c.zone,NULLIF(e.zone_label,''),'') zone,c.source_type source_type
         FROM events e LEFT JOIN cameras c ON c.id=e.camera_id
         WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?) AND (? IS NULL OR e.review_status=?)
-        ORDER BY e.timestamp DESC LIMIT ?""",(severity,severity,event_type,event_type,ack,ack,review_status,review_status,limit))
+        -- Метка времени пишется с точностью до секунды, поэтому события одной
+        -- секунды должны добираться по id: иначе порядок в журнале «плавает».
+        ORDER BY e.timestamp DESC,e.id DESC LIMIT ?""",(severity,severity,event_type,event_type,ack,ack,review_status,review_status,limit))
     for item in data: item["has_frame"]=event_frame_path_for(int(item["id"])).is_file()
     return data
 
@@ -4511,7 +4513,7 @@ def global_search(q: str = Query(min_length=1, max_length=100), limit: int = Que
                 ("название", row[1]), ("ID камеры", row[0]), ("зона", row[2]), ("описание", row[3]), ("статус", _search_alias_text(status, _SEARCH_CAMERA_STATUS_ALIASES)),
             ])
         for row in con.execute("""SELECT e.id,e.type,e.camera_id,e.severity,e.timestamp,e.person_id,e.note,e.review_status,COALESCE(c.name,NULLIF(e.camera_label,'')),COALESCE(c.zone,NULLIF(e.zone_label,''))
-            FROM events e LEFT JOIN cameras c ON c.id=e.camera_id ORDER BY e.timestamp DESC LIMIT 1200""").fetchall():
+            FROM events e LEFT JOIN cameras c ON c.id=e.camera_id ORDER BY e.timestamp DESC,e.id DESC LIMIT 1200""").fetchall():
             event_type = str(row[1] or "")
             severity = str(row[3] or "")
             review = str(row[7] or "pending")
@@ -4653,7 +4655,7 @@ def _event_report_rows(severity:str|None,event_type:str|None,acknowledged:bool|N
         WHERE (? IS NULL OR e.severity=?) AND (? IS NULL OR e.type=?) AND (? IS NULL OR e.acknowledged=?) AND (? IS NULL OR e.review_status=?) AND (? IS NULL OR e.camera_id=?)
           AND (? IS NULL OR e.timestamp>=?)
           AND (? IS NULL OR e.camera_id LIKE ? OR e.person_id LIKE ? OR e.external_id LIKE ? OR e.type LIKE ? OR c.name LIKE ? OR c.zone LIKE ? OR e.camera_label LIKE ? OR e.zone_label LIKE ?)
-        ORDER BY e.timestamp DESC""",(severity,severity,event_type,event_type,ack,ack,review_status,review_status,camera_id,camera_id,since,since,like,like,like,like,like,like,like,like,like))
+        ORDER BY e.timestamp DESC,e.id DESC""",(severity,severity,event_type,event_type,ack,ack,review_status,review_status,camera_id,camera_id,since,since,like,like,like,like,like,like,like,like,like))
 
 
 def _event_review_state(row:dict[str,Any]) -> str:
