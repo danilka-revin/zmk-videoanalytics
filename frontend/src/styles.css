@@ -1145,3 +1145,29 @@ header .icon.sound-toggle.is-off{color:var(--muted);opacity:.7}
 .alert-check small{margin-top:3px;color:var(--muted);font-size:8px;line-height:1.4}
 .alert-tip .alert-test{display:inline-flex;align-items:center;justify-content:center;gap:6px;margin-top:9px;min-height:32px;padding:7px 12px;border:1px solid rgb(var(--accent-rgb) / .34);border-radius:9px;background:rgb(var(--accent-rgb) / .12);color:#3f7a52;font-size:8px;font-weight:700;cursor:pointer}
 .alert-tip .alert-test:hover{background:rgb(var(--accent-rgb) / .22)}
+
+/* Конструктор экспорта: директор сам решает, какие колонки попадут в отчёт. */
+.export-columns-modal{width:min(760px,100%)}
+.export-preset-row{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:9px;margin-top:15px}
+.export-preset-row button{display:flex;flex-direction:column;gap:3px;padding:11px 13px;border:1px solid var(--line);border-radius:12px;background:var(--surface-2);color:var(--text);text-align:left;cursor:pointer;transition:border-color .16s ease,background .16s ease}
+.export-preset-row button b{font-size:10px}
+.export-preset-row button small{color:var(--muted);font-size:8px;line-height:1.4}
+.export-preset-row button.active{border-color:rgb(var(--accent-rgb) / .45);background:rgb(var(--accent-rgb) / .1)}
+.export-column-groups{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:14px;margin-top:16px}
+.export-group-head{margin-bottom:7px}
+.export-group-head b{display:block;font-size:9px}
+.export-group-head small{display:block;margin-top:2px;color:var(--muted);font-size:8px;line-height:1.4}
+.export-column-list{display:flex;flex-direction:column;gap:5px;max-height:290px;overflow:auto;padding-right:4px}
+.export-column{display:flex;align-items:flex-start;gap:9px;padding:8px 11px;border:1px solid var(--line);border-radius:10px;background:rgb(var(--surface-2-rgb) / .5);cursor:pointer}
+.export-column input{flex:0 0 auto;width:14px;height:14px;margin:1px 0 0;accent-color:#4b8a5b;cursor:pointer}
+.export-column b,.export-column small{display:block}
+.export-column b{font-size:9px}
+.export-column small{margin-top:2px;color:var(--muted);font-size:8px;line-height:1.35}
+.export-column.on{border-color:rgb(var(--accent-rgb) / .4);background:rgb(var(--accent-rgb) / .09)}
+.export-columns-foot{display:flex;align-items:center;gap:9px;margin-top:15px;padding:10px 13px;border:1px dashed rgb(var(--ink-rgb) / .14);border-radius:11px;background:rgb(var(--surface-2-rgb) / .4)}
+.export-columns-foot>span{display:flex;align-items:center;gap:5px;font-size:9px;color:var(--muted);white-space:nowrap}
+.export-columns-foot>span b{font-size:13px;color:var(--text)}
+.export-columns-foot em{overflow:hidden;color:var(--muted);font-size:8px;font-style:normal;text-overflow:ellipsis;white-space:nowrap}
+.toolbar .export-columns-button{border-color:rgb(var(--accent-rgb) / .32);background:rgb(var(--accent-rgb) / .09)}
+@media(max-width:700px){.export-preset-row,.export-column-groups{grid-template-columns:1fr}.export-column-list{max-height:none}}
+html[data-theme=dark] .export-preset-row button,html[data-theme=dark] .export-column{background:var(--surface-2);border-color:var(--line)}

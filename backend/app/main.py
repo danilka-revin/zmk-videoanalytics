@@ -4584,12 +4584,61 @@ def csv_safe(value:Any):
 
 def sanitize_csv_rows(data:list[dict[str,Any]]): return [{k:csv_safe(v) for k,v in row.items()} for row in data]
 
-_EVENT_REPORT_FIELDS=(
-    "№ события","Дата и время","Тип нарушения","Код нарушения","Критичность","Тестовое событие","Уверенность, %",
-    "Камера","ID камеры","Зона","Объект / человек","ID детекции","Статус проверки","Подтверждено",
-    "Время решения","Комментарий оператора","Кадр нарушения","Файл кадра","Ссылка на кадр",
-)
+# Экспорт журнала настраивается. Руководителю нужна короткая таблица —
+# «когда, где, кто нарушил и есть ли фото», а администратору и аналитику —
+# полная карточка события для разбора и обучения модели. Ниже: идентификатор
+# столбца → русская шапка, исторический полный набор и короткий набор.
+_EVENT_REPORT_LABELS:dict[str,str]={
+    "index":"№ события",
+    "time":"Дата и время",
+    "type":"Тип нарушения",
+    "code":"Код нарушения",
+    "severity":"Критичность",
+    "test":"Тестовое событие",
+    "confidence":"Уверенность, %",
+    "camera":"Камера",
+    "camera_id":"ID камеры",
+    "zone":"Зона",
+    "place":"Место",
+    "person":"Кто нарушил",
+    "detection":"ID детекции",
+    "status":"Статус проверки",
+    "ack":"Подтверждено",
+    "decided":"Время решения",
+    "note":"Комментарий оператора",
+    "frame":"Кадр нарушения",
+    "photo":"Фото",
+    "frame_file":"Файл кадра",
+    "frame_link":"Ссылка на кадр",
+}
+# Полный набор — прежний порядок колонок: сводные таблицы, которые уже ведут
+# по этому экспорту, не должны «поехать» после обновления.
+_EVENT_REPORT_FULL:tuple[str,...]=("index","time","type","code","severity","test","confidence","camera","camera_id",
+    "zone","person","detection","status","ack","decided","note","frame","frame_file","frame_link")
+# Короткий набор отвечает на четыре вопроса: когда, где, кто нарушил, есть ли фото.
+_EVENT_REPORT_SHORT:tuple[str,...]=("index","time","type","place","person","photo","frame_file")
+_EVENT_REPORT_PRESETS:dict[str,tuple[str,...]]={"full":_EVENT_REPORT_FULL,"short":_EVENT_REPORT_SHORT,
+    "brief":_EVENT_REPORT_SHORT,"director":_EVENT_REPORT_SHORT}
+_EVENT_REPORT_IMAGE_FIELDS=frozenset({_EVENT_REPORT_LABELS["frame"],_EVENT_REPORT_LABELS["photo"],_EVENT_REPORT_LABELS["frame_file"]})
 _EVENT_SEVERITY_LABELS={"critical":"Критический","high":"Высокий","medium":"Средний","low":"Низкий"}
+
+
+def _event_report_columns(value:str|None) -> tuple[str,...]:
+    """Resolve the requested export columns: preset name, explicit list or full."""
+    raw=str(value or "").strip().lower()
+    if not raw: return _EVENT_REPORT_FULL
+    if raw in _EVENT_REPORT_PRESETS: return _EVENT_REPORT_PRESETS[raw]
+    picked:list[str]=[]
+    for item in raw.split(","):
+        key=item.strip()
+        # Unknown or repeated ids are dropped silently: an old client must keep
+        # getting a usable table instead of an error.
+        if key in _EVENT_REPORT_LABELS and key not in picked: picked.append(key)
+    return tuple(picked) or _EVENT_REPORT_FULL
+
+
+def _event_report_fieldnames(columns:tuple[str,...]) -> tuple[str,...]:
+    return tuple(_EVENT_REPORT_LABELS[key] for key in columns)
 
 
 def _event_report_rows(severity:str|None,event_type:str|None,acknowledged:bool|None,review_status:str|None,camera_id:str|None,q:str|None,hours:int|None=None) -> list[dict[str,Any]]:
@@ -4614,100 +4663,120 @@ def _event_review_state(row:dict[str,Any]) -> str:
     return "accepted" if bool(row.get("acknowledged")) else "pending"
 
 
-def _event_report_record(row:dict[str,Any]) -> dict[str,Any]:
+def _event_report_entry(row:dict[str,Any],columns:tuple[str,...]) -> tuple[int,str,dict[str,Any]]:
+    """Build one export row: event id, its evidence JPEG inside the ZIP and the row itself."""
     event_id=int(row["id"])
     frame=event_frame_path_for(event_id)
     has_frame=frame.is_file()
-    review=_event_review_state(row)
     frame_file=f"frames/event-{event_id}.jpg" if has_frame else ""
-    return {
-        "№ события":event_id,
-        "Дата и время":str(row.get("timestamp") or ""),
-        "Тип нарушения":EVENT_LABELS.get(str(row.get("type") or ""),str(row.get("type") or "—")),
-        "Код нарушения":str(row.get("type") or ""),
-        "Критичность":_EVENT_SEVERITY_LABELS.get(str(row.get("severity") or ""),str(row.get("severity") or "—")),
-        "Тестовое событие":"Да" if row.get("is_test") else "Нет",
-        "Уверенность, %":round(float(row.get("confidence") or 0)*100,2),
-        "Камера":str(row.get("camera_name") or row.get("camera_id") or "—"),
-        "ID камеры":str(row.get("camera_id") or ""),
-        "Зона":str(row.get("camera_zone") or "—"),
-        "Объект / человек":str(row.get("person_id") or "—"),
-        "ID детекции":str(row.get("external_id") or "—"),
-        "Статус проверки":REVIEW_LABELS.get(review,review),
-        "Подтверждено":"Да" if bool(row.get("acknowledged")) else "Нет",
-        "Время решения":str(row.get("reviewed_at") or "—"),
-        "Комментарий оператора":str(row.get("note") or "—"),
-        "Кадр нарушения":"Есть" if has_frame else "Не сохранён",
-        "Файл кадра":frame_file or "—",
-        "Ссылка на кадр":f"/api/events/{event_id}/frame" if has_frame else "—",
+    camera=str(row.get("camera_name") or row.get("camera_id") or "—")
+    zone=str(row.get("camera_zone") or "—")
+    review=_event_review_state(row)
+    values:dict[str,Any]={
+        "index":event_id,
+        "time":str(row.get("timestamp") or ""),
+        "type":EVENT_LABELS.get(str(row.get("type") or ""),str(row.get("type") or "—")),
+        "code":str(row.get("type") or ""),
+        "severity":_EVENT_SEVERITY_LABELS.get(str(row.get("severity") or ""),str(row.get("severity") or "—")),
+        "test":"Да" if row.get("is_test") else "Нет",
+        "confidence":round(float(row.get("confidence") or 0)*100,2),
+        "camera":camera,
+        "camera_id":str(row.get("camera_id") or ""),
+        "zone":zone,
+        "place":f"{camera} · {zone}" if zone!="—" else camera,
+        "person":str(row.get("person_id") or "—"),
+        "detection":str(row.get("external_id") or "—"),
+        "status":REVIEW_LABELS.get(review,review),
+        "ack":"Да" if bool(row.get("acknowledged")) else "Нет",
+        "decided":str(row.get("reviewed_at") or "—"),
+        "note":str(row.get("note") or "—"),
+        "frame":"Есть" if has_frame else "Не сохранён",
+        "photo":"Есть" if has_frame else "Нет",
+        "frame_file":frame_file or "—",
+        "frame_link":f"/api/events/{event_id}/frame" if has_frame else "—",
     }
+    return event_id,frame_file,{_EVENT_REPORT_LABELS[key]:values[key] for key in columns}
 
 
-def _event_report_csv(records:list[dict[str,Any]]) -> str:
+def _event_report_entries(severity:str|None,event_type:str|None,acknowledged:bool|None,review_status:str|None,camera_id:str|None,q:str|None,hours:int|None=None,columns:str|None=None) -> list[tuple[int,str,dict[str,Any]]]:
+    picked=_event_report_columns(columns)
+    return [_event_report_entry(row,picked) for row in _event_report_rows(severity,event_type,acknowledged,review_status,camera_id,q,hours)]
+
+
+def _event_report_csv(records:list[dict[str,Any]],columns:tuple[str,...]) -> str:
     out=io.StringIO()
     # UTF-8 BOM + semicolon delimiter open correctly in Russian Excel without a
     # manual import wizard, while the headers remain meaningful to operators.
     out.write("\ufeff")
-    writer=csv.DictWriter(out,fieldnames=_EVENT_REPORT_FIELDS,delimiter=";",lineterminator="\n")
+    writer=csv.DictWriter(out,fieldnames=list(_event_report_fieldnames(columns)),delimiter=";",lineterminator="\n")
     writer.writeheader(); writer.writerows(sanitize_csv_rows(records))
     return out.getvalue()
 
 
-def _event_report_html(records:list[dict[str,Any]]) -> str:
+def _event_report_html(entries:list[tuple[int,str,dict[str,Any]]],columns:tuple[str,...]) -> str:
+    fieldnames=_event_report_fieldnames(columns)
     rows_html=[]
-    for record in records:
+    for event_id,frame_file,record in entries:
         cells=[]
-        for field in _EVENT_REPORT_FIELDS:
+        for field in fieldnames:
             value=record.get(field,"—")
-            if field=="Кадр нарушения" and record.get("Файл кадра") not in {"", "—"}:
-                image=html_escape(str(record["Файл кадра"]),quote=True)
-                cells.append(f'<td><img src="{image}" alt="Кадр нарушения события {html_escape(str(record["№ события"]))}"><small>{html_escape(str(value))}</small></td>')
+            if field in _EVENT_REPORT_IMAGE_FIELDS and frame_file:
+                image=html_escape(frame_file,quote=True)
+                cells.append(f'<td><img src="{image}" alt="Кадр нарушения события {html_escape(str(event_id))}"><small>{html_escape(str(value))}</small></td>')
             else:
                 cells.append(f"<td>{html_escape(str(value))}</td>")
         rows_html.append("<tr>"+"".join(cells)+"</tr>")
-    headers="".join(f"<th>{html_escape(field)}</th>" for field in _EVENT_REPORT_FIELDS)
-    evidence=sum(1 for record in records if record.get("Файл кадра") not in {"", "—"})
+    headers="".join(f"<th>{html_escape(field)}</th>" for field in fieldnames)
+    evidence=sum(1 for _event_id,frame_file,_record in entries if frame_file)
     return f"""<!doctype html><html lang="ru"><meta charset="utf-8"><title>Zovod — журнал нарушений</title>
 <style>body{{font:13px/1.4 Arial,sans-serif;color:#17211d;margin:24px}}h1{{margin:0 0 4px}}p{{color:#526158}}.summary{{display:flex;gap:12px;margin:18px 0}}.summary span{{padding:8px 10px;border:1px solid #d9e5dd;border-radius:8px;background:#f4faf6}}table{{width:100%;border-collapse:collapse;font-size:11px}}th{{position:sticky;top:0;background:#193426;color:#f4ffef}}th,td{{border:1px solid #dce6df;padding:6px;text-align:left;vertical-align:top}}tr:nth-child(even){{background:#f7faf8}}img{{display:block;max-width:180px;max-height:112px;border-radius:4px;background:#16231d}}td small{{display:block;margin-top:3px;color:#66756d}}@media print{{body{{margin:8px}}th{{position:static}}}}</style>
 <h1>Zovod — журнал нарушений</h1><p>Сформировано: {html_escape(now_iso())}. В архиве сохранены доступные кадры нарушений.</p>
-<div class="summary"><span>Событий: <b>{len(records)}</b></span><span>Кадров: <b>{evidence}</b></span></div>
-<table><thead><tr>{headers}</tr></thead><tbody>{''.join(rows_html) or '<tr><td colspan="19">Событий по выбранному фильтру нет.</td></tr>'}</tbody></table></html>"""
+<div class="summary"><span>Событий: <b>{len(entries)}</b></span><span>Кадров: <b>{evidence}</b></span><span>Столбцов: <b>{len(fieldnames)}</b></span></div>
+<table><thead><tr>{headers}</tr></thead><tbody>{''.join(rows_html) or f'<tr><td colspan="{max(1,len(fieldnames))}">Событий по выбранному фильтру нет.</td></tr>'}</tbody></table></html>"""
 
 
-def _event_report_args(severity:str|None,event_type:str|None,acknowledged:bool|None,review_status:Literal["pending","accepted","rejected"]|None,camera_id:str|None,q:str|None,hours:int|None=None) -> list[dict[str,Any]]:
-    return [_event_report_record(row) for row in _event_report_rows(severity,event_type,acknowledged,review_status,camera_id,q,hours)]
+def _event_report_args(severity:str|None,event_type:str|None,acknowledged:bool|None,review_status:Literal["pending","accepted","rejected"]|None,camera_id:str|None,q:str|None,hours:int|None=None,columns:str|None=None) -> list[dict[str,Any]]:
+    return [entry[2] for entry in _event_report_entries(severity,event_type,acknowledged,review_status,camera_id,q,hours,columns)]
 
 
 @app.get("/api/reports/events.csv")
-def report_csv(severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None,camera_id:str|None=None,q:str|None=Query(default=None,max_length=100),hours:int|None=Query(default=None,ge=1,le=2160)):
-    """Russian Excel-friendly event table with all audit fields and frame status."""
-    content=_event_report_csv(_event_report_args(severity,event_type,acknowledged,review_status,camera_id,q,hours))
+def report_csv(severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None,camera_id:str|None=None,q:str|None=Query(default=None,max_length=100),hours:int|None=Query(default=None,ge=1,le=2160),columns:str|None=Query(default=None,max_length=300)):
+    """Russian Excel-friendly event table.
+
+    `columns` selects what goes into the table: a preset (`short` — когда, где,
+    кто нарушил, фото; `full` — вся карточка) or a comma-separated list of
+    column ids. Without the parameter the full audit table is exported.
+    """
+    picked=_event_report_columns(columns)
+    entries=_event_report_entries(severity,event_type,acknowledged,review_status,camera_id,q,hours,columns)
+    content=_event_report_csv([entry[2] for entry in entries],picked)
     return StreamingResponse(iter([content]),media_type="text/csv; charset=utf-8",headers={"Content-Disposition":"attachment; filename=zmk-events-ru.csv"})
 
 
 @app.get("/api/reports/events.zip")
-def report_zip(severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None,camera_id:str|None=None,q:str|None=Query(default=None,max_length=100),hours:int|None=Query(default=None,ge=1,le=2160)):
+def report_zip(severity:str|None=None,event_type:str|None=None,acknowledged:bool|None=None,review_status:Literal["pending","accepted","rejected"]|None=None,camera_id:str|None=None,q:str|None=Query(default=None,max_length=100),hours:int|None=Query(default=None,ge=1,le=2160),columns:str|None=Query(default=None,max_length=300)):
     """Export a ready-to-open Russian report with the table and evidence JPEGs."""
-    records=_event_report_args(severity,event_type,acknowledged,review_status,camera_id,q,hours)
+    picked=_event_report_columns(columns)
+    entries=_event_report_entries(severity,event_type,acknowledged,review_status,camera_id,q,hours,columns)
+    records=[entry[2] for entry in entries]
     archive=io.BytesIO()
     with zipfile.ZipFile(archive,"w",compression=zipfile.ZIP_DEFLATED,compresslevel=6) as bundle:
-        bundle.writestr("events_ru.csv",_event_report_csv(records).encode("utf-8"))
-        bundle.writestr("report.html",_event_report_html(records).encode("utf-8"))
+        bundle.writestr("events_ru.csv",_event_report_csv(records,picked).encode("utf-8"))
+        bundle.writestr("report.html",_event_report_html(entries,picked).encode("utf-8"))
         frame_count=0
-        for record in records:
-            filename=str(record.get("Файл кадра") or "")
-            if not filename or filename=="—":
+        for event_id,frame_file,_record in entries:
+            if not frame_file:
                 continue
-            frame=event_frame_path_for(int(record["№ события"]))
+            frame=event_frame_path_for(event_id)
             if frame.is_file():
-                bundle.write(frame,filename)
+                bundle.write(frame,frame_file)
                 frame_count+=1
         bundle.writestr("README.txt",("Zovod — экспорт журнала нарушений\n\n"
             "events_ru.csv — таблица с русскими названиями столбцов для Excel.\n"
             "report.html — наглядный отчёт с кадрами нарушений.\n"
             "frames/ — JPEG-кадры, доступные на момент экспорта.\n"
             f"Событий: {len(records)}; кадров: {frame_count}.\n").encode())
-        bundle.writestr("manifest.json",json.dumps({"generated_at":now_iso(),"events":len(records),"frames":frame_count,"format":"zmk-event-evidence-v1"},ensure_ascii=False,indent=2).encode("utf-8"))
+        bundle.writestr("manifest.json",json.dumps({"generated_at":now_iso(),"events":len(records),"frames":frame_count,"columns":list(picked),"format":"zmk-event-evidence-v1"},ensure_ascii=False,indent=2).encode("utf-8"))
     return StreamingResponse(iter([archive.getvalue()]),media_type="application/zip",headers={"Content-Disposition":"attachment; filename=zmk-events-with-evidence.zip"})
 @app.get("/api/stream")
 async def stream():
