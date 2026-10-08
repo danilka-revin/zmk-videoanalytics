@@ -179,7 +179,9 @@ def test_delete_selected_events_removes_only_the_selection_and_its_frames():
         camera_id = _start_video_test(client)
         test_ids = [_detect(client, camera_id, f"VIDEO-SEL-{index}") for index in range(3)]
         frames = {event_id: _store_frame(event_id) for event_id in test_ids}
-        production_id = int(client.get("/api/events?limit=1").json()[0]["id"])
+        # События одной секунды имеют одинаковую метку времени, поэтому номер
+        # «обычного» события берём не первым в списке, а любым вне тестовых.
+        production_id = next(int(item["id"]) for item in client.get("/api/events?limit=50").json() if int(item["id"]) not in set(test_ids))
         production_frame = _store_frame(production_id)
         before = _event_ids(client)
 

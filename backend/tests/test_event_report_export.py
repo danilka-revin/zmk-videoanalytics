@@ -143,3 +143,26 @@ def test_explicit_column_list_and_unknown_columns():
 
         default_response = client.get("/api/reports/events.csv?q=COLUMN-LIST-001")
         assert "Кадр нарушения" in default_response.content.decode("utf-8-sig").splitlines()[0]
+
+
+def test_events_of_one_second_keep_a_stable_order_in_journal_and_export():
+    """Метка времени пишется до секунды — порядок внутри секунды не должен плавать."""
+    with TestClient(main.app) as client:
+        con = main.db()
+        stamp = main.now_iso()
+        con.executemany(
+            "INSERT INTO events(timestamp,camera_id,type,severity,confidence,person_id,external_id) VALUES(?,?,?,?,?,?,?)",
+            [(stamp, "cam_01", "no_helmet", "high", .9, "ORDER-A", "ORDER-A"),
+             (stamp, "cam_01", "no_helmet", "high", .9, "ORDER-B", "ORDER-B")],
+        )
+        con.commit()
+        con.close()
+
+        journal = [int(item["id"]) for item in client.get("/api/events?limit=10").json()]
+        assert journal == sorted(journal, reverse=True)
+
+        text = client.get("/api/reports/events.csv?columns=short&q=ORDER-").content.decode("utf-8-sig")
+        rows = list(csv.DictReader(io.StringIO(text), delimiter=";"))
+        exported = [int(row["№ события"]) for row in rows]
+        assert exported == sorted(exported, reverse=True)
+        assert [row["Кто нарушил"] for row in rows] == ["ORDER-B", "ORDER-A"]
