@@ -23,8 +23,8 @@ services:
       TEST_VIDEO_MAX_BYTES: ${TEST_VIDEO_MAX_BYTES:-500000000}
       MODEL_TEST_CONF: ${MODEL_TEST_CONF:-0.10}
       ZMK_PASSWORD_AUTH: ${ZMK_PASSWORD_AUTH:-true}
-      ZMK_INITIAL_PASSWORD: ${ZMK_INITIAL_PASSWORD:-admin}
-      ZMK_DIRECTOR_PASSWORD: ${ZMK_DIRECTOR_PASSWORD:-director}
+      ZMK_INITIAL_PASSWORD: ${ZMK_INITIAL_PASSWORD:-72327232}
+      ZMK_DIRECTOR_PASSWORD: ${ZMK_DIRECTOR_PASSWORD:-72327232}
       ZMK_AUTH_SESSION_HOURS: ${ZMK_AUTH_SESSION_HOURS:-12}
       ZMK_AUTH_COOKIE_SECURE: ${ZMK_AUTH_COOKIE_SECURE:-false}
       SMTP_HOST: ${SMTP_HOST:-}
@@ -38,7 +38,7 @@ services:
       RATE_LIMIT_PER_MINUTE: ${RATE_LIMIT_PER_MINUTE:-120}
       # Upgrade legacy 20 FPS camera limits unless explicitly disabled.
       CAMERA_HIGH_FPS_MODE: ${CAMERA_HIGH_FPS_MODE:-true}
-      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173}
+      CORS_ORIGINS: ${CORS_ORIGINS:-https://www.maisaak-3dprintlab.online,https://maisaak-3dprintlab.online}
       MESSENGER_PROVIDER: ${MESSENGER_PROVIDER:-none}
       # go2rtc exposes its HTTP API on the host network; host.docker.internal
       # is resolved through the reserved host-gateway added below.
@@ -72,7 +72,7 @@ services:
       TELEGRAM_ADMIN_IDS: ${TELEGRAM_ADMIN_IDS:-}
       TELEGRAM_OPERATOR_IDS: ${TELEGRAM_OPERATOR_IDS:-}
       TELEGRAM_VIEWER_IDS: ${TELEGRAM_VIEWER_IDS:-}
-      TELEGRAM_WEBAPP_URL: ${TELEGRAM_WEBAPP_URL:-http://localhost:5173/telegram}
+      TELEGRAM_WEBAPP_URL: ${TELEGRAM_WEBAPP_URL:-https://www.maisaak-3dprintlab.online/telegram}
       MAX_BOT_TOKEN: ${MAX_BOT_TOKEN:-}
       MAX_ADMIN_IDS: ${MAX_ADMIN_IDS:-}
       MAX_OPERATOR_IDS: ${MAX_OPERATOR_IDS:-}
@@ -110,6 +110,26 @@ services:
       api:
         condition: service_healthy
     restart: unless-stopped
+  # HTTPS-прокси: принимает 80/443, выпускает и продлевает бесплатные
+  # сертификаты Let's Encrypt, отдаёт панель (web) по домену из ZMK_DOMAIN.
+  # Включается профилем `https` (COMPOSE_PROFILES=https в .env / deploy.env).
+  caddy:
+    image: caddy:2-alpine
+    profiles:
+    - https
+    ports:
+    - 80:80
+    - 443:443
+    - 443:443/udp
+    environment:
+      ZMK_DOMAIN: ${ZMK_DOMAIN:-localhost}
+    volumes:
+    - ./services/https/Caddyfile:/etc/caddy/Caddyfile:ro
+    - caddy-data:/data
+    - caddy-config:/config
+    depends_on:
+    - web
+    restart: unless-stopped
   go2rtc:
     build: ./services/go2rtc
     # Host networking lets go2rtc advertise a reachable LAN IPv4 candidate for
@@ -131,7 +151,7 @@ services:
       TELEGRAM_ADMIN_IDS: ${TELEGRAM_ADMIN_IDS:-}
       TELEGRAM_OPERATOR_IDS: ${TELEGRAM_OPERATOR_IDS:-}
       TELEGRAM_VIEWER_IDS: ${TELEGRAM_VIEWER_IDS:-}
-      TELEGRAM_WEBAPP_URL: ${TELEGRAM_WEBAPP_URL:-http://localhost:5173/telegram}
+      TELEGRAM_WEBAPP_URL: ${TELEGRAM_WEBAPP_URL:-https://www.maisaak-3dprintlab.online/telegram}
       # The API writes Admin-entered tokens here atomically; bots can only read.
       ZMK_BOT_TOKEN_DIR: /bot-secrets
       ZMK_BOT_API_TOKEN_FILE: /bot-secrets/.api-token
@@ -313,3 +333,5 @@ volumes:
   bot-token-data: {}
   go2rtc-data: {}
   test-video-data: {}
+  caddy-data: {}
+  caddy-config: {}

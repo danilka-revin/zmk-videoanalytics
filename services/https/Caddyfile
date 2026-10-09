@@ -1,0 +1,13 @@
+# HTTPS-терминация для панели Zovod (сервис `caddy`, профиль `https`).
+# Включается через COMPOSE_PROFILES=https (см. deploy.env).
+# ZMK_DOMAIN берётся из .env — это apex-домен (например maisaak-3dprintlab.online).
+# www.<домен> описан отдельным сайтом: если DNS-запись apex вдруг не заведена,
+# сертификат и доступ по www всё равно заработают.
+
+www.{$ZMK_DOMAIN:localhost} {
+	reverse_proxy web:80
+}
+
+{$ZMK_DOMAIN:localhost} {
+	reverse_proxy web:80
+}
