@@ -135,6 +135,32 @@ else
   echo "[start] Конфигурация уже задана — запускаю как есть (повторить мастер: ./start.sh --setup)"
 fi
 
+# =====================================================================
+# DEPLOY OVERRIDES (deploy.env) — переносятся в .env при каждом запуске
+# =====================================================================
+# deploy.env хранится в git и несёт значения для конкретного развёртывания
+# (домен, пароли, HTTPS-профиль). Слияние идёт ПОСЛЕ мастера настроек, чтобы
+# `git pull` + `./start.sh` гарантированно возвращал конфигурацию деплоя,
+# не трогая остальные значения .env (токены, SMTP, камеры). Удалите
+# deploy.env, чтобы отключить авто-применение.
+if [[ -f deploy.env ]]; then
+  while IFS= read -r zmk_line || [[ -n "$zmk_line" ]]; do
+    if [[ "$zmk_line" =~ ^[[:space:]]*(#|$) ]]; then continue; fi
+    if [[ "$zmk_line" =~ ^([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      zmk_key="${BASH_REMATCH[1]}"
+      zmk_val="${BASH_REMATCH[2]}"
+      if grep -q "^${zmk_key}=" .env 2>/dev/null; then
+        zmk_tmp="$(mktemp)"
+        awk -v k="$zmk_key" -v v="$zmk_val" 'BEGIN{done=0} index($0,k"=")==1 {if(!done){print k"="v; done=1}; next} {print} END{if(!done) print k"="v}' .env > "$zmk_tmp" && mv "$zmk_tmp" .env
+      else
+        printf '%s=%s\n' "$zmk_key" "$zmk_val" >> .env
+      fi
+    fi
+  done < deploy.env
+  chmod 600 .env 2>/dev/null || true
+  echo "[start] deploy.env применён (домен, пароли, HTTPS)"
+fi
+
 # --- docker available? (after wizard so first-run always configures) ---
 command -v docker >/dev/null 2>&1 || fail "Docker не установлен. Выполните:  sudo apt install -y docker.io docker-compose-v2  (или запустите установщик)."
 
