@@ -592,6 +592,8 @@ Web Admin ── Telegram/MAX Bot ── Mini App ── СКУД Webhook
 Подробнее:
 
 - [Подробная инструкция для начинающих](docs/BEGINNER_GUIDE_RU.md)
+- [Хостинг дома: ноутбук с Debian как сервер](docs/HOME_SERVER_RU.md)
+- [Выкладка на VPS reg.ru](docs/REGRU_DEPLOY_RU.md)
 - [Архитектура](docs/ARCHITECTURE.md)
 - [Передача данных от модели](docs/MODEL_DATA_FLOW.md)
 - [Автодообучение](docs/AUTO_TRAINING.md)
